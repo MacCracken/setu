@@ -1,0 +1,146 @@
+# programs/codec_test.cyr — RUN test for the setu wire codec.
+#
+# Proves the scaffold works end-to-end:
+#   (A) ROUND-TRIP every SetuMsgKind: build via the constructor, encode into
+#       a byte buffer, decode back, assert kind + argc + every arg identical.
+#   (B) The parser REJECTS a TRUNCATED frame (SETU_ERR_SHORT).
+#   (C) The parser REJECTS a BAD-ARGC frame (SETU_ERR_BADMSG).
+#   (D) The parser REJECTS an UNKNOWN kind (SETU_ERR_BADMSG).
+#   (E) encode into a too-small buffer yields SETU_ERR_SHORT.
+#   (F) signed / large args survive the LE i64 marshalling bit-for-bit.
+#
+# Exit code = number of failed checks (0 = PASS), matching the sadish/
+# dhancha RUN-test convention the CI globs.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+# Scalar counter increment on mismatch (no module-global array — avoids the
+# `var X[N]` sizing footgun).
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+# Round-trip one already-built message: encode -> decode -> assert equal.
+# Uses a fresh decode target each call. `buf` / `cap` are caller-provided.
+fn roundtrip(msg, buf, cap): i64 {
+    var enc = setu_encode(msg, buf, cap);
+    # Encoded length must be non-negative and match the predicted length.
+    check(enc, setu_encoded_len(msg));
+    if (enc < 0) { g_fails = g_fails + 1; return 1; }
+
+    var out = setu_msg_new();
+    var consumed = setu_decode(buf, enc, out);
+    # Consumed the whole frame.
+    check(consumed, enc);
+    if (consumed < 0) { g_fails = g_fails + 1; return 1; }
+
+    # kind + argc identical.
+    check(setu_msg_kind(out), setu_msg_kind(msg));
+    check(setu_msg_argc(out), setu_msg_argc(msg));
+
+    # every arg identical.
+    var argc = setu_msg_argc(msg);
+    var i = 0;
+    while (i < argc) {
+        check(setu_msg_arg(out, i), setu_msg_arg(msg, i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    # A generous frame buffer — widest frame is ATTACH (2+5)*8 = 56 bytes.
+    var cap = 128;
+    var buf = alloc(cap);
+
+    # ---- (A) round-trip every kind ----
+
+    roundtrip(setu_hello(1, 7), buf, cap);
+    roundtrip(setu_create_surface(640, 480, 3), buf, cap);
+    roundtrip(setu_surface_created(42), buf, cap);
+    roundtrip(setu_configure(42, 800, 600, 1), buf, cap);
+    roundtrip(setu_attach(42, 800, 600, 3200, 1), buf, cap);
+    roundtrip(setu_commit(42), buf, cap);
+    roundtrip(setu_close(42), buf, cap);
+    roundtrip(setu_input_key(42, 65, 4), buf, cap);
+    roundtrip(setu_input_ptr_move(42, 120, 340), buf, cap);
+    roundtrip(setu_input_ptr_btn(42, 272, 1), buf, cap);
+    roundtrip(setu_input_focus(42, 1), buf, cap);
+
+    # ---- (F) signed + large args survive LE i64 marshalling ----
+    # Negative coords and a near-full-width value exercise sign + high bytes.
+    var big = setu_input_ptr_move(0 - 5, 0 - 999, 2147483647);
+    roundtrip(big, buf, cap);
+    var big2 = setu_configure(1, 0 - 1, 0 - 2, 0 - 3);
+    roundtrip(big2, buf, cap);
+
+    # ---- (B) truncated frame is rejected (SETU_ERR_SHORT) ----
+    # Encode a valid CONFIGURE (4 args -> 48 bytes) then hand the decoder a
+    # length one byte short of the full frame.
+    var cfg = setu_configure(9, 100, 200, 0);
+    var enc = setu_encode(cfg, buf, cap);
+    check(enc, 48);                       # (2+4)*8
+    var tout = setu_msg_new();
+    var rc_short = setu_decode(buf, enc - 1, tout);
+    check(rc_short, 0 - SETU_ERR_SHORT);  # negated SHORT
+
+    # Also: a header-only truncation (fewer than 16 bytes) is SHORT.
+    var rc_hdr = setu_decode(buf, 8, tout);
+    check(rc_hdr, 0 - SETU_ERR_SHORT);
+
+    # ---- (C) bad-argc frame is rejected (SETU_ERR_BADMSG) ----
+    # Hand-forge a frame: kind = COMMIT (expects argc 1) but argc word = 3.
+    # The decoder must reject on the argc mismatch, NOT read 3 args.
+    var bad = alloc(cap);
+    setu_put_i64(bad, 0, SETU_COMMIT);          # kind
+    setu_put_i64(bad, 8, 3);                    # forged argc (should be 1)
+    setu_put_i64(bad, 16, 111);
+    setu_put_i64(bad, 24, 222);
+    setu_put_i64(bad, 32, 333);
+    var bout = setu_msg_new();
+    var rc_bad = setu_decode(bad, 40, bout);    # 40 bytes present, plenty
+    check(rc_bad, 0 - SETU_ERR_BADMSG);
+
+    # ---- (D) unknown kind is rejected (SETU_ERR_BADMSG) ----
+    var unk = alloc(cap);
+    setu_put_i64(unk, 0, 999);                  # not a SetuMsgKind
+    setu_put_i64(unk, 8, 0);
+    var uout = setu_msg_new();
+    var rc_unk = setu_decode(unk, 16, uout);
+    check(rc_unk, 0 - SETU_ERR_BADMSG);
+
+    # kind 0 (below MIN) also rejected.
+    setu_put_i64(unk, 0, 0);
+    setu_put_i64(unk, 8, 0);
+    var rc_zero = setu_decode(unk, 16, uout);
+    check(rc_zero, 0 - SETU_ERR_BADMSG);
+
+    # ---- (E) encode into a too-small buffer yields SETU_ERR_SHORT ----
+    var small = alloc(16);
+    var att = setu_attach(1, 2, 3, 4, 5);       # needs (2+5)*8 = 56 bytes
+    var rc_enc = setu_encode(att, small, 16);
+    check(rc_enc, 0 - SETU_ERR_SHORT);
+
+    # ---- report ----
+    if (g_fails == 0) {
+        var ok = "codec_test: PASS (roundtrip all kinds + reject short/bad-argc/unknown)\n";
+        syscall(SYS_WRITE, 1, ok, strlen(ok));
+    } else {
+        var f = "codec_test: FAIL\n";
+        syscall(SYS_WRITE, 2, f, strlen(f));
+    }
+    return g_fails;
+}
+
+fn _entry(): i64 {
+    var r = main();
+    syscall(SYS_EXIT, r);
+    return 0;
+}
+_entry();

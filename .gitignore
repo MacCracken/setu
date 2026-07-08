@@ -1,0 +1,28 @@
+# Editor / IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Cyrius build
+/build/
+
+# lib/ is populated by `cyrius deps` from cyrius.cyml [deps].stdlib — a
+# build artifact, not source. Never commit; never replace with a symlink
+# to a cyrius checkout (it causes cross-repo writes when an agent edits
+# lib/*.cyr).
+/lib/
+
+# Coverage
+*.profraw
+coverage/

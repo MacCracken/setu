@@ -1,0 +1,25 @@
+# programs/smoke.cyr — compile-time proof that src/lib.cyr links clean.
+#
+# setu is a library — there is no CLI binary. This program exists so
+# `cyrius build programs/smoke.cyr build/setu-smoke` can verify the full
+# include chain (stdlib + domain modules) parses and links without error.
+# The emitted binary writes a one-line banner and exits 0.
+
+include "src/lib.cyr"
+
+fn main(): i64 {
+    alloc_init();
+    var banner = "setu smoke: lib.cyr linked clean\n";
+    syscall(SYS_WRITE, 1, banner, strlen(banner));
+    return 0;
+}
+
+# BARE top-level call (NOT `var r = main();`) + SYS_EXIT — correct on host
+# AND agnos (see AGNOS CLAUDE.md § Cyrius: bare-call runs after the init-rsp
+# capture; SYS_EXIT resolves to 0 on agnos / 60 on Linux).
+fn _entry(): i64 {
+    var r = main();
+    syscall(SYS_EXIT, r);
+    return 0;
+}
+_entry();

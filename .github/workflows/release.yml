@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    # Bare-number tags (e.g. `0.1.0`) and `v`-prefixed forms both trigger.
+    # Pre-release `-rc.N` / `-beta.N` / `-alpha.N` suffixes are flagged as
+    # GitHub pre-releases so consumers' tag-resolvers skip them by default.
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-alpha.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-alpha.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    name: CI Gate
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build Release
+    needs: [ci]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify version
+        run: |
+          FILE_VERSION=$(tr -d '[:space:]' < VERSION)
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta|alpha)\.[0-9]+)?$' || {
+            echo "tag ($TAG) is not semver x.y.z[-{rc,beta,alpha}.N]"; exit 1; }
+          [ "$FILE_VERSION" = "$TAG" ] || {
+            echo "VERSION ($FILE_VERSION) != tag ($TAG)"; exit 1; }
+          echo "Version verified: $TAG (cyrius.cyml pulls from VERSION via \${file:VERSION})"
+
+      - name: Install Cyrius toolchain
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          echo "Installing Cyrius $CYRIUS_VERSION"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve deps
+        run: |
+          rm -rf lib
+          mkdir lib
+          cyrius deps
+
+      - name: Build (link-check, DCE on)
+        run: |
+          mkdir -p build
+          CYRIUS_DCE=1 cyrius build programs/smoke.cyr build/setu-smoke
+          echo "smoke: $(wc -c < build/setu-smoke) bytes"
+
+      - name: Test (RUN suites)
+        run: |
+          mkdir -p build
+          for t in programs/*_test.cyr; do
+            [ -e "$t" ] || continue
+            name=$(basename "$t" .cyr)
+            cyrius build "$t" "build/$name"
+            "./build/$name" || { echo "FAIL: $t"; exit 1; }
+          done
+          for f in tests/tcyr/*.tcyr; do [ -e "$f" ] || continue; cyrius test "$f" || exit 1; done
+
+      - name: Regenerate dist bundle
+        run: cyrius distlib
+
+      - name: Clean toolchain artifacts
+        run: rm -f cyrius-*.tar.gz
+
+      - name: Archive
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          git archive --format=tar.gz --prefix="setu-${TAG}/" -o "setu-${TAG}-src.tar.gz" HEAD
+          cp dist/setu.cyr "setu-${TAG}.cyr"
+          sha256sum setu-*.tar.gz setu-*.cyr > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            setu-*.tar.gz
+            setu-*.cyr
+            SHA256SUMS
+
+  release:
+    name: Create GitHub Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+      - name: Changelog
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          awk "/^## \\[${TAG}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md > /tmp/body.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: "setu ${{ github.ref_name }}"
+          body_path: /tmp/body.md
+          prerelease: ${{ startsWith(github.ref_name, '0.') || startsWith(github.ref_name, 'v0.') || contains(github.ref_name, '-rc.') || contains(github.ref_name, '-beta.') || contains(github.ref_name, '-alpha.') }}
+          files: |
+            setu-*.tar.gz
+            setu-*.cyr
+            SHA256SUMS

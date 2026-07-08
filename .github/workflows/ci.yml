@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cyrius toolchain
+        # The cyrius.cyml `[package].cyrius` pin is the single source of truth
+        # for the toolchain version — no version is hardcoded in this YAML. Use
+        # the upstream installer so the versioned ~/.cyrius/versions/<ver>/
+        # layout matches how cyrius resolves the pin.
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          echo "Installing Cyrius $CYRIUS_VERSION"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve dependencies
+        # `cyrius deps` copies the [deps].stdlib modules from the installed
+        # toolchain into lib/. setu is a pure-Cyrius leaf contract — no
+        # external libs. Never symlink lib/ to a cyrius checkout.
+        run: |
+          rm -rf lib
+          mkdir lib
+          cyrius deps
+
+      - name: Lint
+        # Hard gate: any `warn` line (warning or untracked-deferral) fails CI.
+        run: |
+          fail=0
+          for f in src/*.cyr programs/*.cyr; do
+            [ -e "$f" ] || continue
+            out=$(cyrius lint "$f" 2>&1 || true)
+            echo "$out"
+            if echo "$out" | grep -qE '^[[:space:]]*warn '; then
+              echo "lint: warnings in $f"; fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || { echo "lint: warnings present"; exit 1; }
+
+      - name: Format check
+        # cyrius fmt reports via EXIT CODE with --check (0 = clean); file goes
+        # BEFORE the flag.
+        run: |
+          fail=0
+          for f in src/*.cyr programs/*.cyr; do
+            [ -e "$f" ] || continue
+            if ! cyrius fmt "$f" --check > /dev/null 2>&1; then
+              echo "needs fmt: $f"; fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || { echo "fmt: drift detected"; exit 1; }
+
+      - name: Vet
+        run: cyrius vet programs/smoke.cyr
+
+      - name: Verify dist bundle is in sync with src/
+        run: |
+          cyrius distlib
+          if ! git diff --quiet dist/setu.cyr; then
+            echo "ERROR: dist/setu.cyr is stale. Run 'cyrius distlib' and commit the result."
+            git --no-pager diff dist/setu.cyr | head -40
+            exit 1
+          fi
+          echo "dist/setu.cyr matches src/"
+
+      - name: Build (link-check, DCE on)
+        run: |
+          mkdir -p build
+          CYRIUS_DCE=1 cyrius build programs/smoke.cyr build/setu-smoke
+          echo "smoke: $(wc -c < build/setu-smoke) bytes"
+
+      - name: Verify ELF
+        run: xxd -l 4 build/setu-smoke | grep -q "7f45 4c46"
+
+      - name: Test (RUN suites)
+        # Every programs/*_test.cyr is a self-checking RUN test: it exercises
+        # the codec, asserts round-trip + rejection, and exits non-zero on
+        # failure. Globbed so new suites are auto-picked.
+        run: |
+          mkdir -p build
+          for t in programs/*_test.cyr; do
+            [ -e "$t" ] || continue
+            name=$(basename "$t" .cyr)
+            echo "== $t =="
+            cyrius build "$t" "build/$name"
+            "./build/$name" || { echo "FAIL: $t"; exit 1; }
+          done
+          for f in tests/tcyr/*.tcyr; do [ -e "$f" ] || continue; cyrius test "$f" || exit 1; done
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for dangerous patterns
+        # Matches code lines only — rejects patterns in # comments.
+        run: |
+          FAIL=0
+          scan() {
+            local label="$1"; shift
+            local pat="$1"; shift
+            local hits
+            hits=$(grep -rnE "$pat" src/ programs/ 2>/dev/null | grep -vE '^\s*[^:]+:[0-9]+:\s*#' || true)
+            if [ -n "$hits" ]; then
+              echo "SECURITY: $label"; echo "$hits"; FAIL=1
+            fi
+          }
+          # setu is a wire parser over untrusted bytes — flag any unchecked
+          # dynamic exec / shell-out (there should be none in a pure codec).
+          scan "shell/exec invocation" 'execve|system\(|popen\('
+          [ $FAIL -eq 0 ] || { echo "security scan failed"; exit 1; }
+          echo "security scan clean"

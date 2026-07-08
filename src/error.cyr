@@ -1,0 +1,81 @@
+# @public — stable API surface for setu error handling.
+# error.cyr — setu display-protocol error codes + Result helpers.
+#
+# SetuErr is a 16-byte record: a consumer (the dhancha client, or the
+# aethersafha compositor) can map a protocol failure cleanly onto its own
+# error domain. Error codes are integer constants; for errors that carry
+# context (a message pointer), use setu_err_new(code, detail).
+#
+# The codec (codec.cyr) does NOT allocate a SetuErr on the hot path — it
+# returns the NEGATED code directly (e.g. `return 0 - SETU_ERR_SHORT`) so
+# a wire parser stays allocation-free. setu_err_new is for consumers that
+# want a carried-context record. Codes here are the shared vocabulary.
+#
+# SetuErr struct layout (16 bytes):
+#   +0: code    — error code constant (one of the SETU_* below)
+#   +8: detail  — pointer to detail string (or 0)
+
+# ================================================================
+# Error code constants
+# ================================================================
+#
+# Positive constants; the codec returns them NEGATED to distinguish an
+# error from a valid non-negative length. SETU_OK = 0 (never negated).
+
+enum SetuErrCode {
+    SETU_OK              = 0;   # no error
+    SETU_ERR_OOM         = 1;   # allocation failed
+    SETU_ERR_BADMSG      = 2;   # malformed frame: unknown kind, or argc != the kind's expected argc
+    SETU_ERR_SHORT       = 3;   # truncated frame: fewer bytes than the header/args require
+    SETU_ERR_UNSUPPORTED = 4;   # valid-shaped request setu can't service yet
+    SETU_ERR_OTHER       = 99;  # catch-all
+}
+
+# ================================================================
+# SetuErr struct
+# ================================================================
+
+# Create a SetuErr with code and an optional detail string (0 = none).
+fn setu_err_new(code, detail): i64 {
+    var e = alloc(16);
+    if (e == 0) { return 0; }
+    store64(e, code);
+    store64(e + 8, detail);
+    return e;
+}
+
+# Create a SetuErr with code only (no detail).
+fn setu_err(code): i64 {
+    return setu_err_new(code, 0);
+}
+
+# Get the error code.
+fn setu_err_code(e): i64 {
+    return load64(e);
+}
+
+# Get the detail string pointer (or 0).
+fn setu_err_detail(e): i64 {
+    return load64(e + 8);
+}
+
+# ================================================================
+# Error name lookup — returns a cstring (never null).
+# ================================================================
+
+fn setu_err_name(code): i64 {
+    if (code == SETU_OK)              { return "ok"; }
+    if (code == SETU_ERR_OOM)         { return "out of memory"; }
+    if (code == SETU_ERR_BADMSG)      { return "malformed message"; }
+    if (code == SETU_ERR_SHORT)       { return "truncated frame"; }
+    if (code == SETU_ERR_UNSUPPORTED) { return "unsupported feature"; }
+    if (code == SETU_ERR_OTHER)       { return "other error"; }
+    return "unknown error";
+}
+
+# Print an error name to stderr (fd 2).
+fn setu_err_print_name(code): i64 {
+    var name = setu_err_name(code);
+    syscall(SYS_WRITE, 2, name, strlen(name));
+    return 0;
+}

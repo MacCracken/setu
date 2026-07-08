@@ -1,0 +1,55 @@
+[package]
+name = "setu"
+version = "${file:VERSION}"
+description = "setu (सेतु — bridge) — the AGNOS native display-protocol CONTRACT lib: the dhancha client <-> aethersafha compositor wire. Carries ONLY pixel/input/surface-lifecycle message TYPES + a pure, allocation-light wire CODEC (encode/decode of little-endian i64 frames). No I/O in the lib — transport lives on each side. AGENT-FREE by construction: no agent/MCP concepts ride this plane (those ride a separate bote/t-ron/daimon endpoint). Consumed by both aethersafha (server) and dhancha (client)."
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/setu"
+language = "cyrius"
+# Toolchain pin — matched to the dhancha client (setu's primary consumer)
+# so the contract lib and its consumer build on the identical compiler.
+cyrius = "6.4.7"
+
+# setu is a library — no CLI binary. `cyrius build` targets a smoke
+# program that links the full include chain to prove lib.cyr parses clean.
+# It is the display-protocol CONTRACT between the dhancha client and the
+# aethersafha compositor — pure types + a pure wire codec, headless
+# RUN-testable (the sadish/dhancha discipline). Transport (Unix socket +
+# memfd/SCM_RIGHTS) lives in each side, NOT here.
+[build]
+entry = "programs/smoke.cyr"
+output = "build/setu-smoke"
+
+# `[lib]` feeds `cyrius distlib` — module order matters: stdlib first
+# (declared in src/lib.cyr), then domain modules in dependency order.
+# error.cyr is dep-free; proto.cyr builds on it; codec.cyr builds on both.
+# Don't reorder without re-running `cyrius distlib` and verifying the
+# concatenated bundle still compiles clean.
+[lib]
+modules = [
+    "src/error.cyr",
+    "src/proto.cyr",
+    "src/codec.cyr",
+]
+
+[deps]
+# Minimal stdlib set — exactly what the lib + tests actually use:
+#   string  — strlen / cstring helpers (error names, banners)
+#   fmt     — number formatting in test diagnostics
+#   alloc   — alloc() for message + frame buffers
+#   io      — write helpers used by the smoke banner / test output
+#   vec     — dynamic buffer helper available to consumers
+#   str     — string-builder helpers used by test diagnostics
+#   syscalls— SYS_EXIT / write; the BARE-call exit form
+#   assert  — RUN-test assertions
+# The codec is everything-is-i64 and allocation-light (little-endian byte
+# marshalling via load8/store8 builtins) — no extra dep needed for the wire.
+stdlib = [
+    "string",
+    "fmt",
+    "alloc",
+    "io",
+    "vec",
+    "str",
+    "syscalls",
+    "assert",
+]

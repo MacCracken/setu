@@ -1,0 +1,179 @@
+# @public — stable API surface for the setu wire codec.
+# codec.cyr — the PURE wire codec: SetuMsg <-> byte frame.
+#
+# NO I/O. NO allocation on the hot path (encode writes into a caller buffer;
+# decode fills a caller-provided SetuMsg). Transport (socket send/recv,
+# SCM_RIGHTS fd passing) lives in each side, NOT here — this file only
+# turns a message into bytes and untrusted bytes back into a validated
+# message.
+#
+# ---- Frame format ----
+#
+# A frame is a sequence of little-endian signed 64-bit words:
+#
+#   [ kind ][ argc ][ arg0 ][ arg1 ] ... [ arg(argc-1) ]
+#     8B      8B      8B      8B            8B
+#
+# So a frame is exactly (2 + argc) * 8 bytes. `kind` is the wire
+# discriminant (a SetuMsgKind); `argc` MUST equal the kind's canonical
+# arg count (setu_kind_argc) or the frame is rejected.
+#
+# ---- Untrusted input ----
+#
+# setu_decode is a WIRE PARSER over UNTRUSTED bytes. Every read is bounds-
+# checked against in_len BEFORE it happens; kind is range- + table-checked;
+# argc is validated against the per-kind table; args beyond the frame are
+# never read. A short or malformed frame returns a NEGATED SetuErr, never a
+# partial/garbage message.
+#
+# ---- Return convention ----
+#
+# Both entry points return a NON-NEGATIVE length on success, or a NEGATED
+# SetuErr code on failure (e.g. `0 - SETU_ERR_SHORT`). Callers test `< 0`
+# then `0 - rc` to recover the code. SETU_OK is 0 and is never returned as
+# an error (a zero-length frame is impossible — the header alone is 16B).
+
+var SETU_WORD = 8;    # bytes per wire word (i64, little-endian)
+
+# ================================================================
+# Little-endian i64 <-> bytes (bounds-checked byte marshalling).
+# ================================================================
+#
+# These operate on raw byte buffers via the load8/store8 builtins so the
+# codec is endianness-explicit and allocation-free. `store8` writes the low
+# 8 bits; `load8` reads an unsigned byte.
+
+# Write a signed 64-bit value at buf+off as 8 little-endian bytes.
+# Caller guarantees [off, off+8) is in range. Uses `& 0xFF` after a per-byte
+# right shift to extract each byte, so the sign of `v` never corrupts the
+# decomposition (unlike `% 256` / `/ 256`, which do NOT floor for negatives).
+fn setu_put_i64(buf, off, v): i64 {
+    var i = 0;
+    while (i < SETU_WORD) {
+        store8(buf + off + i, (v >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Read 8 little-endian bytes at buf+off into a signed 64-bit value.
+# Caller guarantees [off, off+8) is in range. Each byte is masked to its
+# unsigned value (load8) and OR'd in at its LE weight; the top byte's bit 7
+# lands at bit 63, so the original signed value is reconstructed bit-for-bit
+# (two's complement, mod 2^64).
+fn setu_get_i64(buf, off): i64 {
+    var v = 0;
+    var i = 0;
+    while (i < SETU_WORD) {
+        v = v | ((load8(buf + off + i) & 0xFF) << (i * 8));
+        i = i + 1;
+    }
+    return v;
+}
+
+# ================================================================
+# Encode: SetuMsg -> frame bytes.
+# ================================================================
+#
+# setu_encode(msg, out_buf, out_cap) -> encoded_len, or a negated SetuErr.
+#
+# Writes [kind][argc][args...] as LE i64 words into out_buf. Every write is
+# bounds-checked against out_cap FIRST — a buffer too small yields
+# SETU_ERR_SHORT and writes nothing past the cap. The message is validated
+# (known kind + argc matches the table) before any bytes are emitted, so a
+# malformed in-memory message yields SETU_ERR_BADMSG.
+fn setu_encode(msg, out_buf, out_cap): i64 {
+    # Validate shape before emitting anything.
+    var verr = setu_msg_validate(msg);
+    if (verr != SETU_OK) { return 0 - verr; }
+
+    var kind = setu_msg_kind(msg);
+    var argc = setu_msg_argc(msg);
+
+    # Required frame length = (2 header words + argc arg words) * 8.
+    var need = (2 + argc) * SETU_WORD;
+    if (out_cap < need) { return 0 - SETU_ERR_SHORT; }
+
+    # Header.
+    setu_put_i64(out_buf, 0, kind);
+    setu_put_i64(out_buf, SETU_WORD, argc);
+
+    # Args.
+    var i = 0;
+    while (i < argc) {
+        var off = (2 + i) * SETU_WORD;
+        setu_put_i64(out_buf, off, setu_msg_arg(msg, i));
+        i = i + 1;
+    }
+
+    return need;
+}
+
+# ================================================================
+# Decode: frame bytes -> SetuMsg (UNTRUSTED input — hardened).
+# ================================================================
+#
+# setu_decode(in_buf, in_len, msg_out) -> consumed_len, or a negated SetuErr.
+#
+# Reads one frame from the front of in_buf. Bounds discipline:
+#   1. Need the 16-byte header before reading kind/argc  -> SETU_ERR_SHORT.
+#   2. kind must be a known SetuMsgKind                   -> SETU_ERR_BADMSG.
+#   3. argc must equal the kind's table value             -> SETU_ERR_BADMSG.
+#      (This rejects a hostile argc BEFORE it is used to size any read, so a
+#      forged huge argc can never drive an out-of-bounds arg loop.)
+#   4. The full (2+argc)*8 bytes must be present          -> SETU_ERR_SHORT.
+#   5. Only then are the argc args read into msg_out.
+#
+# msg_out is a caller-provided SetuMsg (setu_msg_new()); it is fully
+# overwritten on success. On any error msg_out is left untouched by the arg
+# loop (kind/argc may have been read but the message is not returned as
+# valid — the negative return is the contract). consumed_len lets a caller
+# advance past this frame to parse the next.
+fn setu_decode(in_buf, in_len, msg_out): i64 {
+    # (1) header present?
+    var header = 2 * SETU_WORD;   # 16 bytes: kind + argc
+    if (in_len < header) { return 0 - SETU_ERR_SHORT; }
+
+    var kind = setu_get_i64(in_buf, 0);
+    var argc = setu_get_i64(in_buf, SETU_WORD);
+
+    # (2) known kind?
+    if (setu_kind_valid(kind) == 0) { return 0 - SETU_ERR_BADMSG; }
+
+    # (3) argc matches the per-kind table? (validated before it sizes reads)
+    var want = setu_kind_argc(kind);
+    if (argc != want) { return 0 - SETU_ERR_BADMSG; }
+
+    # (4) full frame present?
+    var need = (2 + argc) * SETU_WORD;
+    if (in_len < need) { return 0 - SETU_ERR_SHORT; }
+
+    # (5) commit into msg_out.
+    setu_msg_set_kind(msg_out, kind);
+    setu_msg_set_argc(msg_out, argc);
+    var i = 0;
+    while (i < argc) {
+        var off = (2 + i) * SETU_WORD;
+        setu_msg_set_arg(msg_out, i, setu_get_i64(in_buf, off));
+        i = i + 1;
+    }
+    # Zero any unused arg slots so a reused msg_out has no stale tail.
+    while (i < SETU_MAX_ARGS) {
+        setu_msg_set_arg(msg_out, i, 0);
+        i = i + 1;
+    }
+
+    return need;
+}
+
+# ================================================================
+# Convenience: the exact encoded length of a valid message.
+# ================================================================
+#
+# Returns (2+argc)*8 for a valid message, or a negated SetuErr if the
+# message is malformed. Lets a caller size a buffer before encoding.
+fn setu_encoded_len(msg): i64 {
+    var verr = setu_msg_validate(msg);
+    if (verr != SETU_OK) { return 0 - verr; }
+    return (2 + setu_msg_argc(msg)) * SETU_WORD;
+}

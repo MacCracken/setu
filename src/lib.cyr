@@ -1,0 +1,45 @@
+# @public — setu library include chain.
+# setu (सेतु — bridge) — the AGNOS native display-protocol CONTRACT lib.
+#
+# The bridge between the dhancha CLIENT and the aethersafha COMPOSITOR:
+# it carries ONLY pixel / input / surface-lifecycle message TYPES plus a
+# pure wire CODEC (marshal/unmarshal as pure functions). No I/O lives here
+# — the transport (a Unix-domain control+event socket + memfd/shm buffers
+# passed via SCM_RIGHTS) lives on each SIDE, not in this contract lib.
+# Consumed by BOTH aethersafha (server) and dhancha (client), so the wire
+# has exactly one definition.
+#
+# AGENT-FREE by construction. No agent / MCP concepts ride this plane —
+# surface introspection and drive-verbs ride a SEPARATE bote/t-ron/daimon
+# endpoint (the agent plane, §3 of the native-display-protocol design). That
+# split is what keeps the desktop AI-OPTIONAL by construction: a plain GUI
+# app speaks only setu and never touches an agent concept.
+#
+# Stdlib includes live ONLY in this file — domain modules are flat, which
+# is what makes `cyrius distlib` (strip-include concatenation) produce a
+# compile-clean `dist/setu.cyr`. Don't add stdlib includes in individual
+# src/*.cyr files.
+
+# ================================================================
+# Standard library
+# ================================================================
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/syscalls.cyr"
+include "lib/assert.cyr"
+
+# ================================================================
+# setu domain modules — flat, dependency order.
+# error.cyr is dep-free (the shared error vocabulary). proto.cyr (the
+# SetuMsg record + message kinds + per-kind argc table + constructors)
+# builds on it. codec.cyr (pure encode/decode of the LE i64 wire frame)
+# builds on both — it validates via proto's table and reports via error's
+# codes. Reordering breaks `cyrius distlib`; keep this order.
+# ================================================================
+include "src/error.cyr"
+include "src/proto.cyr"
+include "src/codec.cyr"
