@@ -621,17 +621,17 @@ fn setu_cl_sockaddr(addr_buf, path): i64 {
 # (>= 0) or a negative code (-2 socket, -3 connect). agnos: AF_UNIX fail-closes
 # (3b brings a TCP/shm transport) -> -1 without referencing Linux socket nrs.
 fn setu_connect(path): i64 {
-#ifdef CYRIUS_TARGET_AGNOS
+    #ifdef CYRIUS_TARGET_AGNOS
     return 0 - 1;
-#endif
-#ifndef CYRIUS_TARGET_AGNOS
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var fd = syscall(SYS_SOCKET, SETU_AF_UNIX, SETU_SOCK_STREAM, 0);
     if (fd < 0) { return 0 - 2; }
     var addr = alloc(110);
     var alen = setu_cl_sockaddr(addr, path);
     if (syscall(SYS_CONNECT, fd, addr, alen) < 0) { syscall(SYS_CLOSE, fd); return 0 - 3; }
     return fd;
-#endif
+    #endif
 }
 
 # Encode `msg` and write the whole frame to `fd`. Returns bytes written (> 0), a
