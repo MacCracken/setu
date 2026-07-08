@@ -593,9 +593,10 @@ fn setu_encoded_len(msg): i64 {
 # semantic layer (DhEvent / terminal keys) stays in each consumer.
 #
 # Transport = AF_UNIX SOCK_STREAM (the sovereign local pattern; prior-art
-# aethersafha setu_server, bote transport_unix). Linux-only for now: AF_UNIX
-# fail-closes on agnos until the agnos transport (3b) lands — setu_connect is
-# guarded so --agnos builds link clean and fail closed at runtime.
+# aethersafha setu_server, bote transport_unix). Linux-only until the agnos
+# transport lands (item 3b, agnosticos native-display-protocol.md): AF_UNIX
+# fail-closes on agnos, so setu_connect is guarded — --agnos builds link clean
+# and fail closed at runtime.
 
 var SETU_AF_UNIX     = 1;   # AF_UNIX
 var SETU_SOCK_STREAM = 1;   # SOCK_STREAM

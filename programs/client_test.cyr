@@ -28,10 +28,14 @@ fn main(): i64 {
     check(load8(&addr + 7), 120);           # 'x' (last path byte)
     check(load8(&addr + 8), 0);             # trailing NUL
 
-    # A long path clamps to 107 bytes of path + family + NUL = 110.
-    var lng = "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaZZZ";
-    var lal = setu_cl_sockaddr(&addr, lng);
-    check(lal, 110);                        # 2 + 107 + 1, clamped
+    # A long path (> 107) clamps to 107 bytes of path + family + NUL = 110.
+    # Built in a buffer (not a 120+ char literal) to keep the source line short.
+    var lbuf[128];
+    var li = 0;
+    while (li < 115) { store8(&lbuf + li, 97); li = li + 1; }   # 115 'a's
+    store8(&lbuf + 115, 0);                                     # terminate
+    var lal = setu_cl_sockaddr(&addr, &lbuf);
+    check(lal, 110);                        # 2 + 107 (clamped) + 1
     check(load8(&addr + 109), 0);           # NUL still terminates within 110
 
     if (g_fails == 0) {
