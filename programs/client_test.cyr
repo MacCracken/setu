@@ -1,0 +1,52 @@
+# programs/client_test.cyr — RUN test for the setu client transport.
+#
+# The socket ops (connect/send/recv) need a live compositor peer — they are
+# proven end-to-end by the puka <-> aethersafha integration. Here we unit-test
+# the PURE, host-testable part: setu_cl_sockaddr's sockaddr_un layout (family +
+# path + NUL + returned length). Exit code = failed checks (0 = PASS), matching
+# the setu codec_test / sadish RUN-test convention the CI globs.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    var addr[128];                          # >= 110 (sockaddr_un)
+    var path = "/tmp/x";                    # 6 chars
+
+    var alen = setu_cl_sockaddr(&addr, path);
+    check(alen, 9);                         # 2 (family) + 6 (path) + 1 (NUL)
+    check(load8(&addr), SETU_AF_UNIX);      # sun_family low byte = AF_UNIX (1)
+    check(load8(&addr + 1), 0);             # sun_family high byte = 0
+    check(load8(&addr + 2), 47);            # '/' (0x2F)
+    check(load8(&addr + 3), 116);           # 't'
+    check(load8(&addr + 7), 120);           # 'x' (last path byte)
+    check(load8(&addr + 8), 0);             # trailing NUL
+
+    # A long path clamps to 107 bytes of path + family + NUL = 110.
+    var lng = "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaZZZ";
+    var lal = setu_cl_sockaddr(&addr, lng);
+    check(lal, 110);                        # 2 + 107 + 1, clamped
+    check(load8(&addr + 109), 0);           # NUL still terminates within 110
+
+    if (g_fails == 0) {
+        var ok = "client_test: PASS (sockaddr_un layout + clamp)\n";
+        syscall(SYS_WRITE, 1, ok, strlen(ok));
+    } else {
+        var f = "client_test: FAIL\n";
+        syscall(SYS_WRITE, 2, f, strlen(f));
+    }
+    return g_fails;
+}
+
+fn _entry(): i64 {
+    var r = main();
+    syscall(SYS_EXIT, r);
+    return 0;
+}
+_entry();

@@ -1,15 +1,20 @@
 # setu
 
-Version: 0.1.0
+Version: 0.2.0
 
 **setu** (सेतु — Sanskrit/Hindi: *bridge*) is the pure-Cyrius **native
-display-protocol contract lib** for AGNOS — the wire between the `dhancha`
-client and the `aethersafha` compositor. It carries **only** pixel, input,
-and surface-lifecycle message **types** plus a pure wire **codec**
-(marshal / unmarshal as pure functions). There is **no I/O in the lib** —
-the transport (a Unix-domain control+event socket + memfd/shm pixel buffers
-passed over `SCM_RIGHTS`) lives on each side. Because the contract has
-exactly one definition, both sides agree on the wire by construction.
+display-protocol** for AGNOS — the wire between GUI clients and the
+`aethersafha` compositor. It carries the pixel, input, and surface-lifecycle
+message **types**, a pure wire **codec** (marshal / unmarshal as pure,
+host-testable functions), and — since **v0.2.0** — the **reference client
+transport** (`client.cyr`): the persistent AF_UNIX connection every app owns
+(`setu_client_connect` → `setu_client_present` → `setu_client_recv` →
+`setu_client_close`). The codec stays pure; the client is the **one**
+implementation both consumers share — `dhancha` renders widgets → pixels,
+`puka` renders a cell grid → pixels, and both present raw buffers through it —
+so the transport has a single definition, not one per consumer. The compositor
+SIDE (accept / serve) lives in `aethersafha`. Because the contract has exactly
+one definition, both sides agree on the wire by construction.
 
 It is **agent-free by design.** No agent / MCP concepts ride this plane.
 Surface introspection and drive-verbs ride a **separate** `bote` / `t-ron` /

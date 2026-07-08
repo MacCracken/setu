@@ -4,6 +4,38 @@ All notable changes to **setu** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-07-08
+
+The reference **client transport** joins the lib: setu is now the protocol
+CONTRACT (proto/codec) **plus** its reference client, so both consumers —
+`dhancha` (toolkit) and `puka` (terminal) — share one implementation instead of
+duplicating it.
+
+### Added
+
+- **`src/client.cyr`** — setu's reference CLIENT transport, promoted in from
+  dhancha's `dh_setu_*` / `DhClient` (a MOVE, generalized to raw buffers).
+  - **Framing primitives** — `setu_connect` (AF_UNIX; agnos-guarded, fail-closes
+    until the agnos transport 3b lands), `setu_send`, `setu_recv`,
+    `setu_read_exact`, `setu_read_msg` (length-framed stream read), and the pure
+    `setu_cl_sockaddr` (`sockaddr_un` builder).
+  - **`SetuClient`** — the persistent, RAW-BUFFER app handle:
+    `setu_client_connect` → `setu_client_present(pix, w, h)` (lazily
+    `CREATE_SURFACE` on first present, then `ATTACH` + inline pixels + `COMMIT`)
+    → `setu_client_recv` (one framed setu message) → `setu_client_close`.
+    Consumers layer their own render on top and present raw buffers.
+- **`programs/client_test.cyr`** — RUN test for the pure `setu_cl_sockaddr`
+  layout + long-path clamp. (The socket ops are proven end-to-end by the
+  `puka` ↔ `aethersafha` integration.)
+
+### Changed
+
+- **setu is no longer I/O-free.** The lib now ships the reference client (the
+  codec remains pure/host-testable). `src/lib.cyr` + `[lib].modules` include
+  `client.cyr`; both Linux and `--agnos` build clean (the `setu_connect` agnos
+  guard compiles without referencing Linux socket numbers). README + lib header
+  updated. **Agent-free by construction is unchanged.**
+
 ## [0.1.0] — 2026-07-07
 
 Initial scaffold — the AGNOS native display-protocol contract lib: the

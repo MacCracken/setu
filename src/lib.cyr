@@ -2,12 +2,15 @@
 # setu (सेतु — bridge) — the AGNOS native display-protocol CONTRACT lib.
 #
 # The bridge between the dhancha CLIENT and the aethersafha COMPOSITOR:
-# it carries ONLY pixel / input / surface-lifecycle message TYPES plus a
-# pure wire CODEC (marshal/unmarshal as pure functions). No I/O lives here
-# — the transport (a Unix-domain control+event socket + memfd/shm buffers
-# passed via SCM_RIGHTS) lives on each SIDE, not in this contract lib.
-# Consumed by BOTH aethersafha (server) and dhancha (client), so the wire
-# has exactly one definition.
+# it carries the pixel / input / surface-lifecycle message TYPES, a pure wire
+# CODEC (marshal/unmarshal as pure functions), AND the reference CLIENT
+# transport (client.cyr — the persistent AF_UNIX connection every app owns).
+# The codec stays pure/host-testable; the client is the ONE implementation
+# both consumers share (dhancha renders widgets -> pixels, puka renders a cell
+# grid -> pixels; both present raw buffers through setu_client_present) so the
+# transport has a single definition, not one per consumer. The compositor SIDE
+# (accept/serve) still lives in aethersafha. Consumed by aethersafha (server)
+# + dhancha (toolkit client) + puka (terminal client).
 #
 # AGENT-FREE by construction. No agent / MCP concepts ride this plane —
 # surface introspection and drive-verbs ride a SEPARATE bote/t-ron/daimon
@@ -43,3 +46,4 @@ include "lib/assert.cyr"
 include "src/error.cyr"
 include "src/proto.cyr"
 include "src/codec.cyr"
+include "src/client.cyr"
