@@ -581,89 +581,140 @@ fn setu_encoded_len(msg): i64 {
 # client.cyr — setu's reference CLIENT transport (persistent connection).
 #
 # Promoted into setu (from dhancha's dh_setu_* / DhClient) so BOTH consumers —
-# dhancha (widget toolkit) and puka (terminal) — share ONE client implementation
-# instead of duplicating it. setu is now the protocol CONTRACT (proto/codec) +
-# its reference CLIENT/SERVER transport, not the codec alone.
+# dhancha (widget toolkit) and puka (terminal) — share ONE client. setu is the
+# protocol CONTRACT (proto/codec) + this reference CLIENT/SERVER transport.
 #
-# RAW-BUFFER model: connect once, create a surface once, then present an
-# already-rendered w*h BGRA pixel buffer (ATTACH + inline pixels + COMMIT) and
-# pump input frames — all over the same fd. Consumers layer their own render on
-# top: dhancha renders a widget SdSurface -> pixels; puka renders its cell grid
-# -> a CPU framebuffer. setu delivers raw setu MESSAGES (setu_client_recv); the
-# semantic layer (DhEvent / terminal keys) stays in each consumer.
+# TRANSPORT (item 3b) = TCP over loopback (127.0.0.1 : SETU_TCP_PORT) via the
+# cyrius `net.cyr` socket layer — CROSS-PLATFORM by construction: net.cyr routes
+# to Linux BSD sockets on the host AND to agnos's kernel TCP band
+# (sock_connect #47 / sock_listen #56 / sock_accept #57, tagged-fd send/recv
+# #48/#49) on agnos. This REPLACES the earlier AF_UNIX path (which fail-closed on
+# agnos): setu now speaks the same wire on Linux AND agnos, so puka + the desktop
+# run on the sovereign kernel, not just Linux. One well-known loopback port —
+# the desktop has a single compositor endpoint; `path` params are kept for API
+# compatibility but are advisory (the transport is TCP:SETU_TCP_PORT).
 #
-# Transport = AF_UNIX SOCK_STREAM (the sovereign local pattern; prior-art
-# aethersafha setu_server, bote transport_unix). Linux-only until the agnos
-# transport lands (item 3b, agnosticos native-display-protocol.md): AF_UNIX
-# fail-closes on agnos, so setu_connect is guarded — --agnos builds link clean
-# and fail closed at runtime.
+# Two agnos socket semantics the framing must absorb (both #ifdef-guarded so
+# Linux behaviour is byte-identical to before):
+#   - `sock_recv` (#49) is NON-BLOCKING: 0 = would-block, -1 = EOF (inverted from
+#     Linux's 0 = EOF). setu_read_blk retries-with-yield (bounded) on agnos.
+#   - `sock_send` (#48) may send < len. setu_write_all loops until the whole
+#     buffer is out (a large pixel payload can't go in one syscall).
+# RAW-BUFFER persistent client: connect once → create surface once → ATTACH +
+# inline pixels + COMMIT per present → recv frames. Consumers layer their render.
 
-var SETU_AF_UNIX     = 1;   # AF_UNIX
-var SETU_SOCK_STREAM = 1;   # SOCK_STREAM
+var SETU_TCP_PORT = 7700;   # the compositor's well-known setu loopback port
 
 # =========================================================================
-# sockaddr + framing primitives (transport-level, over the setu codec)
+# TCP transport + framing primitives (over the setu codec, via net.cyr)
 # =========================================================================
 
-# Build a sockaddr_un (110 bytes) at `addr_buf` for `path` (cstr). Returns the
-# struct length to pass to connect() (sun_family + path + NUL). Pure — testable.
-fn setu_cl_sockaddr(addr_buf, path): i64 {
-    memset(addr_buf, 0, 110);
-    store16(addr_buf, SETU_AF_UNIX);
-    var plen = strlen(path);
-    if (plen > 107) { plen = 107; }
-    memcpy(addr_buf + 2, path, plen);
-    store8(addr_buf + 2 + plen, 0);
-    return 2 + plen + 1;
+# Connect to the compositor's setu endpoint (loopback : SETU_TCP_PORT). `path` is
+# advisory (kept for API compat). Returns the connected fd (>= 0), or -2 (socket)
+# / -3 (connect). Cross-platform via net.cyr.
+fn setu_connect(path): i64 {
+    var s = tcp_socket();
+    if (is_ok(s) == 0) { return 0 - 2; }
+    var fd = result_unwrap(s);
+    if (is_ok(sock_connect(fd, INADDR_LOOPBACK(), SETU_TCP_PORT)) == 0) {
+        sock_close(fd);
+        return 0 - 3;
+    }
+    return fd;
 }
 
-# Connect to the compositor's setu socket at `path`. Returns the connected fd
-# (>= 0) or a negative code (-2 socket, -3 connect). agnos: AF_UNIX fail-closes
-# (3b brings a TCP/shm transport) -> -1 without referencing Linux socket nrs.
-fn setu_connect(path): i64 {
-    #ifdef CYRIUS_TARGET_AGNOS
-    return 0 - 1;
-    #endif
+# --- server transport (the compositor owns the listener) ---------------------
+
+# Bind + listen on the setu endpoint (loopback : SETU_TCP_PORT). `path` advisory.
+# Returns the listening fd (>= 0), or -2 (socket) / -3 (bind) / -4 (listen). The
+# fd is set non-blocking so setu_accept polls (agnos #57 is already non-blocking).
+fn setu_listen(path): i64 {
+    var s = tcp_socket();
+    if (is_ok(s) == 0) { return 0 - 2; }
+    var fd = result_unwrap(s);
     #ifndef CYRIUS_TARGET_AGNOS
-    var fd = syscall(SYS_SOCKET, SETU_AF_UNIX, SETU_SOCK_STREAM, 0);
-    if (fd < 0) { return 0 - 2; }
-    var addr = alloc(110);
-    var alen = setu_cl_sockaddr(addr, path);
-    if (syscall(SYS_CONNECT, fd, addr, alen) < 0) { syscall(SYS_CLOSE, fd); return 0 - 3; }
-    return fd;
+    sock_reuse(fd);                                  # SO_REUSEADDR — rebind after a restart
     #endif
+    if (is_ok(sock_bind(fd, INADDR_LOOPBACK(), SETU_TCP_PORT)) == 0) { sock_close(fd); return 0 - 3; }
+    if (is_ok(sock_listen(fd, 8)) == 0) { sock_close(fd); return 0 - 4; }
+    #ifndef CYRIUS_TARGET_AGNOS
+    sock_set_nonblocking(fd);                        # accept polls (agnos accept is already non-blocking)
+    #endif
+    return fd;
+}
+
+# Accept the next pending client on `sfd`. Returns the client fd (>= 0), or -5
+# when none is pending (WOULD_BLOCK — the compositor polls again next frame).
+# Non-blocking on BOTH targets, so the frame loop never stalls on accept.
+fn setu_accept(sfd): i64 {
+    var a = sock_accept(sfd);
+    if (is_ok(a) == 1) { return result_unwrap(a); }
+    return 0 - 5;                                    # EAGAIN / no client pending
+}
+
+# --- write --------------------------------------------------------------------
+
+# Write EXACTLY `n` bytes from `buf` to `fd`, looping over partial sends (agnos
+# sock_send #48 may send < len). Returns `n` (>= 0) or -7 on a write error.
+fn setu_write_all(fd, buf, n): i64 {
+    var sent = 0;
+    while (sent < n) {
+        var w = syscall(SYS_WRITE, fd, buf + sent, n - sent);
+        if (w <= 0) { return 0 - 7; }
+        sent = sent + w;
+    }
+    return n;
 }
 
 # Encode `msg` and write the whole frame to `fd`. Returns bytes written (> 0), a
-# negated SetuErr on encode failure, or -7 on a short write. The widest setu
-# frame fits in 128 bytes.
+# negated SetuErr on encode failure, or -7 on a write error. Widest frame ≤ 128 B.
 fn setu_send(fd, msg): i64 {
     var cap = 128;
     var buf = alloc(cap);
     var enc = setu_encode(msg, buf, cap);
     if (enc < 0) { return enc; }
-    var w = syscall(SYS_WRITE, fd, buf, enc);
-    if (w != enc) { return 0 - 7; }
-    return w;
+    if (setu_write_all(fd, buf, enc) < 0) { return 0 - 7; }
+    return enc;
+}
+
+# Read at least 1 byte into `buf` (cap `cap`), blocking until data / EOF. Absorbs
+# agnos's non-blocking recv (0 = would-block → yield + bounded retry) vs Linux's
+# blocking read (0 = EOF). Returns bytes (> 0), or -6 on EOF / error / timeout.
+fn setu_read_blk(fd, buf, cap): i64 {
+    var tries = 0;
+    while (tries <= 5000) {
+        var r = syscall(SYS_READ, fd, buf, cap);
+        #ifdef CYRIUS_TARGET_AGNOS
+        if (r < 0) { return 0 - 6; }               # -1 = EOF / error
+        if (r > 0) { return r; }                   # got bytes
+        tries = tries + 1;                          # r == 0 → would-block
+        sys_sleep_ms(2);                            # yield (~10s cap at 5000*2ms)
+        #endif
+        #ifndef CYRIUS_TARGET_AGNOS
+        if (r <= 0) { return 0 - 6; }               # 0 = EOF on Linux
+        return r;
+        #endif
+    }
+    return 0 - 6;                                    # would-block timeout (agnos)
 }
 
 # Read ONE setu frame from `fd` into `msg_out` via a single bulk read. Returns
-# the decoded length (> 0), -6 on empty read / EOF, or a negated SetuErr. Use
-# setu_read_msg (length-framed) when reading a continuous STREAM of frames.
+# the decoded length (> 0), -6 on EOF, or a negated SetuErr. Use setu_read_msg
+# (length-framed) when reading a continuous STREAM of frames.
 fn setu_recv(fd, msg_out): i64 {
     var cap = 256;
     var buf = alloc(cap);
-    var n = syscall(SYS_READ, fd, buf, cap);
+    var n = setu_read_blk(fd, buf, cap);
     if (n <= 0) { return 0 - 6; }
     return setu_decode(buf, n, msg_out);
 }
 
-# Read EXACTLY `n` bytes from `fd` into `buf`, looping over short reads. Returns
-# `n` (>= 0) or -6 on EOF/error.
+# Read EXACTLY `n` bytes from `fd` into `buf`, looping over short/would-block
+# reads. Returns `n` (>= 0) or -6 on EOF/error.
 fn setu_read_exact(fd, buf, n): i64 {
     var got = 0;
     while (got < n) {
-        var r = syscall(SYS_READ, fd, buf + got, n - got);
+        var r = setu_read_blk(fd, buf + got, n - got);
         if (r <= 0) { return 0 - 6; }
         got = got + r;
     }
@@ -697,9 +748,8 @@ enum SetuClientOff {
     SETU_C_SZ  = 16;
 }
 
-# Connect to the compositor's setu socket at `path`. Returns a *SetuClient, or 0
-# on failure (agnos: always 0 until 3b). The surface is created lazily on the
-# first setu_client_present.
+# Connect to the compositor's setu endpoint. Returns a *SetuClient, or 0 on
+# failure. The surface is created lazily on the first setu_client_present.
 fn setu_client_connect(path): i64 {
     var fd = setu_connect(path);
     if (fd < 0) { return 0; }
@@ -712,11 +762,11 @@ fn setu_client_connect(path): i64 {
 fn setu_client_fd(c): i64  { return load64(c + SETU_C_FD); }
 fn setu_client_sid(c): i64 { return load64(c + SETU_C_SID); }
 
-# Present an already-rendered w*h BGRA pixel buffer `pix` over the client's
-# connection. On the first present it creates the surface once (CREATE_SURFACE ->
-# SURFACE_CREATED, storing the id); every present sends ATTACH + inline pixels +
-# COMMIT. Returns 0 or a negative code (-41 create send, -6 recv, -8 unexpected
-# reply, -42 attach send, -43 short pixel write, -44 commit send).
+# Present an already-rendered w*h BGRA pixel buffer `pix`. On the first present it
+# creates the surface once (CREATE_SURFACE -> SURFACE_CREATED, storing the id);
+# every present sends ATTACH + inline pixels + COMMIT. Returns 0 or a negative
+# code (-41 create send, -6 recv, -8 unexpected reply, -42 attach send, -43 pixel
+# write, -44 commit send).
 fn setu_client_present(c, pix, w, h): i64 {
     var fd = setu_client_fd(c);
     var id = setu_client_sid(c);
@@ -731,7 +781,7 @@ fn setu_client_present(c, pix, w, h): i64 {
     var stride = w * 4;
     var nbytes = h * stride;
     if (setu_send(fd, setu_attach(id, w, h, stride, 1)) < 0) { return 0 - 42; }
-    if (syscall(SYS_WRITE, fd, pix, nbytes) != nbytes) { return 0 - 43; }
+    if (setu_write_all(fd, pix, nbytes) < 0) { return 0 - 43; }
     if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }
     return 0;
 }
@@ -744,6 +794,6 @@ fn setu_client_recv(c, msg_out): i64 {
 }
 
 fn setu_client_close(c): i64 {
-    syscall(SYS_CLOSE, setu_client_fd(c));
+    sock_close(setu_client_fd(c));
     return 0;
 }

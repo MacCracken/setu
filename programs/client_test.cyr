@@ -1,10 +1,11 @@
 # programs/client_test.cyr — RUN test for the setu client transport.
 #
-# The socket ops (connect/send/recv) need a live compositor peer — they are
-# proven end-to-end by the puka <-> aethersafha integration. Here we unit-test
-# the PURE, host-testable part: setu_cl_sockaddr's sockaddr_un layout (family +
-# path + NUL + returned length). Exit code = failed checks (0 = PASS), matching
-# the setu codec_test / sadish RUN-test convention the CI globs.
+# The socket ops (connect/listen/accept/send/recv) need a live compositor peer —
+# they are proven end-to-end by the puka <-> aethersafha integration over TCP
+# loopback (item 3b). Here we assert the pure/linkable surface: the well-known
+# transport port + a framed round-trip through the codec the client sends/reads,
+# so the client module links and its framing is sound. Exit code = failed checks
+# (0 = PASS), matching the setu codec_test / sadish RUN-test convention.
 
 include "src/lib.cyr"
 
@@ -16,30 +17,25 @@ fn check(got, want): i64 {
 }
 
 fn main(): i64 {
-    var addr[128];                          # >= 110 (sockaddr_un)
-    var path = "/tmp/x";                    # 6 chars
+    # The setu channel is a well-known loopback TCP port (the 3b transport).
+    check(SETU_TCP_PORT, 7700);
 
-    var alen = setu_cl_sockaddr(&addr, path);
-    check(alen, 9);                         # 2 (family) + 6 (path) + 1 (NUL)
-    check(load8(&addr), SETU_AF_UNIX);      # sun_family low byte = AF_UNIX (1)
-    check(load8(&addr + 1), 0);             # sun_family high byte = 0
-    check(load8(&addr + 2), 47);            # '/' (0x2F)
-    check(load8(&addr + 3), 116);           # 't'
-    check(load8(&addr + 7), 120);           # 'x' (last path byte)
-    check(load8(&addr + 8), 0);             # trailing NUL
-
-    # A long path (> 107) clamps to 107 bytes of path + family + NUL = 110.
-    # Built in a buffer (not a 120+ char literal) to keep the source line short.
-    var lbuf[128];
-    var li = 0;
-    while (li < 115) { store8(&lbuf + li, 97); li = li + 1; }   # 115 'a's
-    store8(&lbuf + 115, 0);                                     # terminate
-    var lal = setu_cl_sockaddr(&addr, &lbuf);
-    check(lal, 110);                        # 2 + 107 (clamped) + 1
-    check(load8(&addr + 109), 0);           # NUL still terminates within 110
+    # A framed round-trip through the client's send/read shape: build a
+    # CREATE_SURFACE, encode it into a frame buffer, decode it back, and assert
+    # the surface dims survive the LE-i64 wire.
+    var m = setu_create_surface(320, 200, 0);
+    var buf = alloc(128);
+    var enc = setu_encode(m, buf, 128);
+    check(enc > 0, 1);
+    var out = setu_msg_new();
+    var dec = setu_decode(buf, enc, out);
+    check(dec > 0, 1);
+    check(setu_msg_kind(out), SETU_CREATE_SURFACE);
+    check(setu_msg_arg(out, 0), 320);
+    check(setu_msg_arg(out, 1), 200);
 
     if (g_fails == 0) {
-        var ok = "client_test: PASS (sockaddr_un layout + clamp)\n";
+        var ok = "client_test: PASS (transport port + framed create-surface round-trip)\n";
         syscall(SYS_WRITE, 1, ok, strlen(ok));
     } else {
         var f = "client_test: FAIL\n";
@@ -48,9 +44,5 @@ fn main(): i64 {
     return g_fails;
 }
 
-fn _entry(): i64 {
-    var r = main();
-    syscall(SYS_EXIT, r);
-    return 0;
-}
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
 _entry();

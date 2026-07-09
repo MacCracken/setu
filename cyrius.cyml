@@ -53,4 +53,7 @@ stdlib = [
     "str",
     "syscalls",
     "assert",
+    "result",   # Result (Ok/Err/is_ok/result_unwrap) — net.cyr's return type
+    "net",      # cross-platform TCP sockets (tcp_socket/sock_*) — the 3b transport
+    "chrono",   # sys_sleep_ms — the agnos would-block read yield
 ]
