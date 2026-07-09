@@ -1,0 +1,91 @@
+# buf.cyr — setu SHARED-BUFFER backend (out-of-band pixel transport).
+#
+# Replaces inline-pixel streaming: the client renders into a shared buffer, ATTACH
+# carries the buffer id (setu_attach_buf, arg5 > 0) instead of the pixels, and the
+# compositor maps the SAME buffer by id and blits from it. This sidesteps the
+# single-CPU two-proc TCP flow-control deadlock on agnos (TCP_RX_RING = 2 KB, but a
+# surface is hundreds of KB) AND is lower-copy. See
+# agnosticos/docs/development/planning/shared-buffer-present.md.
+#
+# The buffer is referenced by an integer id sent over the setu wire — NO fd passing,
+# so it rides setu's TCP transport on both targets. Platform backends resolve the id
+# to the same physical pages:
+#   Linux  — a tmpfs file /dev/shm/setu-buf-<id>, ftruncate'd + mmap'd MAP_SHARED
+#            (both procs see each other's writes). Pure userland; no kernel change.
+#   agnos  — kernel shared-memory syscalls (shm_create/shm_map). STUBBED here; landed
+#            in the agnos shm bite (planning doc bite 2). agnos mmap#27 is anon-PRIVATE,
+#            so a shared id'd region is a new kernel capability.
+
+var _setu_buf_counter = 0;
+
+# Build "/dev/shm/setu-buf-<buf_id>\0" into `out` (caller supplies >= 48 bytes).
+fn setu_buf_path(buf_id, out): i64 {
+    var prefix = "/dev/shm/setu-buf-";
+    var plen = strlen(prefix);
+    var i = 0;
+    while (i < plen) { store8(out + i, load8(prefix + i)); i = i + 1; }
+    var nl = fmt_int_buf(buf_id, out + plen);
+    store8(out + plen + nl, 0);
+    return 0;
+}
+
+# Client: allocate a fresh shared buffer of `size` bytes. Returns a buffer id (> 0)
+# or -1. On Linux this creates + ftruncates the tmpfs file; map it next to fill it.
+fn setu_buf_create(size): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0 - 1;                          # agnos shm bite (planning doc)
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var pid = syscall(39);                 # getpid — per-proc uniqueness seed
+    _setu_buf_counter = _setu_buf_counter + 1;
+    var id = pid * 100000 + _setu_buf_counter;
+    var path[48];
+    setu_buf_path(id, &path);
+    var fd = sys_open(&path, 66, 384);     # O_RDWR|O_CREAT (2|64), mode 0600
+    if (fd < 0) { return 0 - 1; }
+    if (syscall(77, fd, size) < 0) { sys_close(fd); return 0 - 1; }   # ftruncate
+    sys_close(fd);
+    return id;
+    #endif
+}
+
+# Map buffer `buf_id` (`size` bytes) into this process — SHARED. Returns a pointer
+# (> 0) or 0. Both the client (to render) and the compositor (to read) call this.
+fn setu_buf_map(buf_id, size): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;                              # agnos shm bite (planning doc)
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var path[48];
+    setu_buf_path(buf_id, &path);
+    var fd = sys_open(&path, 2, 0);        # O_RDWR
+    if (fd < 0) { return 0; }
+    var ptr = syscall(9, 0, size, 3, 1, fd, 0);   # mmap: PROT_READ|WRITE, MAP_SHARED
+    sys_close(fd);                         # mapping survives the fd close
+    if (ptr < 0) { return 0; }             # MAP_FAILED (mmap returns a negative errno)
+    return ptr;
+    #endif
+}
+
+# Release a mapping obtained from setu_buf_map. Returns 0 / -1.
+fn setu_buf_unmap(ptr, size): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return syscall(11, ptr, size);         # munmap
+    #endif
+}
+
+# Client owner: destroy the buffer (unlink the backing object). Existing mappings
+# stay valid until unmapped (POSIX unlink-after-map semantics). Returns 0 / -1.
+fn setu_buf_close(buf_id): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var path[48];
+    setu_buf_path(buf_id, &path);
+    return syscall(87, &path);             # unlink
+    #endif
+}

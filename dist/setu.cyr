@@ -234,7 +234,7 @@ fn setu_kind_argc(kind): i64 {
     if (kind == SETU_CREATE_SURFACE)  { return 3; }  # w, h, flags
     if (kind == SETU_SURFACE_CREATED) { return 1; }  # id
     if (kind == SETU_CONFIGURE)       { return 4; }  # id, w, h, state
-    if (kind == SETU_ATTACH)          { return 5; }  # id, w, h, stride, fmt
+    if (kind == SETU_ATTACH)          { return 6; }  # id, w, h, stride, fmt, buf_id (0=inline)
     if (kind == SETU_COMMIT)          { return 1; }  # id
     if (kind == SETU_CLOSE)           { return 1; }  # id
     if (kind == SETU_INPUT_KEY)       { return 3; }  # id, keysym, mods
@@ -323,6 +323,23 @@ fn setu_attach(id, w, h, stride, fmt): i64 {
     setu_msg_set_arg(m, 2, h);
     setu_msg_set_arg(m, 3, stride);
     setu_msg_set_arg(m, 4, fmt);
+    # arg5 (buf_id) stays 0 = INLINE pixels follow this frame (legacy path).
+    return m;
+}
+
+# ATTACH referencing a SHARED BUFFER by id (arg5 > 0) — the pixels live in the
+# shared buffer (see buf.cyr), NOT streamed inline after this frame. This is the
+# sovereign present path that sidesteps the single-CPU two-proc TCP flow-control
+# deadlock on agnos. buf_id 0 would mean inline, so a real shared buffer is always > 0.
+fn setu_attach_buf(id, w, h, stride, fmt, buf_id): i64 {
+    var m = setu_msg_begin(SETU_ATTACH);
+    if (m == 0) { return 0; }
+    setu_msg_set_arg(m, 0, id);
+    setu_msg_set_arg(m, 1, w);
+    setu_msg_set_arg(m, 2, h);
+    setu_msg_set_arg(m, 3, stride);
+    setu_msg_set_arg(m, 4, fmt);
+    setu_msg_set_arg(m, 5, buf_id);
     return m;
 }
 
@@ -576,6 +593,100 @@ fn setu_encoded_len(msg): i64 {
     return (2 + setu_msg_argc(msg)) * SETU_WORD;
 }
 
+# --- buf.cyr ---
+
+# buf.cyr — setu SHARED-BUFFER backend (out-of-band pixel transport).
+#
+# Replaces inline-pixel streaming: the client renders into a shared buffer, ATTACH
+# carries the buffer id (setu_attach_buf, arg5 > 0) instead of the pixels, and the
+# compositor maps the SAME buffer by id and blits from it. This sidesteps the
+# single-CPU two-proc TCP flow-control deadlock on agnos (TCP_RX_RING = 2 KB, but a
+# surface is hundreds of KB) AND is lower-copy. See
+# agnosticos/docs/development/planning/shared-buffer-present.md.
+#
+# The buffer is referenced by an integer id sent over the setu wire — NO fd passing,
+# so it rides setu's TCP transport on both targets. Platform backends resolve the id
+# to the same physical pages:
+#   Linux  — a tmpfs file /dev/shm/setu-buf-<id>, ftruncate'd + mmap'd MAP_SHARED
+#            (both procs see each other's writes). Pure userland; no kernel change.
+#   agnos  — kernel shared-memory syscalls (shm_create/shm_map). STUBBED here; landed
+#            in the agnos shm bite (planning doc bite 2). agnos mmap#27 is anon-PRIVATE,
+#            so a shared id'd region is a new kernel capability.
+
+var _setu_buf_counter = 0;
+
+# Build "/dev/shm/setu-buf-<buf_id>\0" into `out` (caller supplies >= 48 bytes).
+fn setu_buf_path(buf_id, out): i64 {
+    var prefix = "/dev/shm/setu-buf-";
+    var plen = strlen(prefix);
+    var i = 0;
+    while (i < plen) { store8(out + i, load8(prefix + i)); i = i + 1; }
+    var nl = fmt_int_buf(buf_id, out + plen);
+    store8(out + plen + nl, 0);
+    return 0;
+}
+
+# Client: allocate a fresh shared buffer of `size` bytes. Returns a buffer id (> 0)
+# or -1. On Linux this creates + ftruncates the tmpfs file; map it next to fill it.
+fn setu_buf_create(size): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0 - 1;                          # agnos shm bite (planning doc)
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var pid = syscall(39);                 # getpid — per-proc uniqueness seed
+    _setu_buf_counter = _setu_buf_counter + 1;
+    var id = pid * 100000 + _setu_buf_counter;
+    var path[48];
+    setu_buf_path(id, &path);
+    var fd = sys_open(&path, 66, 384);     # O_RDWR|O_CREAT (2|64), mode 0600
+    if (fd < 0) { return 0 - 1; }
+    if (syscall(77, fd, size) < 0) { sys_close(fd); return 0 - 1; }   # ftruncate
+    sys_close(fd);
+    return id;
+    #endif
+}
+
+# Map buffer `buf_id` (`size` bytes) into this process — SHARED. Returns a pointer
+# (> 0) or 0. Both the client (to render) and the compositor (to read) call this.
+fn setu_buf_map(buf_id, size): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;                              # agnos shm bite (planning doc)
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var path[48];
+    setu_buf_path(buf_id, &path);
+    var fd = sys_open(&path, 2, 0);        # O_RDWR
+    if (fd < 0) { return 0; }
+    var ptr = syscall(9, 0, size, 3, 1, fd, 0);   # mmap: PROT_READ|WRITE, MAP_SHARED
+    sys_close(fd);                         # mapping survives the fd close
+    if (ptr < 0) { return 0; }             # MAP_FAILED (mmap returns a negative errno)
+    return ptr;
+    #endif
+}
+
+# Release a mapping obtained from setu_buf_map. Returns 0 / -1.
+fn setu_buf_unmap(ptr, size): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return syscall(11, ptr, size);         # munmap
+    #endif
+}
+
+# Client owner: destroy the buffer (unlink the backing object). Existing mappings
+# stay valid until unmapped (POSIX unlink-after-map semantics). Returns 0 / -1.
+fn setu_buf_close(buf_id): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var path[48];
+    setu_buf_path(buf_id, &path);
+    return syscall(87, &path);             # unlink
+    #endif
+}
+
 # --- client.cyr ---
 
 # client.cyr — setu's reference CLIENT transport (persistent connection).
@@ -764,9 +875,11 @@ fn setu_client_sid(c): i64 { return load64(c + SETU_C_SID); }
 
 # Present an already-rendered w*h BGRA pixel buffer `pix`. On the first present it
 # creates the surface once (CREATE_SURFACE -> SURFACE_CREATED, storing the id);
-# every present sends ATTACH + inline pixels + COMMIT. Returns 0 or a negative
-# code (-41 create send, -6 recv, -8 unexpected reply, -42 attach send, -43 pixel
-# write, -44 commit send).
+# every present hands the pixels to the compositor via a SHARED BUFFER (the sovereign
+# path — ATTACH-by-id, no inline stream) and falls back to INLINE pixels only when the
+# shared-buffer backend is unavailable (agnos until the shm bite). Returns 0 or a
+# negative code (-41 create send, -6 recv, -8 unexpected reply, -42 attach send,
+# -43 pixel write, -44 commit send, -45 buffer map).
 fn setu_client_present(c, pix, w, h): i64 {
     var fd = setu_client_fd(c);
     var id = setu_client_sid(c);
@@ -780,6 +893,26 @@ fn setu_client_present(c, pix, w, h): i64 {
     }
     var stride = w * 4;
     var nbytes = h * stride;
+    # --- Shared-buffer present (sidesteps the single-CPU two-proc TCP flow-control
+    #     deadlock on agnos: TCP_RX_RING is 2 KB but a surface is hundreds of KB) ---
+    var buf_id = setu_buf_create(nbytes);
+    if (buf_id > 0) {
+        var bptr = setu_buf_map(buf_id, nbytes);
+        if (bptr != 0) {
+            # copy the rendered pixels into the shared buffer (word-fast + byte tail)
+            var words = nbytes / 8;
+            var wi = 0;
+            while (wi < words) { store64(bptr + wi * 8, load64(pix + wi * 8)); wi = wi + 1; }
+            var bi = words * 8;
+            while (bi < nbytes) { store8(bptr + bi, load8(pix + bi)); bi = bi + 1; }
+            setu_buf_unmap(bptr, nbytes);
+            if (setu_send(fd, setu_attach_buf(id, w, h, stride, 1, buf_id)) < 0) { return 0 - 42; }
+            if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }
+            return 0;
+        }
+    }
+    # --- Inline fallback (shared-buffer backend unavailable; works single-consumer or
+    #     multi-core). ATTACH's arg5 (buf_id) stays 0 → the server reads inline pixels. ---
     if (setu_send(fd, setu_attach(id, w, h, stride, 1)) < 0) { return 0 - 42; }
     if (setu_write_all(fd, pix, nbytes) < 0) { return 0 - 43; }
     if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }

@@ -29,6 +29,7 @@ modules = [
     "src/error.cyr",
     "src/proto.cyr",
     "src/codec.cyr",
+    "src/buf.cyr",
     "src/client.cyr",
 ]
 

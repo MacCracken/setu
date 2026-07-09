@@ -184,9 +184,11 @@ fn setu_client_sid(c): i64 { return load64(c + SETU_C_SID); }
 
 # Present an already-rendered w*h BGRA pixel buffer `pix`. On the first present it
 # creates the surface once (CREATE_SURFACE -> SURFACE_CREATED, storing the id);
-# every present sends ATTACH + inline pixels + COMMIT. Returns 0 or a negative
-# code (-41 create send, -6 recv, -8 unexpected reply, -42 attach send, -43 pixel
-# write, -44 commit send).
+# every present hands the pixels to the compositor via a SHARED BUFFER (the sovereign
+# path — ATTACH-by-id, no inline stream) and falls back to INLINE pixels only when the
+# shared-buffer backend is unavailable (agnos until the shm bite). Returns 0 or a
+# negative code (-41 create send, -6 recv, -8 unexpected reply, -42 attach send,
+# -43 pixel write, -44 commit send, -45 buffer map).
 fn setu_client_present(c, pix, w, h): i64 {
     var fd = setu_client_fd(c);
     var id = setu_client_sid(c);
@@ -200,6 +202,26 @@ fn setu_client_present(c, pix, w, h): i64 {
     }
     var stride = w * 4;
     var nbytes = h * stride;
+    # --- Shared-buffer present (sidesteps the single-CPU two-proc TCP flow-control
+    #     deadlock on agnos: TCP_RX_RING is 2 KB but a surface is hundreds of KB) ---
+    var buf_id = setu_buf_create(nbytes);
+    if (buf_id > 0) {
+        var bptr = setu_buf_map(buf_id, nbytes);
+        if (bptr != 0) {
+            # copy the rendered pixels into the shared buffer (word-fast + byte tail)
+            var words = nbytes / 8;
+            var wi = 0;
+            while (wi < words) { store64(bptr + wi * 8, load64(pix + wi * 8)); wi = wi + 1; }
+            var bi = words * 8;
+            while (bi < nbytes) { store8(bptr + bi, load8(pix + bi)); bi = bi + 1; }
+            setu_buf_unmap(bptr, nbytes);
+            if (setu_send(fd, setu_attach_buf(id, w, h, stride, 1, buf_id)) < 0) { return 0 - 42; }
+            if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }
+            return 0;
+        }
+    }
+    # --- Inline fallback (shared-buffer backend unavailable; works single-consumer or
+    #     multi-core). ATTACH's arg5 (buf_id) stays 0 → the server reads inline pixels. ---
     if (setu_send(fd, setu_attach(id, w, h, stride, 1)) < 0) { return 0 - 42; }
     if (setu_write_all(fd, pix, nbytes) < 0) { return 0 - 43; }
     if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }

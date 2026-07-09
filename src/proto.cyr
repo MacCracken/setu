@@ -143,7 +143,7 @@ fn setu_kind_argc(kind): i64 {
     if (kind == SETU_CREATE_SURFACE)  { return 3; }  # w, h, flags
     if (kind == SETU_SURFACE_CREATED) { return 1; }  # id
     if (kind == SETU_CONFIGURE)       { return 4; }  # id, w, h, state
-    if (kind == SETU_ATTACH)          { return 5; }  # id, w, h, stride, fmt
+    if (kind == SETU_ATTACH)          { return 6; }  # id, w, h, stride, fmt, buf_id (0=inline)
     if (kind == SETU_COMMIT)          { return 1; }  # id
     if (kind == SETU_CLOSE)           { return 1; }  # id
     if (kind == SETU_INPUT_KEY)       { return 3; }  # id, keysym, mods
@@ -232,6 +232,23 @@ fn setu_attach(id, w, h, stride, fmt): i64 {
     setu_msg_set_arg(m, 2, h);
     setu_msg_set_arg(m, 3, stride);
     setu_msg_set_arg(m, 4, fmt);
+    # arg5 (buf_id) stays 0 = INLINE pixels follow this frame (legacy path).
+    return m;
+}
+
+# ATTACH referencing a SHARED BUFFER by id (arg5 > 0) — the pixels live in the
+# shared buffer (see buf.cyr), NOT streamed inline after this frame. This is the
+# sovereign present path that sidesteps the single-CPU two-proc TCP flow-control
+# deadlock on agnos. buf_id 0 would mean inline, so a real shared buffer is always > 0.
+fn setu_attach_buf(id, w, h, stride, fmt, buf_id): i64 {
+    var m = setu_msg_begin(SETU_ATTACH);
+    if (m == 0) { return 0; }
+    setu_msg_set_arg(m, 0, id);
+    setu_msg_set_arg(m, 1, w);
+    setu_msg_set_arg(m, 2, h);
+    setu_msg_set_arg(m, 3, stride);
+    setu_msg_set_arg(m, 4, fmt);
+    setu_msg_set_arg(m, 5, buf_id);
     return m;
 }
 
