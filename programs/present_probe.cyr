@@ -1,0 +1,65 @@
+# programs/present_probe.cyr — a slim, dependency-light setu CLIENT.
+#
+# Connects to the compositor over the setu TCP transport (loopback:7700) and
+# presents ONE rendered test frame, then exits. It depends ONLY on setu (which
+# builds `--agnos`), so it proves the transport ON THE SOVEREIGN KERNEL without
+# the puka terminal's GPU stack (mabda uses Linux `SYS_IOCTL` and does not build
+# `--agnos` yet). This is the agnos analog of puka's `puka_setu_probe`, and the
+# stand-in first-resident for aethersafha's agnos setu e2e until full puka ports
+# (the compositor spawns `/bin/puka`; the smoke seeds this binary there).
+#
+# Run: it needs a live compositor listening on setu loopback:7700.
+
+include "src/lib.cyr"
+
+fn pp_say(s): i64 { return syscall(SYS_WRITE, 1, s, strlen(s)); }
+
+# Render a w*h XRGB8888 (bytes [B,G,R,X]) test pattern into `pix`: a dark backdrop,
+# a light grid every 16 px, and a 2 px green border — a distinctive shape so the
+# compositor's screendump clearly shows this client's window.
+fn pp_render(pix, w, h): i64 {
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var c = 0x00202020;                        # dark grey backdrop
+            if ((x & 15) == 0) { c = 0x00C0C0C0; }     # grid column
+            if ((y & 15) == 0) { c = 0x00C0C0C0; }     # grid row
+            if (x < 2) { c = 0x0000FF00; }             # green border (left)
+            if (y < 2) { c = 0x0000FF00; }             # top
+            if (x >= w - 2) { c = 0x0000FF00; }        # right
+            if (y >= h - 2) { c = 0x0000FF00; }        # bottom
+            store32(pix + (y * w + x) * 4, c);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var w = 320;
+    var h = 192;
+    var pix = alloc(w * h * 4);
+    pp_render(pix, w, h);
+
+    var path = "/tmp/aethersafha-setu.sock";     # advisory; transport is loopback:7700
+    var c = setu_client_connect(path);
+    if (c == 0) { pp_say("present_probe: setu connect failed\n"); return 1; }
+    var rc = setu_client_present(c, pix, w, h);
+    setu_client_close(c);
+    if (rc < 0) {
+        pp_say("present_probe: present failed rc=");
+        var nb[24];
+        var nl = fmt_int_buf(rc, &nb);
+        syscall(SYS_WRITE, 1, &nb, nl);
+        pp_say("\n");
+        return 1;
+    }
+    pp_say("present_probe: presented a 320x192 test frame over setu\n");
+    return 0;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

@@ -79,7 +79,7 @@ fn setu_accept(sfd): i64 {
 fn setu_write_all(fd, buf, n): i64 {
     var sent = 0;
     while (sent < n) {
-        var w = syscall(SYS_WRITE, fd, buf + sent, n - sent);
+        var w = sys_write(fd, buf + sent, n - sent);
         if (w <= 0) { return 0 - 7; }
         sent = sent + w;
     }
@@ -103,7 +103,7 @@ fn setu_send(fd, msg): i64 {
 fn setu_read_blk(fd, buf, cap): i64 {
     var tries = 0;
     while (tries <= 5000) {
-        var r = syscall(SYS_READ, fd, buf, cap);
+        var r = sys_read(fd, buf, cap);
         #ifdef CYRIUS_TARGET_AGNOS
         if (r < 0) { return 0 - 6; }               # -1 = EOF / error
         if (r > 0) { return r; }                   # got bytes
