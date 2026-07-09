@@ -1,15 +1,21 @@
 # setu
 
-Version: 0.2.0
+Version: 0.3.0
 
 **setu** (सेतु — Sanskrit/Hindi: *bridge*) is the pure-Cyrius **native
 display-protocol** for AGNOS — the wire between GUI clients and the
 `aethersafha` compositor. It carries the pixel, input, and surface-lifecycle
 message **types**, a pure wire **codec** (marshal / unmarshal as pure,
 host-testable functions), and — since **v0.2.0** — the **reference client
-transport** (`client.cyr`): the persistent AF_UNIX connection every app owns
+transport** (`client.cyr`): the persistent connection every app owns
 (`setu_client_connect` → `setu_client_present` → `setu_client_recv` →
-`setu_client_close`). The codec stays pure; the client is the **one**
+`setu_client_close`). Since **v0.3.0** that transport is **TCP over loopback**
+(`127.0.0.1 : 7700`) via the cyrius `net.cyr` socket layer — CROSS-PLATFORM by
+construction: it routes to Linux BSD sockets on the host AND to agnos's kernel
+TCP band (`sock_connect`/`sock_listen`/`sock_accept`, tagged-fd send/recv) on
+the sovereign kernel, so the desktop runs on agnos, not just Linux (this
+replaced the Linux-only AF_UNIX path, which fail-closed on agnos). The codec
+stays pure; the client is the **one**
 implementation both consumers share — `dhancha` renders widgets → pixels,
 `puka` renders a cell grid → pixels, and both present raw buffers through it —
 so the transport has a single definition, not one per consumer. The compositor

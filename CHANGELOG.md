@@ -4,6 +4,52 @@ All notable changes to **setu** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-07-08
+
+The reference transport goes **cross-platform** (item 3b of the road-to-desktop):
+setu now speaks **TCP over loopback** (`127.0.0.1 : 7700`) on Linux **and** on
+agnos, so the sovereign desktop runs on the sovereign kernel — not just the host.
+This **replaces** the 0.2.0 AF_UNIX client, which was Linux-only and fail-closed
+on agnos. Proven end-to-end: `puka` (client) connects over TCP and presents a
+rendered 320×192 terminal frame → `aethersafha`'s server accepts (non-blocking
+poll) and composites it → a valid PPM with real content (grey grid on black).
+
+### Added
+
+- **Server transport in `client.cyr`** — the compositor half now lives beside the
+  client so both sides share one wire definition:
+  - `setu_listen(path)` — `tcp_socket` + `sock_bind` + `sock_listen` on
+    `loopback:7700`; sets the fd non-blocking on Linux (agnos accept is already
+    non-blocking) so the frame loop never stalls. Returns the listening fd or a
+    negative step code.
+  - `setu_accept(sfd)` — non-blocking accept; the client fd (≥ 0) or `-5`
+    (`WOULD_BLOCK`, poll again) on **both** targets.
+  - `setu_write_all(fd, buf, n)` — writes exactly `n` bytes, looping over partial
+    sends (agnos `sock_send` #48 may send < len — a large pixel payload can't go
+    in one syscall).
+- **`SETU_TCP_PORT`** (`7700`) — the compositor's single well-known loopback port
+  (the desktop has one compositor endpoint; `path` params are kept for API
+  compatibility but are advisory).
+
+### Changed
+
+- **`setu_connect` is now TCP** — `tcp_socket` + `sock_connect(loopback, 7700)`
+  via `net.cyr`, replacing the AF_UNIX `connect(sockaddr_un)` path. Same
+  signature; `path` is advisory.
+- **`setu_read_blk` absorbs agnos's non-blocking recv** — on agnos `sock_recv`
+  (#49) returns `0` for would-block / `-1` for EOF (inverted from Linux's `0` =
+  EOF), so the agnos branch retries-with-yield (bounded, `sleep_ms`) instead of
+  treating `0` as EOF. Linux behaviour is byte-identical to before.
+- **Deps** — `cyrius.cyml` gains `net` (sockets), `result` (`is_ok` /
+  `result_unwrap`), and `chrono` (the portable `sleep_ms` yield).
+
+### Removed
+
+- **`setu_cl_sockaddr`** (the `sockaddr_un` builder) — obsolete under TCP; there
+  is no socket path to marshal. **Breaking:** consumers that referenced it must
+  drop the call (the address is now the implicit `loopback:7700`). `dhancha`'s
+  `dh_setu_sockaddr` forwarder was removed to match.
+
 ## [0.2.0] — 2026-07-08
 
 The reference **client transport** joins the lib: setu is now the protocol
