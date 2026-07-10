@@ -18,17 +18,20 @@ fn pp_say(s): i64 { return syscall(SYS_WRITE, 1, s, strlen(s)); }
 # GREEN border (the smoke's window-visible gate), and a horizontal RED bar that moves
 # DOWN with the frame number — so a live-updating window visibly animates.
 #   green = 0x0000FF00 (G=255) · red = 0x00FF0000 (R=255).
-fn pp_frame(pix, w, h, frame, barcol, keyed): i64 {
+fn pp_frame(pix, w, h, frame, barcol, keyed, focused): i64 {
     var barh = 8;
     var span = h - barh - 4;
     if (span < 1) { span = 1; }
     var bar_y = 2 + (frame % span);
-    # Input reaction: when the compositor has forwarded a key to THIS (focused)
-    # client, the border + bar flash WHITE — the on-screen proof that keystrokes
-    # route through setu to the focused window (vs an idle green-bordered client).
-    var bordercol = 0x0000FF00;                        # green border (idle)
+    # Focus state OVER SETU: the FOCUSED window draws a BRIGHT green border, an
+    # unfocused one a DIM green border. The compositor drives this by sending
+    # SETU_INPUT_FOCUS(1/0) as focus moves (e.g. on TAB) — so the focus indicator
+    # is always visible, client-rendered, not just a compositor-side titlebar tint.
+    var bordercol = 0x00003000;                        # dim green (unfocused)
+    if (focused != 0) { bordercol = 0x0000FF00; }      # bright green (focused)
+    # Key reaction OVER SETU: the focused window flashes its bar WHITE on a keypress.
     var barc = barcol;
-    if (keyed != 0) { bordercol = 0x00FFFFFF; barc = 0x00FFFFFF; }
+    if (keyed != 0) { barc = 0x00FFFFFF; }
     var y = 0;
     while (y < h) {
         var x = 0;
@@ -69,7 +72,7 @@ fn main(): i64 {
     # 1, 2, ...), so a multi-window desktop shows visibly different clients.
     var barcol = 0x00FF0000;                        # red bar (odd buffer ids)
     if ((buf_id % 2) == 0) { barcol = 0x000000FF; } # blue bar (even ids)
-    pp_frame(pix, w, h, 0, barcol, 0);              # frame 0: idle (not yet keyed)
+    pp_frame(pix, w, h, 0, barcol, 0, 0);          # frame 0: idle (not keyed, not yet focused)
     setu_buf_write(buf_id, pix, nbytes);
     if (setu_send(fd, setu_create_surface(w, h, 0)) < 0) { return 1; }
     var reply = setu_msg_new();
@@ -89,15 +92,19 @@ fn main(): i64 {
     # enough (setu_serve_probe serves one present); the loop is agnos-only.
     #ifdef CYRIUS_TARGET_AGNOS
     var keyed = 0;                    # latches to 1 once the compositor forwards us a key
+    var focused = 0;                  # tracks SETU_INPUT_FOCUS: 1 = we hold focus, 0 = we don't
     var inmsg = setu_msg_new();
     var frame = 1;
     while (frame < 2000000) {
-        # Non-blocking: if the compositor has forwarded a key to this (focused) client,
-        # latch `keyed` so the window flashes white — input routed over setu, on-device.
+        # Non-blocking: drain any input the compositor forwarded. SETU_INPUT_FOCUS moves
+        # our border bright/dim as focus changes (e.g. on TAB); SETU_INPUT_KEY flashes the
+        # bar white — both routed over setu to whichever client currently holds focus.
         if (setu_poll_input(fd, inmsg) == 1) {
-            if (setu_msg_kind(inmsg) == SETU_INPUT_KEY) { keyed = 1; }
+            var k = setu_msg_kind(inmsg);
+            if (k == SETU_INPUT_KEY)   { keyed = 1; }
+            if (k == SETU_INPUT_FOCUS) { focused = setu_msg_arg(inmsg, 1); }
         }
-        pp_frame(pix, w, h, frame / 6, barcol, keyed);   # bar advances ~every 6 rounds (visible pacing)
+        pp_frame(pix, w, h, frame / 6, barcol, keyed, focused);   # bar advances ~every 6 rounds (visible pacing)
         setu_buf_write(buf_id, pix, nbytes);
         sys_sched_yield();
         frame = frame + 1;
