@@ -1,12 +1,12 @@
 # programs/present_probe.cyr — a slim, dependency-light setu CLIENT.
 #
-# Connects to the compositor over the setu TCP transport (loopback:7700) and
-# presents ONE rendered test frame, then exits. It depends ONLY on setu (which
-# builds `--agnos`), so it proves the transport ON THE SOVEREIGN KERNEL without
-# the puka terminal's GPU stack (mabda uses Linux `SYS_IOCTL` and does not build
-# `--agnos` yet). This is the agnos analog of puka's `puka_setu_probe`, and the
-# stand-in first-resident for aethersafha's agnos setu e2e until full puka ports
-# (the compositor spawns `/bin/puka`; the smoke seeds this binary there).
+# Connects to the compositor over the setu TCP transport (loopback:7700), establishes
+# ONE surface bound to a shared buffer, then LIVE-ANIMATES it: it keeps writing new
+# frames into that shared buffer (setu_buf_write) — the compositor re-reads the buffer
+# every frame (win_bufid), so the window updates with no per-frame socket traffic. It
+# depends ONLY on setu (which builds `--agnos`), so it proves the desktop path ON THE
+# SOVEREIGN KERNEL without the puka terminal's GPU stack (mabda uses Linux `SYS_IOCTL`).
+# The compositor spawns `/bin/puka`; the smoke seeds this binary there.
 #
 # Run: it needs a live compositor listening on setu loopback:7700.
 
@@ -14,21 +14,27 @@ include "src/lib.cyr"
 
 fn pp_say(s): i64 { return syscall(SYS_WRITE, 1, s, strlen(s)); }
 
-# Render a w*h XRGB8888 (bytes [B,G,R,X]) test pattern into `pix`: a dark backdrop,
-# a light grid every 16 px, and a 2 px green border — a distinctive shape so the
-# compositor's screendump clearly shows this client's window.
-fn pp_render(pix, w, h): i64 {
+# Render frame `frame` into `pix` (w*h, bytes [B,G,R,X]): a dark grid, a constant 2 px
+# GREEN border (the smoke's window-visible gate), and a horizontal RED bar that moves
+# DOWN with the frame number — so a live-updating window visibly animates.
+#   green = 0x0000FF00 (G=255) · red = 0x00FF0000 (R=255).
+fn pp_frame(pix, w, h, frame, barcol): i64 {
+    var barh = 8;
+    var span = h - barh - 4;
+    if (span < 1) { span = 1; }
+    var bar_y = 2 + (frame % span);
     var y = 0;
     while (y < h) {
         var x = 0;
         while (x < w) {
-            var c = 0x00202020;                        # dark grey backdrop
-            if ((x & 15) == 0) { c = 0x00C0C0C0; }     # grid column
-            if ((y & 15) == 0) { c = 0x00C0C0C0; }     # grid row
-            if (x < 2) { c = 0x0000FF00; }             # green border (left)
-            if (y < 2) { c = 0x0000FF00; }             # top
-            if (x >= w - 2) { c = 0x0000FF00; }        # right
-            if (y >= h - 2) { c = 0x0000FF00; }        # bottom
+            var c = 0x00202020;                        # dark backdrop
+            if ((x & 15) == 0) { c = 0x00404040; }     # grid column
+            if ((y & 15) == 0) { c = 0x00404040; }     # grid row
+            if (y >= bar_y) { if (y < bar_y + barh) { c = barcol; } }   # moving bar (per-client color)
+            if (x < 2) { c = 0x0000FF00; }             # green border
+            if (y < 2) { c = 0x0000FF00; }
+            if (x >= w - 2) { c = 0x0000FF00; }
+            if (y >= h - 2) { c = 0x0000FF00; }
             store32(pix + (y * w + x) * 4, c);
             x = x + 1;
         }
@@ -41,23 +47,50 @@ fn main(): i64 {
     alloc_init();
     var w = 320;
     var h = 192;
-    var pix = alloc(w * h * 4);
-    pp_render(pix, w, h);
+    var nbytes = w * h * 4;
+    var pix = alloc(nbytes);
 
     var path = "/tmp/aethersafha-setu.sock";     # advisory; transport is loopback:7700
     var c = setu_client_connect(path);
     if (c == 0) { pp_say("present_probe: setu connect failed\n"); return 1; }
-    var rc = setu_client_present(c, pix, w, h);
-    setu_client_close(c);
-    if (rc < 0) {
-        pp_say("present_probe: present failed rc=");
-        var nb[24];
-        var nl = fmt_int_buf(rc, &nb);
-        syscall(SYS_WRITE, 1, &nb, nl);
-        pp_say("\n");
-        return 1;
+    var fd = setu_client_fd(c);
+
+    # Create the shared buffer + write frame 0, then establish the surface bound to it
+    # (ONE present: CREATE_SURFACE -> SURFACE_CREATED -> ATTACH-by-buf_id -> COMMIT).
+    var buf_id = setu_buf_create(nbytes);
+    if (buf_id < 0) { pp_say("present_probe: buf_create failed\n"); return 1; }
+    # Per-client bar color keyed off the buffer id (each client gets a distinct global id:
+    # 1, 2, ...), so a multi-window desktop shows visibly different clients.
+    var barcol = 0x00FF0000;                        # red bar (odd buffer ids)
+    if ((buf_id % 2) == 0) { barcol = 0x000000FF; } # blue bar (even ids)
+    pp_frame(pix, w, h, 0, barcol);
+    setu_buf_write(buf_id, pix, nbytes);
+    if (setu_send(fd, setu_create_surface(w, h, 0)) < 0) { return 1; }
+    var reply = setu_msg_new();
+    if (setu_read_msg(fd, reply) < 0) { return 1; }
+    if (setu_msg_kind(reply) != SETU_SURFACE_CREATED) { return 1; }
+    var sid = setu_msg_arg(reply, 0);
+    var stride = w * 4;
+    if (setu_send(fd, setu_attach_buf(sid, w, h, stride, 1, buf_id)) < 0) { return 1; }
+    if (setu_send(fd, setu_commit(sid)) < 0) { return 1; }
+    pp_say("present_probe: surface established; animating shared buffer\n");
+
+    # LIVE (agnos): keep writing new frames into the SAME shared buffer + YIELD to the compositor
+    # each one. sleep_ms#41 preempt-DISABLES (holds the CPU for the whole sleep → starves the
+    # single-core compositor); sys_sched_yield#44 cooperatively hands the slice over, so
+    # client-write and compositor-read ALTERNATE — the compositor re-reads a COMPLETE frame (no
+    # torn read) and re-composites, so the window animates. On Linux the single present above is
+    # enough (setu_serve_probe serves one present); the loop is agnos-only.
+    #ifdef CYRIUS_TARGET_AGNOS
+    var frame = 1;
+    while (frame < 2000000) {
+        pp_frame(pix, w, h, frame / 6, barcol);   # bar advances ~every 6 rounds (visible pacing)
+        setu_buf_write(buf_id, pix, nbytes);
+        sys_sched_yield();
+        frame = frame + 1;
     }
-    pp_say("present_probe: presented a 320x192 test frame over setu\n");
+    #endif
+    setu_client_close(c);
     return 0;
 }
 
