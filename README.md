@@ -1,6 +1,6 @@
 # setu
 
-Version: 0.3.2
+Version: 0.4.0
 
 **setu** (सेतु — Sanskrit/Hindi: *bridge*) is the pure-Cyrius **native
 display-protocol** for AGNOS — the wire between GUI clients and the

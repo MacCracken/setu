@@ -4,6 +4,33 @@ All notable changes to **setu** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-07-09 — INPUT + FOCUS over setu, proven end-to-end on the sovereign kernel
+
+The input milestone. setu's S→C input channel — non-blocking poll (0.3.2), keys, and now
+**focus** — is demonstrated end-to-end on agnos: the reference client `present_probe` runs as
+a multi-window desktop where the compositor (aethersafha) routes keystrokes to the focused
+window and moves focus on TAB, and each client renders its own state from the wire.
+Minor bump to mark the milestone — the **library API is unchanged since 0.3.2** (`setu_poll_input`
++ the `SETU_INPUT_*` constructors/argc table were already in place); the delta is the reference
+client and the proof.
+
+### Added
+
+- **`present_probe` renders `SETU_INPUT_FOCUS`** — tracks the focus flag off the wire and draws
+  its border BRIGHT green (focused) vs DIM green (unfocused), so focus is legible on the client
+  itself as it moves (e.g. on TAB), not only as a compositor-side titlebar tint. Combined with
+  the existing `SETU_INPUT_KEY` reaction (bar flashes white), the client now demonstrates the
+  full S→C input surface.
+
+### Proven (on agnos, QEMU USB-xHCI keyboard `sendkey`)
+
+- **Keyboard routed to the focused window** — injecting a key flips only the focused client
+  (white bar), the unfocused client untouched (`setu-input-test.py`).
+- **Focus cycles over setu** — TAB moves the bright (focused) border cleanly from one client to
+  the other; focus is client-rendered, driven by `SETU_INPUT_FOCUS` (`setu-focus-test.py`).
+- **Multi-window** — two clients composited as distinct cascaded windows, each live-animating
+  its own shared buffer (`aethersafha-setu-smoke.sh`).
+
 ## [0.3.2] — 2026-07-09 — non-blocking client input poll (the S→C input channel)
 
 Clients can now REACT to input the compositor forwards to them without stalling their render
