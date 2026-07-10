@@ -206,15 +206,7 @@ fn setu_client_present(c, pix, w, h): i64 {
     #     deadlock on agnos: TCP_RX_RING is 2 KB but a surface is hundreds of KB) ---
     var buf_id = setu_buf_create(nbytes);
     if (buf_id > 0) {
-        var bptr = setu_buf_map(buf_id, nbytes);
-        if (bptr != 0) {
-            # copy the rendered pixels into the shared buffer (word-fast + byte tail)
-            var words = nbytes / 8;
-            var wi = 0;
-            while (wi < words) { store64(bptr + wi * 8, load64(pix + wi * 8)); wi = wi + 1; }
-            var bi = words * 8;
-            while (bi < nbytes) { store8(bptr + bi, load8(pix + bi)); bi = bi + 1; }
-            setu_buf_unmap(bptr, nbytes);
+        if (setu_buf_write(buf_id, pix, nbytes) == 0) {
             if (setu_send(fd, setu_attach_buf(id, w, h, stride, 1, buf_id)) < 0) { return 0 - 42; }
             if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }
             return 0;

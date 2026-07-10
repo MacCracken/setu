@@ -4,6 +4,42 @@ All notable changes to **setu** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] — 2026-07-09 — SHARED-BUFFER present (out-of-band pixels) + the on-device tagged-fd read/write fix
+
+The present path stops streaming pixels inline over the socket and hands them to the
+compositor through a **shared buffer** referenced by id. On agnos this is what makes a
+real surface composite: a hundreds-of-KB inline pixel payload can't drain through the 2 KB
+`TCP_RX_RING` while the single-CPU sender holds preemption in `sock_send`#48 — it deadlocks.
+Shared-buffer sidesteps it (and is lower-copy). The `setu_serve_probe`+`present_probe`
+round-trip is proven on Linux, and `aethersafha-setu-smoke.sh` is **green on the sovereign
+kernel**. Cyrius pin **6.4.25 → 6.4.34** (for the native `sys_shm_*` wrappers).
+
+### Added
+
+- **`src/buf.cyr` — the shared-buffer backend** (`setu_buf_create` / `_write` / `_read` /
+  `_close`), COPY-based + agnostic. Linux = a `/dev/shm/setu-buf-<id>` tmpfs file (write()/
+  read()); agnos = the kernel shm band via the native `sys_shm_create`/`_write`/`_read`/`_free`
+  (`#71-74`, agnos 1.53.9). Kernel/OS-OWNED buffers, so a client exiting right after present
+  can't free a page the compositor is still reading (no cross-proc page-map lifetime hazard).
+- **`setu_attach_buf(id, w, h, stride, fmt, buf_id)`** — ATTACH that references a shared buffer.
+
+### Changed
+
+- **`SETU_ATTACH` carries `buf_id` (arg5), argc 5→6.** `0` = inline pixels follow the frame
+  (legacy path, kept as the multi-core fallback); `> 0` = the pixels live in shared buffer
+  `buf_id`. `setu_client_present` now takes the shared-buffer path (create → write → ATTACH-by-id
+  → COMMIT), falling back to the inline stream only when the buffer backend is unavailable.
+
+### Fixed
+
+- **The agnos tagged-fd data plane.** `setu_write_all`/`setu_read_blk` used the raw primitive
+  `syscall(SYS_WRITE/SYS_READ)` on a **userland tagged connect-fd** (`0x40000000|slot` from
+  `net.cyr`), which the kernel rejects at the `vfs_write`/`vfs_read` `fd_idx >= 32` bound before
+  the `VFS_SOCK → tcp_send/tcp_recv` dispatch — so on agnos the first client→compositor write
+  failed (`rc=-41`) and the compositor could never read a client frame. Now they call the
+  tagged-fd-aware `sys_write`/`sys_read` (setu already links `net`+`syscalls`; Linux `sys_write`
+  is a plain `write`, so it stays portable). This is what let the on-device present complete.
+
 ## [0.3.0] — 2026-07-08
 
 The reference transport goes **cross-platform** (item 3b of the road-to-desktop):
