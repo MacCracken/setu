@@ -18,11 +18,17 @@ fn pp_say(s): i64 { return syscall(SYS_WRITE, 1, s, strlen(s)); }
 # GREEN border (the smoke's window-visible gate), and a horizontal RED bar that moves
 # DOWN with the frame number — so a live-updating window visibly animates.
 #   green = 0x0000FF00 (G=255) · red = 0x00FF0000 (R=255).
-fn pp_frame(pix, w, h, frame, barcol): i64 {
+fn pp_frame(pix, w, h, frame, barcol, keyed): i64 {
     var barh = 8;
     var span = h - barh - 4;
     if (span < 1) { span = 1; }
     var bar_y = 2 + (frame % span);
+    # Input reaction: when the compositor has forwarded a key to THIS (focused)
+    # client, the border + bar flash WHITE — the on-screen proof that keystrokes
+    # route through setu to the focused window (vs an idle green-bordered client).
+    var bordercol = 0x0000FF00;                        # green border (idle)
+    var barc = barcol;
+    if (keyed != 0) { bordercol = 0x00FFFFFF; barc = 0x00FFFFFF; }
     var y = 0;
     while (y < h) {
         var x = 0;
@@ -30,11 +36,11 @@ fn pp_frame(pix, w, h, frame, barcol): i64 {
             var c = 0x00202020;                        # dark backdrop
             if ((x & 15) == 0) { c = 0x00404040; }     # grid column
             if ((y & 15) == 0) { c = 0x00404040; }     # grid row
-            if (y >= bar_y) { if (y < bar_y + barh) { c = barcol; } }   # moving bar (per-client color)
-            if (x < 2) { c = 0x0000FF00; }             # green border
-            if (y < 2) { c = 0x0000FF00; }
-            if (x >= w - 2) { c = 0x0000FF00; }
-            if (y >= h - 2) { c = 0x0000FF00; }
+            if (y >= bar_y) { if (y < bar_y + barh) { c = barc; } }    # moving bar (per-client / white when keyed)
+            if (x < 2) { c = bordercol; }              # border: green idle, white when keyed
+            if (y < 2) { c = bordercol; }
+            if (x >= w - 2) { c = bordercol; }
+            if (y >= h - 2) { c = bordercol; }
             store32(pix + (y * w + x) * 4, c);
             x = x + 1;
         }
@@ -63,7 +69,7 @@ fn main(): i64 {
     # 1, 2, ...), so a multi-window desktop shows visibly different clients.
     var barcol = 0x00FF0000;                        # red bar (odd buffer ids)
     if ((buf_id % 2) == 0) { barcol = 0x000000FF; } # blue bar (even ids)
-    pp_frame(pix, w, h, 0, barcol);
+    pp_frame(pix, w, h, 0, barcol, 0);              # frame 0: idle (not yet keyed)
     setu_buf_write(buf_id, pix, nbytes);
     if (setu_send(fd, setu_create_surface(w, h, 0)) < 0) { return 1; }
     var reply = setu_msg_new();
@@ -82,9 +88,16 @@ fn main(): i64 {
     # torn read) and re-composites, so the window animates. On Linux the single present above is
     # enough (setu_serve_probe serves one present); the loop is agnos-only.
     #ifdef CYRIUS_TARGET_AGNOS
+    var keyed = 0;                    # latches to 1 once the compositor forwards us a key
+    var inmsg = setu_msg_new();
     var frame = 1;
     while (frame < 2000000) {
-        pp_frame(pix, w, h, frame / 6, barcol);   # bar advances ~every 6 rounds (visible pacing)
+        # Non-blocking: if the compositor has forwarded a key to this (focused) client,
+        # latch `keyed` so the window flashes white — input routed over setu, on-device.
+        if (setu_poll_input(fd, inmsg) == 1) {
+            if (setu_msg_kind(inmsg) == SETU_INPUT_KEY) { keyed = 1; }
+        }
+        pp_frame(pix, w, h, frame / 6, barcol, keyed);   # bar advances ~every 6 rounds (visible pacing)
         setu_buf_write(buf_id, pix, nbytes);
         sys_sched_yield();
         frame = frame + 1;

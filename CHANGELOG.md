@@ -4,6 +4,27 @@ All notable changes to **setu** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] — 2026-07-09 — non-blocking client input poll (the S→C input channel)
+
+Clients can now REACT to input the compositor forwards to them without stalling their render
+loop. This is the client half of **input-over-setu** (the compositor's forwarding half ships
+in aethersafha 0.8.2): the compositor sends a `SETU_INPUT_KEY` frame to the focused surface's
+connection, and the client drains it non-blocking each frame. The `SETU_INPUT_*` constructors
+already existed (0.3.1); what was missing was a way for a client to poll for them without
+blocking its animation loop.
+
+### Added
+
+- **`setu_poll_input(fd, msg_out)`** — a NON-BLOCKING single-recv poll for one inbound frame.
+  On agnos `sock_recv`#49 returns 0 for would-block, so an empty channel returns immediately
+  (0) and the client's animate loop never blocks; a frame returns 1 with `msg_out` filled, and
+  EOF/error returns -6. The compositor sends one small `SETU_INPUT_*` frame per event over
+  loopback, so a single recv delivers a whole frame (no reassembly at this milestone).
+- **`programs/present_probe.cyr` reacts to forwarded keys** — latches on `SETU_INPUT_KEY` and
+  flips its border + bar to WHITE, the on-screen proof that a keystroke routed through setu to
+  the focused window. Validated on agnos by an injection harness (`setu-input-test.py`) that
+  boots with a QEMU USB-xHCI keyboard and drives `sendkey`.
+
 ## [0.3.1] — 2026-07-09 — SHARED-BUFFER present (out-of-band pixels) + the on-device tagged-fd read/write fix
 
 The present path stops streaming pixels inline over the socket and hands them to the

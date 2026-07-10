@@ -129,6 +129,22 @@ fn setu_recv(fd, msg_out): i64 {
     return setu_decode(buf, n, msg_out);
 }
 
+# NON-BLOCKING poll for ONE inbound frame (the S->C input channel). Does a single
+# recv; if no data is buffered (agnos sock_recv #49 returns 0 = would-block) it
+# returns 0 IMMEDIATELY — the caller's animation loop never stalls. Returns 1 and
+# fills `msg_out` when a frame arrived, 0 when nothing is pending, or -6 on EOF/error.
+# The compositor sends one small SETU_INPUT_* frame per event over loopback, so a
+# single recv delivers a whole frame (no reassembly needed at this milestone).
+fn setu_poll_input(fd, msg_out): i64 {
+    var cap = 256;
+    var buf = alloc(cap);
+    var r = sys_read(fd, buf, cap);        # agnos: non-blocking (0 = would-block, -1 = EOF)
+    if (r == 0) { return 0; }              # nothing buffered → no input this frame
+    if (r < 0)  { return 0 - 6; }          # EOF / error
+    if (setu_decode(buf, r, msg_out) < 0) { return 0; }   # partial/garbled → skip
+    return 1;
+}
+
 # Read EXACTLY `n` bytes from `fd` into `buf`, looping over short/would-block
 # reads. Returns `n` (>= 0) or -6 on EOF/error.
 fn setu_read_exact(fd, buf, n): i64 {
