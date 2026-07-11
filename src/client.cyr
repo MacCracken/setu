@@ -179,9 +179,10 @@ fn setu_read_msg(fd, msg_out): i64 {
 # =========================================================================
 
 enum SetuClientOff {
-    SETU_C_FD  = 0;    # connected setu fd
-    SETU_C_SID = 8;    # compositor-assigned surface id (0 until first present)
-    SETU_C_SZ  = 16;
+    SETU_C_FD    = 0;    # connected setu fd
+    SETU_C_SID   = 8;    # compositor-assigned surface id (0 until first present)
+    SETU_C_FLAGS = 16;   # CREATE_SURFACE flags to request (e.g. SETU_SURF_FULL_KEYS)
+    SETU_C_SZ    = 24;
 }
 
 # Connect to the compositor's setu endpoint. Returns a *SetuClient, or 0 on
@@ -192,11 +193,23 @@ fn setu_client_connect(path): i64 {
     var c = alloc(SETU_C_SZ);
     store64(c + SETU_C_FD, fd);
     store64(c + SETU_C_SID, 0);
+    store64(c + SETU_C_FLAGS, 0);
     return c;
 }
 
 fn setu_client_fd(c): i64  { return load64(c + SETU_C_FD); }
 fn setu_client_sid(c): i64 { return load64(c + SETU_C_SID); }
+
+# Request FULL keyboard events (press AND release) for this client's surface so an app
+# can track HELD keys, instead of the default press-only stream. Call BEFORE the first
+# setu_client_present — the flag rides the CREATE_SURFACE handshake (arg2). The compositor
+# then delivers SETU_INPUT_KEY with arg2 = 1 (press) / 0 (release). Press-only clients
+# (that never call this) keep flags 0, so the compositor sends presses only with arg2 = 0
+# — byte-identical to the pre-0.5.0 behaviour. Returns 0.
+fn setu_client_request_keys(c): i64 {
+    store64(c + SETU_C_FLAGS, load64(c + SETU_C_FLAGS) | SETU_SURF_FULL_KEYS);
+    return 0;
+}
 
 # Present an already-rendered w*h BGRA pixel buffer `pix`. On the first present it
 # creates the surface once (CREATE_SURFACE -> SURFACE_CREATED, storing the id);
@@ -209,7 +222,7 @@ fn setu_client_present(c, pix, w, h): i64 {
     var fd = setu_client_fd(c);
     var id = setu_client_sid(c);
     if (id == 0) {
-        if (setu_send(fd, setu_create_surface(w, h, 0)) < 0) { return 0 - 41; }
+        if (setu_send(fd, setu_create_surface(w, h, load64(c + SETU_C_FLAGS))) < 0) { return 0 - 41; }
         var reply = setu_msg_new();
         if (setu_read_msg(fd, reply) < 0) { return 0 - 6; }
         if (setu_msg_kind(reply) != SETU_SURFACE_CREATED) { return 0 - 8; }

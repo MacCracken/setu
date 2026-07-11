@@ -18,7 +18,7 @@
 #   SETU_ATTACH          C->S   id, w, h, stride, fmt   (see NOTE below)
 #   SETU_COMMIT          C->S   id
 #   SETU_CLOSE           C<->S  id
-#   SETU_INPUT_KEY       S->C   id, keysym, mods
+#   SETU_INPUT_KEY       S->C   id, keysym, mods   (mods = press/release 1/0 on FULL_KEYS)
 #   SETU_INPUT_PTR_MOVE  S->C   id, x, y
 #   SETU_INPUT_PTR_BTN   S->C   id, button, state
 #   SETU_INPUT_FOCUS     S->C   id, focused
@@ -47,7 +47,8 @@ enum SetuMsgKind {
     SETU_ATTACH          = 5;   # C->S:  id, w, h, stride, fmt (memfd out-of-band)
     SETU_COMMIT          = 6;   # C->S:  id
     SETU_CLOSE           = 7;   # C<->S: id
-    SETU_INPUT_KEY       = 8;   # S->C:  id, keysym, mods
+    SETU_INPUT_KEY       = 8;   # S->C:  id, keysym, mods (mods=press/release value 1/0 on
+    #        SETU_SURF_FULL_KEYS surfaces; 0 press-only otherwise)
     SETU_INPUT_PTR_MOVE  = 9;   # S->C:  id, x, y
     SETU_INPUT_PTR_BTN   = 10;  # S->C:  id, button, state
     SETU_INPUT_FOCUS     = 11;  # S->C:  id, focused
@@ -57,6 +58,15 @@ enum SetuMsgKind {
 # unknown discriminant is rejected before the per-kind argc lookup.
 var SETU_KIND_MIN = 1;
 var SETU_KIND_MAX = 11;
+
+# CREATE_SURFACE `flags` (arg2) bits — a client OR's these into the flags passed to
+# setu_create_surface; the compositor reads them at the handshake and remembers them
+# per-surface. Keeps argc unchanged (the flags word already exists on the wire).
+enum SetuSurfaceFlags {
+    SETU_SURF_FULL_KEYS = 1;   # deliver SETU_INPUT_KEY on press AND release (mods arg =
+    # 1 press / 0 release), not press-only — for apps that track
+    # HELD keys (games). Default (unset) = press-only, mods = 0.
+}
 
 # ================================================================
 # SetuMsg struct — the in-memory message representation.

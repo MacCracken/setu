@@ -4,6 +4,24 @@ All notable changes to **setu** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-07-10 — full key events (press + release) for held-key apps
+
+Games and apps that need **held-key state** (hold W to keep moving) can now opt into full
+keyboard events. A client calls `setu_client_request_keys(c)` before its first present; the
+flag rides the existing `CREATE_SURFACE` `flags` word (arg2, `SETU_SURF_FULL_KEYS = 1`), so the
+compositor delivers `SETU_INPUT_KEY` on **both press and release** with the make/break in the
+`mods` arg (1 = press, 0 = release). **Wire-compatible and opt-in:** the message shape is
+unchanged (argc stays 3), and a client that never requests full keys keeps the press-only
+stream with `mods = 0` — byte-identical to 0.4.0, so nav clients (crab, present_probe, jalwa)
+need no change. First consumer: cyrius-doom's `PM_SETU` backend (real held movement on the
+aethersafha desktop); the compositor honours the flag per-surface (aethersafha).
+
+### Added
+
+- `setu_client_request_keys(c)` (client API) + `SETU_SURF_FULL_KEYS` surface-flags constant.
+- `SetuClient` gains a `SETU_C_FLAGS` field carrying the requested `CREATE_SURFACE` flags into
+  the lazy first-present handshake.
+
 ## [0.4.0] — 2026-07-09 — INPUT + FOCUS over setu, proven end-to-end on the sovereign kernel
 
 The input milestone. setu's S→C input channel — non-blocking poll (0.3.2), keys, and now
