@@ -901,11 +901,11 @@ enum SetuClientOff {
     SETU_C_SID   = 8;    # compositor-assigned surface id (0 until first present)
     SETU_C_FLAGS = 16;   # CREATE_SURFACE flags to request (e.g. SETU_SURF_FULL_KEYS)
     SETU_C_BUFID = 24;   # cached shared-buffer id (0 = none) — ONE buffer per client,
-                         # reused across presents; recreated on resize, freed at close.
-                         # (Pre-0.5.1 a buffer was created EVERY present and never freed:
-                         # agnos exhausted its 16 kernel shm slots in <0.5 s of 35 Hz
-                         # presents — a system-wide present DoS — and Linux leaked one
-                         # /dev/shm/setu-buf-* tmpfs file per frame.)
+    # reused across presents; recreated on resize, freed at close.
+    # (Pre-0.5.1 a buffer was created EVERY present and never freed:
+    # agnos exhausted its 16 kernel shm slots in <0.5 s of 35 Hz
+    # presents — a system-wide present DoS — and Linux leaked one
+    # /dev/shm/setu-buf-* tmpfs file per frame.)
     SETU_C_BUFSZ = 32;   # size in bytes of the cached shared buffer
     SETU_C_INBUF = 40;   # input stream-reassembly buffer (lazily alloc'd, 0 until first poll)
     SETU_C_INLEN = 48;   # bytes currently buffered in SETU_C_INBUF
@@ -1060,7 +1060,7 @@ fn setu_client_poll_input(c, msg_out): i64 {
         return 0;                                # partial frame — completes next poll
     }
     if (r == 0) { return 0; }                    # agnos: would-block; Linux: EOF-as-idle
-                                                 # (matches setu_poll_input's semantics)
+    # (matches setu_poll_input's semantics)
     if (len > 0) { return 0; }                   # error but bytes pending — drain first
     return 0 - 6;                                # EOF / error
 }
