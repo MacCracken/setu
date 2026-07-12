@@ -34,8 +34,69 @@ fn main(): i64 {
     check(setu_msg_arg(out, 0), 320);
     check(setu_msg_arg(out, 1), 200);
 
+    # --- 0.5.1: input STREAM REASSEMBLY (setu__inbuf_take, the pure core of
+    # setu_client_poll_input). Two coalesced INPUT_KEY frames plus HALF of a third
+    # in one buffer — exactly what one TCP recv can deliver — must hand out frames
+    # 1 and 2, hold the partial, then complete frame 3 when its tail arrives.
+    var c = alloc(SETU_C_SZ);
+    store64(c + SETU_C_FD, 0 - 1);              # no socket: pure-extract path only
+    store64(c + SETU_C_SID, 0);
+    store64(c + SETU_C_FLAGS, 0);
+    store64(c + SETU_C_BUFID, 0);
+    store64(c + SETU_C_BUFSZ, 0);
+    var ib = alloc(SETU_C_INBUF_CAP);
+    store64(c + SETU_C_INBUF, ib);
+    var e1 = setu_encode(setu_input_key(7, 26, 1), ib, SETU_C_INBUF_CAP);
+    var e2 = setu_encode(setu_input_key(7, 26, 0), ib + e1, SETU_C_INBUF_CAP - e1);
+    check(e1 > 0, 1);
+    check(e2 > 0, 1);
+    var tmp = alloc(128);
+    var e3 = setu_encode(setu_input_key(7, 4, 1), tmp, 128);
+    check(e3 > 0, 1);
+    var half = e3 / 2;
+    var ci = 0;
+    while (ci < half) { store8(ib + e1 + e2 + ci, load8(tmp + ci)); ci = ci + 1; }
+    store64(c + SETU_C_INLEN, e1 + e2 + half);
+    var km = setu_msg_new();
+    check(setu__inbuf_take(c, km), 1);          # frame 1: press
+    check(setu_msg_kind(km), SETU_INPUT_KEY);
+    check(setu_msg_arg(km, 1), 26);
+    check(setu_msg_arg(km, 2), 1);
+    check(setu__inbuf_take(c, km), 1);          # frame 2: the RELEASE survives coalescing
+    check(setu_msg_arg(km, 2), 0);
+    check(setu__inbuf_take(c, km), 0);          # frame 3 is split — held, not dropped
+    check(load64(c + SETU_C_INLEN), half);
+    var tl = load64(c + SETU_C_INLEN);          # tail arrives on the "next read"
+    ci = half;
+    while (ci < e3) { store8(ib + tl + (ci - half), load8(tmp + ci)); ci = ci + 1; }
+    store64(c + SETU_C_INLEN, tl + (e3 - half));
+    check(setu__inbuf_take(c, km), 1);          # frame 3 completes
+    check(setu_msg_arg(km, 1), 4);
+    check(load64(c + SETU_C_INLEN), 0);         # buffer fully drained
+
+    # --- 0.5.1: shared-buffer lifecycle (Linux tmpfs backend) — create/write/read
+    # round-trip, then CLOSE actually destroys the buffer (the pre-0.5.1 leak was
+    # exactly this close never being called).
+    var bid = setu_buf_create(1024);
+    check(bid > 0, 1);
+    var bsrc = alloc(1024);
+    var bi = 0;
+    while (bi < 1024) { store8(bsrc + bi, bi & 255); bi = bi + 1; }
+    check(setu_buf_write(bid, bsrc, 1024), 0);
+    var bdst = alloc(1024);
+    check(setu_buf_read(bid, bdst, 1024), 0);
+    var bmiss = 0;
+    bi = 0;
+    while (bi < 1024) {
+        if (load8(bdst + bi) != (bi & 255)) { bmiss = bmiss + 1; }
+        bi = bi + 1;
+    }
+    check(bmiss, 0);
+    check(setu_buf_close(bid), 0);
+    check(setu_buf_read(bid, bdst, 1024), 0 - 1);   # gone after close
+
     if (g_fails == 0) {
-        var ok = "client_test: PASS (transport port + framed create-surface round-trip)\n";
+        var ok = "client_test: PASS (transport port + framed create-surface round-trip + stream reassembly + buf lifecycle)\n";
         syscall(SYS_WRITE, 1, ok, strlen(ok));
     } else {
         var f = "client_test: FAIL\n";

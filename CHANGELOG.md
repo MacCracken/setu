@@ -4,6 +4,44 @@ All notable changes to **setu** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — 2026-07-12 — present-buffer reuse (shm-slot/tmpfs leak fix) + input stream reassembly
+
+Two client-transport defects found by cyrius-doom's 0.33.3 audit round (doom is the first
+35 Hz continuous-present consumer; probe/nav clients present rarely enough that neither bit).
+
+### Fixed
+
+- **`setu_client_present` allocated a NEW shared buffer every present and never freed any**
+  (`setu_buf_create` per call; `setu_buf_close` had zero callers; `SetuClient` had no field
+  to cache an id). On agnos this exhausted the kernel's **16 system-wide shm slots** in
+  under half a second of 35 Hz presents — every later present (doom's *and every other setu
+  app's*) fell to the inline-TCP path, which is exactly the 2 KB-loopback-window stall the
+  shared buffer exists to avoid, and the slots were unreclaimable until reboot. On Linux it
+  leaked one `/dev/shm/setu-buf-*` tmpfs file per frame (~9 MB/s at 35 Hz). Now the client
+  caches ONE buffer id (`SETU_C_BUFID`/`SETU_C_BUFSZ`), rewrites it in place each present
+  (the compositor re-reads the attached id per commit, so in-place rewrite is the designed
+  path), recreates it on resize, drops it on a failed write (no dead-id retry loop), and
+  **`setu_client_close` frees it**. RUN-tested: tmpfs create → write → read-back → close →
+  read fails (buffer really destroyed).
+
+### Added
+
+- **`setu_client_poll_input(c, msg_out)` — non-blocking input poll with STREAM REASSEMBLY.**
+  The bare `setu_poll_input` decodes only the FIRST frame of each recv and drops any
+  coalesced or split tail — TCP has no message boundaries, so a fast key sequence lost
+  events, and a lost key-RELEASE is a stuck key for `SETU_SURF_FULL_KEYS` consumers (doom:
+  the player walks forever). The client now carries a 512-byte reassembly buffer
+  (`SETU_C_INBUF`/`SETU_C_INLEN`, lazily allocated once — no per-poll allocation, which also
+  removes the old per-call 256 B bump-alloc leak for consumers on never-free allocators);
+  frames are handed out one per call, partial frames complete on a later poll, and a
+  desynced header resets the buffer (the stream has no resync marker). `setu_poll_input`
+  is kept for API compat with a caveat comment. RUN-tested: two coalesced INPUT_KEY frames
+  + a half frame in one buffer → both delivered, the release survives, the split frame
+  completes when its tail arrives.
+- `SetuClient` grows from 24 to 56 bytes (`SETU_C_BUFID`/`SETU_C_BUFSZ`/`SETU_C_INBUF`/
+  `SETU_C_INLEN`). The struct is opaque (allocated by `setu_client_connect`), so consumers
+  recompile against the new dist with zero code changes; the wire is untouched.
+
 ## [0.5.0] — 2026-07-10 — full key events (press + release) for held-key apps
 
 Games and apps that need **held-key state** (hold W to keep moving) can now opt into full

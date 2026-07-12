@@ -133,8 +133,9 @@ fn setu_recv(fd, msg_out): i64 {
 # recv; if no data is buffered (agnos sock_recv #49 returns 0 = would-block) it
 # returns 0 IMMEDIATELY — the caller's animation loop never stalls. Returns 1 and
 # fills `msg_out` when a frame arrived, 0 when nothing is pending, or -6 on EOF/error.
-# The compositor sends one small SETU_INPUT_* frame per event over loopback, so a
-# single recv delivers a whole frame (no reassembly needed at this milestone).
+# CAVEAT: decodes only the FIRST frame of each recv — coalesced or split frames are
+# dropped (TCP has no message boundaries). Kept for API compat; stream consumers
+# should use setu_client_poll_input (0.5.1), which reassembles across reads.
 fn setu_poll_input(fd, msg_out): i64 {
     var cap = 256;
     var buf = alloc(cap);
@@ -182,8 +183,19 @@ enum SetuClientOff {
     SETU_C_FD    = 0;    # connected setu fd
     SETU_C_SID   = 8;    # compositor-assigned surface id (0 until first present)
     SETU_C_FLAGS = 16;   # CREATE_SURFACE flags to request (e.g. SETU_SURF_FULL_KEYS)
-    SETU_C_SZ    = 24;
+    SETU_C_BUFID = 24;   # cached shared-buffer id (0 = none) — ONE buffer per client,
+                         # reused across presents; recreated on resize, freed at close.
+                         # (Pre-0.5.1 a buffer was created EVERY present and never freed:
+                         # agnos exhausted its 16 kernel shm slots in <0.5 s of 35 Hz
+                         # presents — a system-wide present DoS — and Linux leaked one
+                         # /dev/shm/setu-buf-* tmpfs file per frame.)
+    SETU_C_BUFSZ = 32;   # size in bytes of the cached shared buffer
+    SETU_C_INBUF = 40;   # input stream-reassembly buffer (lazily alloc'd, 0 until first poll)
+    SETU_C_INLEN = 48;   # bytes currently buffered in SETU_C_INBUF
+    SETU_C_SZ    = 56;
 }
+
+var SETU_C_INBUF_CAP = 512;   # ≥ 6 widest frames ((2+8)*8 = 80 B); input frames are 40 B
 
 # Connect to the compositor's setu endpoint. Returns a *SetuClient, or 0 on
 # failure. The surface is created lazily on the first setu_client_present.
@@ -194,6 +206,10 @@ fn setu_client_connect(path): i64 {
     store64(c + SETU_C_FD, fd);
     store64(c + SETU_C_SID, 0);
     store64(c + SETU_C_FLAGS, 0);
+    store64(c + SETU_C_BUFID, 0);
+    store64(c + SETU_C_BUFSZ, 0);
+    store64(c + SETU_C_INBUF, 0);
+    store64(c + SETU_C_INLEN, 0);
     return c;
 }
 
@@ -212,12 +228,13 @@ fn setu_client_request_keys(c): i64 {
 }
 
 # Present an already-rendered w*h BGRA pixel buffer `pix`. On the first present it
-# creates the surface once (CREATE_SURFACE -> SURFACE_CREATED, storing the id);
-# every present hands the pixels to the compositor via a SHARED BUFFER (the sovereign
-# path — ATTACH-by-id, no inline stream) and falls back to INLINE pixels only when the
-# shared-buffer backend is unavailable (agnos until the shm bite). Returns 0 or a
-# negative code (-41 create send, -6 recv, -8 unexpected reply, -42 attach send,
-# -43 pixel write, -44 commit send, -45 buffer map).
+# creates the surface once (CREATE_SURFACE -> SURFACE_CREATED, storing the id) and
+# the shared buffer once (cached in the client, rewritten in place every present,
+# recreated on resize, freed at close); each present hands the pixels to the
+# compositor via that SHARED BUFFER (the sovereign path — ATTACH-by-id, no inline
+# stream) and falls back to INLINE pixels only when the shared-buffer backend is
+# unavailable. Returns 0 or a negative code (-41 create send, -6 recv, -8 unexpected
+# reply, -42 attach send, -43 pixel write, -44 commit send, -45 buffer map).
 fn setu_client_present(c, pix, w, h): i64 {
     var fd = setu_client_fd(c);
     var id = setu_client_sid(c);
@@ -232,14 +249,37 @@ fn setu_client_present(c, pix, w, h): i64 {
     var stride = w * 4;
     var nbytes = h * stride;
     # --- Shared-buffer present (sidesteps the single-CPU two-proc TCP flow-control
-    #     deadlock on agnos: TCP_RX_RING is 2 KB but a surface is hundreds of KB) ---
-    var buf_id = setu_buf_create(nbytes);
+    #     deadlock on agnos: TCP_RX_RING is 2 KB but a surface is hundreds of KB).
+    #     The buffer is created ONCE and reused every present (the compositor re-reads
+    #     the id it holds on each commit, so rewriting in place is the designed path);
+    #     a resize closes + recreates it. Freed in setu_client_close. ---
+    var buf_id = load64(c + SETU_C_BUFID);
+    if (buf_id > 0) {
+        if (load64(c + SETU_C_BUFSZ) != nbytes) {          # resize -> recreate
+            setu_buf_close(buf_id);
+            buf_id = 0;
+            store64(c + SETU_C_BUFID, 0);
+            store64(c + SETU_C_BUFSZ, 0);
+        }
+    }
+    if (buf_id <= 0) {
+        buf_id = setu_buf_create(nbytes);
+        if (buf_id > 0) {
+            store64(c + SETU_C_BUFID, buf_id);
+            store64(c + SETU_C_BUFSZ, nbytes);
+        }
+    }
     if (buf_id > 0) {
         if (setu_buf_write(buf_id, pix, nbytes) == 0) {
             if (setu_send(fd, setu_attach_buf(id, w, h, stride, 1, buf_id)) < 0) { return 0 - 42; }
             if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }
             return 0;
         }
+        # Write failed — drop the cached buffer (don't retry a dead id every frame)
+        # and fall through to the inline path for this present.
+        setu_buf_close(buf_id);
+        store64(c + SETU_C_BUFID, 0);
+        store64(c + SETU_C_BUFSZ, 0);
     }
     # --- Inline fallback (shared-buffer backend unavailable; works single-consumer or
     #     multi-core). ATTACH's arg5 (buf_id) stays 0 → the server reads inline pixels. ---
@@ -256,7 +296,65 @@ fn setu_client_recv(c, msg_out): i64 {
     return setu_read_msg(setu_client_fd(c), msg_out);
 }
 
+# Extract ONE complete frame from the client's reassembly buffer into `msg_out`
+# (no syscall). Returns 1 when a frame was decoded, 0 when the buffered bytes
+# don't yet hold a complete frame. A desynced header (bad argc) resets the buffer
+# — the stream has no resync marker, so dropping is the only safe recovery.
+fn setu__inbuf_take(c, msg_out): i64 {
+    var ib = load64(c + SETU_C_INBUF);
+    var len = load64(c + SETU_C_INLEN);
+    if (ib == 0) { return 0; }
+    if (len < 16) { return 0; }
+    var argc = setu_get_i64(ib, 8);
+    if (argc < 0) { store64(c + SETU_C_INLEN, 0); return 0; }
+    if (argc > SETU_MAX_ARGS) { store64(c + SETU_C_INLEN, 0); return 0; }
+    var total = (2 + argc) * 8;
+    if (len < total) { return 0; }
+    var dec = setu_decode(ib, total, msg_out);
+    var rem = len - total;                       # shift the remainder down
+    var i = 0;
+    while (i < rem) { store8(ib + i, load8(ib + total + i)); i = i + 1; }
+    store64(c + SETU_C_INLEN, rem);
+    if (dec < 0) { return 0; }                   # garbled frame consumed; caller re-polls
+    return 1;
+}
+
+# NON-BLOCKING poll for the next inbound frame with STREAM REASSEMBLY. Unlike the
+# bare setu_poll_input (which decodes only the FIRST frame of each recv and drops
+# any coalesced/split tail — TCP has no message boundaries, so a fast key sequence
+# lost events, and a lost key-RELEASE means a stuck key for FULL_KEYS consumers),
+# this buffers leftover bytes in the client and hands frames out one per call.
+# Returns 1 and fills `msg_out` when a frame is ready, 0 when nothing is pending,
+# or -6 on EOF/error with nothing buffered. Call in a loop until 0 to drain.
+fn setu_client_poll_input(c, msg_out): i64 {
+    var ib = load64(c + SETU_C_INBUF);
+    if (ib == 0) {
+        ib = alloc(SETU_C_INBUF_CAP);
+        store64(c + SETU_C_INBUF, ib);
+        store64(c + SETU_C_INLEN, 0);
+    }
+    # A complete frame may already be buffered from the last read — no syscall.
+    if (setu__inbuf_take(c, msg_out) == 1) { return 1; }
+    var len = load64(c + SETU_C_INLEN);
+    var r = sys_read(load64(c + SETU_C_FD), ib + len, SETU_C_INBUF_CAP - len);
+    if (r > 0) {
+        store64(c + SETU_C_INLEN, len + r);
+        if (setu__inbuf_take(c, msg_out) == 1) { return 1; }
+        return 0;                                # partial frame — completes next poll
+    }
+    if (r == 0) { return 0; }                    # agnos: would-block; Linux: EOF-as-idle
+                                                 # (matches setu_poll_input's semantics)
+    if (len > 0) { return 0; }                   # error but bytes pending — drain first
+    return 0 - 6;                                # EOF / error
+}
+
 fn setu_client_close(c): i64 {
+    var buf_id = load64(c + SETU_C_BUFID);
+    if (buf_id > 0) {
+        setu_buf_close(buf_id);
+        store64(c + SETU_C_BUFID, 0);
+        store64(c + SETU_C_BUFSZ, 0);
+    }
     sock_close(setu_client_fd(c));
     return 0;
 }
