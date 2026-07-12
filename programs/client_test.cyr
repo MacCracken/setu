@@ -96,7 +96,7 @@ fn main(): i64 {
     check(setu_buf_read(bid, bdst, 1024), 0 - 1);   # gone after close
 
     if (g_fails == 0) {
-        var ok = "client_test: PASS (transport port + framed create-surface round-trip + stream reassembly + buf lifecycle)\n";
+        var ok = "client_test: PASS (port + create-surface round-trip + reassembly + buf lifecycle)\n";
         syscall(SYS_WRITE, 1, ok, strlen(ok));
     } else {
         var f = "client_test: FAIL\n";

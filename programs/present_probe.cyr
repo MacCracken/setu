@@ -72,7 +72,7 @@ fn main(): i64 {
     # 1, 2, ...), so a multi-window desktop shows visibly different clients.
     var barcol = 0x00FF0000;                        # red bar (odd buffer ids)
     if ((buf_id % 2) == 0) { barcol = 0x000000FF; } # blue bar (even ids)
-    pp_frame(pix, w, h, 0, barcol, 0, 0);          # frame 0: idle (not keyed, not yet focused)
+    pp_frame(pix, w, h, 0, barcol, 0, 0);          # frame 0: idle (unkeyed, unfocused)
     setu_buf_write(buf_id, pix, nbytes);
     if (setu_send(fd, setu_create_surface(w, h, 0)) < 0) { return 1; }
     var reply = setu_msg_new();
