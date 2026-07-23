@@ -4,6 +4,44 @@ All notable changes to **setu** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-07-23
+
+### Changed — client buffers are now GPU-VISIBLE on agnos, which unblocks the entire hardware-compositing band
+
+`setu_buf_create` asks for **`shm_create_gpu` #86** first and falls back to `shm_create` #71.
+
+⚠ **This one line is why the agnos ring-3 GPU band had no caller.** `#71` allocates **system RAM**, and on
+agnos the GPU cannot reach system RAM at all — bus-master is off by design and the engines see only the
+framebuffer aperture. So a `#71` slot is structurally un-blittable, and the kernel rejects it at **both** GPU
+entry points: `gpu_blit_shm` #87 with `src_mc == 0 ⇒ the GPU cannot read it`, and `gpu_shader_op` #92 with
+`GPO_E_BADSLOT`. Every client surface in the desktop was allocated this way, so ~15 iron burns of proven GPU
+capability (`#84`-`#89`, `#92`) had **zero** reachable consumers.
+
+The published diagnosis was that alpha was the blocker (sadish forcing `0xFF`, bhumi packing `X=0`). That is
+real but **downstream** — it gates `#92`'s premultiplied blend specifically. It was not what stopped `#87`,
+which is an opaque blit and needs no alpha convention at all.
+
+`#86` is the GPU-visible **peer** of `#71`: same slot table, same `#72`/`#73`/`#74` afterwards, only the
+backing memory differs. Callers are unaffected and cannot tell which they got.
+
+**The fallback is the QEMU path, not defensive padding.** `#86` returns `-1` when there is no GPU carveout,
+which is every QEMU boot — the desktop keeps working there on the CPU copy path.
+
+### Changed — cyrius pin 6.4.34 → 6.4.71
+
+Required: `sys_shm_create_gpu` landed in the 6.4.7x wrapper set. Also picks up the `net.cyr` `sock_accept`
+per-poll allocation-leak fix that accept-loop consumers want.
+
+### Notes
+
+Host + `--agnos` builds green; `client_test` and `codec_test` pass; `cyrius lint` 0 warnings, `fmt --check`
+clean, `vet` clean, `distlib` regenerated (no drift).
+
+⚠ **Consumers of this release get GPU-visible buffers automatically** — no API change, no call-site change.
+What they do NOT get for free is a GPU *consumer*: `aethersafha`'s per-pixel composite loop still runs on
+the CPU until it is wired to `#87`.
+
+
 ## [0.5.1] — 2026-07-12 — present-buffer reuse (shm-slot/tmpfs leak fix) + input stream reassembly
 
 Two client-transport defects found by cyrius-doom's 0.33.3 audit round (doom is the first
