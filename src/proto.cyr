@@ -66,6 +66,21 @@ enum SetuSurfaceFlags {
     SETU_SURF_FULL_KEYS = 1;   # deliver SETU_INPUT_KEY on press AND release (mods arg =
     # 1 press / 0 release), not press-only — for apps that track
     # HELD keys (games). Default (unset) = press-only, mods = 0.
+    SETU_SURF_PREMULTIPLIED = 2;   # this surface's pixels are PREMULTIPLIED BGRA (c <= a) and the
+    # compositor may blend it per-pixel instead of copying it opaquely.
+    # ⚠ OPT-IN, and it must stay that way. On agnos the compositor
+    # composites an unflagged surface with gpu_blit_shm#87 (an opaque
+    # copy that ignores byte 3) and a flagged one with gpu_shader_op#92
+    # op 0x01 (premultiplied src-over, which READS byte 3). A client
+    # that writes byte 3 = 0 — as several do today, e.g. any surface
+    # painted with a bare 0x00RRGGBB colour — would become FULLY
+    # TRANSPARENT under #92, i.e. its window would vanish. So the
+    # default must remain the opaque path, and only a client that
+    # knows it emits premultiplied pixels may set this.
+    # ⚠ PREMULTIPLIED means each channel is ALREADY scaled by alpha
+    # (c <= a). Passing straight alpha does not error — it just looks
+    # washed out, silently. There is no runtime check anywhere in the
+    # stack; sadish's sd_premul() is the sanctioned producer.
 }
 
 # ================================================================

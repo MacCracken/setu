@@ -4,6 +4,28 @@ All notable changes to **setu** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-07-23
+
+### Added — `SETU_SURF_PREMULTIPLIED` (surface flag bit 1) + `setu_client_request_premultiplied`
+
+A client can now declare that its surface pixels are **premultiplied BGRA** (`c <= a`), which lets the
+compositor blend it per-pixel instead of copying it opaquely. Wire-compatible and additive: the flags word
+already existed (`SETU_SURF_FULL_KEYS` is bit 0), so existing clients send 0 or 1 and are unaffected.
+
+⚠ **Opt-in, and it must stay that way.** On agnos the compositor composites an unflagged surface with
+`gpu_blit_shm` **#87** — an opaque copy that ignores byte 3 — and a flagged one with `gpu_shader_op` **#92**
+op 0x01, premultiplied src-over, which **reads** byte 3. A surface whose alpha byte is 0 (exactly what a
+bare `0x00RRGGBB` colour produces, and what several painters in the stack emitted until this week) becomes
+**fully transparent** under #92: the window vanishes. Defaulting this on would break every existing client.
+
+⚠ **Premultiplied means each channel is already scaled by alpha.** Passing straight alpha does **not** error
+anywhere in the stack — it renders washed out, silently, with no diagnostic. `sadish`'s `sd_premul()` is the
+sanctioned producer.
+
+### Notes
+
+Host + `--agnos` builds green; `client_test` + `codec_test` pass; `distlib` regenerated.
+
 ## [0.6.0] - 2026-07-23
 
 ### Changed — client buffers are now GPU-VISIBLE on agnos, which unblocks the entire hardware-compositing band
