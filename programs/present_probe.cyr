@@ -14,6 +14,26 @@ include "src/lib.cyr"
 
 fn pp_say(s): i64 { return syscall(SYS_WRITE, 1, s, strlen(s)); }
 
+# Print a signed integer via pp_say. ⚠ This program deliberately avoids the stdlib io module
+# (it is the dependency-light client), so `print_int` is not linked in — hence the hand-rolled one.
+fn pp_num(n): i64 {
+    var buf[32];
+    var v = n;
+    var neg = 0;
+    if (v < 0) { neg = 1; v = 0 - v; }
+    var i = 31;
+    store8(&buf + i, 10);                 # trailing newline
+    i = i - 1;
+    if (v == 0) { store8(&buf + i, 48); i = i - 1; }
+    while (v > 0) {
+        store8(&buf + i, 48 + (v % 10));
+        v = v / 10;
+        i = i - 1;
+    }
+    if (neg == 1) { store8(&buf + i, 45); i = i - 1; }
+    return syscall(SYS_WRITE, 1, &buf + i + 1, 31 - i);
+}
+
 # Render frame `frame` into `pix` (w*h, bytes [B,G,R,X]): a dark grid, a constant 2 px
 # GREEN border (the smoke's window-visible gate), and a horizontal RED bar that moves
 # DOWN with the frame number — so a live-updating window visibly animates.
@@ -61,7 +81,15 @@ fn main(): i64 {
 
     var path = "/tmp/aethersafha-setu.sock";     # advisory; transport is loopback:7700
     var c = setu_client_connect(path);
-    if (c == 0) { pp_say("present_probe: setu connect failed\n"); return 1; }
+    if (c == 0) {
+        # ⛔ SAY WHICH FAILURE AND WHAT THE KERNEL RETURNED. "setu connect failed" alone cost a
+        # QEMU cycle: -2 (no socket) and -3 (connect refused) are different faults with different
+        # fixes, and the raw #47 return is where the reason actually is.
+        pp_say("present_probe: setu connect failed, stage then kernel rc:\n");
+        pp_num(setu_connect_error());
+        pp_num(setu_connect_rc());
+        return 1;
+    }
     var fd = setu_client_fd(c);
 
     # Create the shared buffer + write frame 0, then establish the surface bound to it

@@ -781,15 +781,65 @@ var SETU_TCP_PORT = 7700;   # the compositor's well-known setu loopback port
 # Connect to the compositor's setu endpoint (loopback : SETU_TCP_PORT). `path` is
 # advisory (kept for API compat). Returns the connected fd (>= 0), or -2 (socket)
 # / -3 (connect). Cross-platform via net.cyr.
+# ⛔ WHY THE FAILURE REASON IS RECORDED. Every client collapses a failed connect into one
+# message — `present_probe: setu connect failed`, `crab: setu connect failed` — because
+# `setu_client_connect` returns 0 for BOTH the socket-creation failure and the connect failure.
+# On the 2026-08-02 desktop bring-up that made an instant, reproducible failure unreadable: two
+# different faults, one indistinguishable symptom, and no way to tell a full conn table from an RST
+# from a bad port without another boot. The raw syscall return is the one fact that separates them.
+# ⚠ agnos `sock_connect` #47 blocks up to ~8 s polling for the SYN-ACK, so a failure that returns
+# INSTANTLY is already known not to be a handshake timeout.
+var setu_conn_err = 0;      # last setu_connect failure: -2 socket, -3 connect. 0 = last one worked.
+var setu_conn_rc = 0;       # the raw sys_sock_connect return behind a -3, where the reason lives.
+fn setu_connect_error(): i64 { return setu_conn_err; }
+fn setu_connect_rc(): i64 { return setu_conn_rc; }
+
 fn setu_connect(path): i64 {
+    setu_conn_err = 0;
+    setu_conn_rc = 0;
     var s = tcp_socket();
-    if (is_ok(s) == 0) { return 0 - 2; }
+    if (is_ok(s) == 0) { setu_conn_err = 0 - 2; return 0 - 2; }
     var fd = result_unwrap(s);
+    #ifdef CYRIUS_TARGET_AGNOS
+    # ⛔ CONNECT TO net_ip, NOT 127.0.0.1 — agnos loopback TCP only closes the handshake when the
+    # two addresses AGREE, and 127.0.0.1 makes them disagree on every real boot.
+    #
+    # Trace it: the client's SYN carries `src = net_ip` (the stack has one source address) and
+    # `dst = 127.0.0.1`, which `net_is_loopback` accepts, so the SYN is lo_ring-delivered and the
+    # passive open records `peer = net_ip`. Its SYN-ACK then goes out with `src = net_ip` — but the
+    # client's conn was created with `dst_ip = 127.0.0.1`, so `tcp_find_conn(..., src_ip = net_ip)`
+    # finds NO match, the reply lands on an unknown 4-tuple, and the conn dies. `sock_connect` #47
+    # returns -1 with the client's own slot zeroed.
+    #
+    # ⚠ THE agnos SELFTEST HOOK HID THIS FOR THE WHOLE LIFE OF THE FEATURE. `AETHERSAFHA_SETU_SELFTEST`
+    # assigns `net_ip = 0x7F000001` in the kernel before launching the compositor — which makes
+    # src == dst == 127.0.0.1 and the match succeed. That is why `aethersafha-setu-smoke.sh` passes
+    # and why no ordinary boot ever has. The kernel's own loopback proof (`loopback-smoke.sh`,
+    # "TCP handshake to net_ip completed over lo") connects to **net_ip** and never to 127.0.0.1.
+    #
+    # ⚠ `net_ip == 0` (a box with no NIC, so no DHCP) cannot be fixed from here: the reply's dst
+    # would be 0, which `net_is_loopback` explicitly excludes. Fall back to 127.0.0.1 so behaviour is
+    # unchanged there rather than newly broken, and leave that case to the kernel.
+    var setu_dst = sys_net_ip();
+    if (setu_dst == 0) { setu_dst = 0x7F000001; }
+    var conn = sys_sock_connect(setu_dst, SETU_TCP_PORT, 0);
+    setu_conn_rc = conn;
+    if (conn < 0) {
+        sock_close(fd);
+        setu_conn_err = 0 - 3;
+        return 0 - 3;
+    }
+    _agnos_sock_bind(fd, conn);
+    return fd;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     if (is_ok(sock_connect(fd, INADDR_LOOPBACK(), SETU_TCP_PORT)) == 0) {
         sock_close(fd);
+        setu_conn_err = 0 - 3;
         return 0 - 3;
     }
     return fd;
+    #endif
 }
 
 # --- server transport (the compositor owns the listener) ---------------------
@@ -948,6 +998,12 @@ var SETU_C_INBUF_CAP = 512;   # ≥ 6 widest frames ((2+8)*8 = 80 B); input fram
 
 # Connect to the compositor's setu endpoint. Returns a *SetuClient, or 0 on
 # failure. The surface is created lazily on the first setu_client_present.
+# ⛔ DO NOT ADD A CONNECT RETRY LOOP HERE WITHOUT RE-MEASURING. It was tried on 2026-08-02 and it
+# made things STRICTLY WORSE: agnos `sock_connect` #47 runs with preempt DISABLED for the whole
+# attempt, so a client retrying in a loop holds the CPU the compositor needs in order to make any
+# progress at all. With 200 tries the compositor's 30 s budget stretched to 72 s of wall clock and
+# still saw zero connections — the retry starved the peer it was waiting for. A `sched_yield`
+# between attempts does not fix it, because the cost is inside the blocking syscall, not between them.
 fn setu_client_connect(path): i64 {
     var fd = setu_connect(path);
     if (fd < 0) { return 0; }
