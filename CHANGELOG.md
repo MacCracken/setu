@@ -4,6 +4,54 @@ All notable changes to **setu** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.7.2] - 2026-08-02
+
+### Fixed — ⛔ CLIENTS COULD NEVER CONNECT ON A REAL agnos BOOT: connect to `net_ip`, not 127.0.0.1
+
+`setu_connect` dialled `INADDR_LOOPBACK` (127.0.0.1). agnos puts **`net_ip`** — the host's own IPv4 —
+in an outbound SYN's *source* field, and its TCP stack matches a reply on the full 4-tuple. So:
+
+1. Client SYN goes out `src = net_ip`, `dst = 127.0.0.1`. `net_is_loopback` accepts the dst, so the
+   segment is delivered through the kernel's lo_ring — this part always worked.
+2. The passive open records the peer as `net_ip` and sends its SYN-ACK back with `src = net_ip`.
+3. The client's conn was created with `dst_ip = 127.0.0.1`, so `tcp_find_conn(..., src_ip = net_ip)`
+   finds **no match**. The reply lands on an unknown 4-tuple and the conn dies.
+
+`sock_connect` #47 returns **-1 instantly** — not the ~8 s SYN-ACK timeout, because the client's own
+slot is zeroed — and every client reported the same opaque `setu connect failed`.
+
+⛔ **THE agnos SELFTEST HOOK HID THIS FOR THE WHOLE LIFE OF THE FEATURE.**
+`AETHERSAFHA_SETU_SELFTEST` assigns `net_ip = 0x7F000001` in the kernel before it launches the
+compositor (agnos `kernel/core/main.cyr`, and the hook's own comment explains why). That makes
+`src == dst == 127.0.0.1`, the 4-tuple matches, and `aethersafha-setu-smoke.sh` passes. **No ordinary
+boot has that fixup**, so the smoke was green while the real launch path had never once worked.
+⚠ The kernel's *other* loopback proof (`loopback-smoke.sh`, 5/5) connects to **net_ip** and never to
+127.0.0.1 — two green proofs disagreeing about the address, and the bug lived in the gap.
+
+**Fix:** dial `sys_net_ip()`, falling back to 127.0.0.1 only when it is 0.
+⚠ `net_ip == 0` (no NIC ⇒ no DHCP) is **not** fixable from ring 3 — the reply's dst would be 0, which
+`net_is_loopback` explicitly excludes — so that case is left unchanged rather than newly broken, and
+belongs to the kernel.
+
+### Added — `setu_connect_error()` / `setu_connect_rc()`
+
+`setu_client_connect` returns 0 for both a failed socket and a failed connect, so every client
+printed one indistinguishable message for two different faults. These expose the failing **stage**
+(-2 socket / -3 connect) and the **raw kernel return** behind it. On agnos the connect now calls
+`sys_sock_connect` directly so that return survives instead of being flattened to `Err(1)`.
+
+⚠ **DO NOT ADD A CONNECT RETRY LOOP** — tried, and strictly worse. `sock_connect` #47 holds preempt
+DISABLED for the whole attempt, so a retrying client starves the compositor it is waiting for: 200
+tries stretched the compositor's 30 s budget to 72 s with still zero connections. A `sched_yield`
+between attempts does not help; the cost is *inside* the blocking syscall. The reason is recorded at
+the call site so it is not re-attempted.
+
+### Verified
+
+`aethersafha` launched **in the foreground** from the agnsh prompt in QEMU: both clients connect and
+present, confirmed on the **framebuffer** (not the serial log) — the slim `present_probe` and crab's
+dual-pane file manager, composited as windows.
+
 ## [0.7.1] - 2026-08-02
 
 ### Changed — cyrius pin 6.4.71 -> 6.5.5
