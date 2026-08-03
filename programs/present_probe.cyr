@@ -4,11 +4,19 @@
 # ONE surface bound to a shared buffer, then LIVE-ANIMATES it: it keeps writing new
 # frames into that shared buffer (setu_buf_write) — the compositor re-reads the buffer
 # every frame (win_bufid), so the window updates with no per-frame socket traffic. It
-# depends ONLY on setu (which builds `--agnos`), so it proves the desktop path ON THE
-# SOVEREIGN KERNEL without the puka terminal's GPU stack (mabda uses Linux `SYS_IOCTL`).
-# The compositor spawns `/bin/puka`; the smoke seeds this binary there.
+# depends ONLY on setu (which builds `--agnos`), so it exercises the desktop path without
+# the puka terminal's GPU stack (mabda uses Linux `SYS_IOCTL`).
 #
-# Run: it needs a live compositor listening on setu loopback:7700.
+# ⛔ RETRACTED 2026-08-03 — this header used to claim it "proves the desktop path ON THE
+# SOVEREIGN KERNEL". IT PROVED NOTHING ON agnos. Every agnos run of this probe before
+# setu 0.7.2 needed an `AETHERSAFHA_SETU_SELFTEST` kernel (`net_ip = 0x7F000001`) to get a
+# connection at all; on an ordinary boot the handshake could not complete. The TCP transport
+# it dials is a RETIRED WRONG PREMISE, replaced by the agnos socket `naadi` — see the banner
+# at the top of setu `src/client.cyr` and agnos `docs/development/planning/ipc.md` §9/§10.
+#
+# The compositor spawns `/bin/puka`; the (now-deleted) smoke seeded this binary there.
+#
+# Run: it needs a live compositor listening on setu loopback:7700 (pending naadi).
 
 include "src/lib.cyr"
 

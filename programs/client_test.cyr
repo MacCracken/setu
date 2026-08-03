@@ -1,8 +1,12 @@
 # programs/client_test.cyr — RUN test for the setu client transport.
 #
-# The socket ops (connect/listen/accept/send/recv) need a live compositor peer —
-# they are proven end-to-end by the puka <-> aethersafha integration over TCP
-# loopback (item 3b). Here we assert the pure/linkable surface: the well-known
+# The socket ops (connect/listen/accept/send/recv) need a live compositor peer.
+# ⛔ They were claimed here as "proven end-to-end by the puka <-> aethersafha integration
+# over TCP loopback (item 3b)". That integration was proven ON LINUX ONLY; the agnos-side
+# greens came from `AETHERSAFHA_SETU_SELFTEST`-rigged kernels and are FALSE GREENS. The TCP
+# transport is a RETIRED WRONG PREMISE (replaced by the agnos socket `naadi`) — see the
+# banner at the top of `src/client.cyr`.
+# Here we assert the pure/linkable surface: the well-known
 # transport port + a framed round-trip through the codec the client sends/reads,
 # so the client module links and its framing is sound. Exit code = failed checks
 # (0 = PASS), matching the setu codec_test / sadish RUN-test convention.
@@ -17,7 +21,8 @@ fn check(got, want): i64 {
 }
 
 fn main(): i64 {
-    # The setu channel is a well-known loopback TCP port (the 3b transport).
+    # ⛔ Pins the RETIRED TCP port so the naadi migration (ipc.md §9.6) has to touch this test
+    # deliberately. This asserts what the code currently IS, not what the transport SHOULD BE.
     check(SETU_TCP_PORT, 7700);
 
     # A framed round-trip through the client's send/read shape: build a

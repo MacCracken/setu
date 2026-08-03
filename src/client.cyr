@@ -2,9 +2,50 @@
 # shared by every consumer (dhancha, puka, crab) so there is ONE client, not three.
 # setu = the protocol CONTRACT (proto/codec) + this transport.
 #
-# Transport: TCP over loopback : SETU_TCP_PORT via cyrius `net.cyr` — Linux BSD
-# sockets on the host, the agnos kernel TCP band on agnos (connect #47, send/recv
-# #48/#49, listen/accept #56/#57). `path` params are advisory (API compat only).
+# ============================================================================
+# ⛔ THE TRANSPORT BELOW IS A RETIRED WRONG PREMISE — DO NOT BUILD ON IT
+# ============================================================================
+# TCP over loopback (`127.0.0.1 : SETU_TCP_PORT`) is NOT the AGNOS desktop
+# transport and never should have been. It was chosen at setu 0.3.0 because a
+# TCP stack happened to exist, was never put to the operator, and was then
+# carried for a month behind six accommodations. A local display protocol has
+# nothing to route, nothing to checksum, no window to negotiate, no RTO to wait
+# out, and NO BUSINESS OWNING A PORT.
+#
+# ⛔ AND IT NEVER WORKED ON agnos. The only test that ever showed it passing —
+# `aethersafha-setu-smoke.sh` — passed BY ACCIDENT: the kernel hook
+# `AETHERSAFHA_SETU_SELFTEST` assigned `net_ip = 0x7F000001` before launching
+# the compositor. agnos stamped `net_ip` as the SOURCE of every outbound
+# segment, so a SYN to 127.0.0.1 was answered to `net_ip` and `tcp_find_conn`
+# never matched — except under that hook, where the assignment made
+# src == dst == 127.0.0.1. On an ordinary boot the compositor↔client handshake
+# COULD NOT COMPLETE. See agnos `kernel/core/net.cyr:183-190`. The hook and the
+# smoke were DELETED 2026-08-03; no claim tracing to that smoke is evidence.
+#
+# ⭐ THE REPLACEMENT is the agnos socket — `naadi` (नाडी), designed in agnos
+# `docs/development/planning/ipc.md` §9. A channel handed to the child at spawn,
+# not an address dialled over a network stack.
+#
+# ⚠ WHY THIS CODE IS STILL HERE: `naadi` does not exist yet, and the migration
+# is a staged twelve-bite cut (ipc.md §9.6). Ripping the transport out today
+# would leave the desktop with no transport at all. ITS PRESENCE IS NOT AN
+# ENDORSEMENT — do not extend it, do not add accommodations to it, and do not
+# cite it as the working/proven/correct desktop path.
+#
+# ⚠ NOT retired: the setu CODEC and message ABI below (pure, transport-agnostic,
+# survives the swap untouched); the shared-buffer present path (`sys_shm`) —
+# which is precisely the workload having ALREADY left this wire; and the LINUX
+# arm — Linux is a DIFFERENT TARGET with a different kernel, not an agnos
+# fallback. ⛔ If the Linux arm ever becomes reachable on agnos, that is the
+# wrong path returning.
+# ============================================================================
+#
+# Transport (as implemented, pending the naadi migration): TCP over loopback :
+# SETU_TCP_PORT via cyrius `net.cyr` — Linux BSD sockets on the host, the agnos
+# kernel TCP band on agnos (connect #47, send/recv #48/#49, listen/accept
+# #56/#57). `path` params are advisory — they were never real, and are one of the
+# six accommodations named above; six consumers carried, ignored and passed them
+# identically. They go away with the transport.
 #
 # Two agnos socket semantics the framing absorbs (both #ifdef-guarded, so Linux
 # behaviour is unchanged):
@@ -13,15 +54,21 @@
 #
 # Model: connect once → create surface once → ATTACH + pixels + COMMIT per present.
 
-var SETU_TCP_PORT = 7700;   # the compositor's well-known setu loopback port
+# ⛔ RETIRED WRONG PREMISE (see the banner above). A local display protocol has no
+# business owning a well-known port; this one goes away with the naadi migration.
+var SETU_TCP_PORT = 7700;   # the compositor's TCP loopback port — NOT the sanctioned transport
 
 # =========================================================================
-# TCP transport + framing primitives (over the setu codec, via net.cyr)
+# ⛔ RETIRED TCP transport (see the banner at the top of this file) + framing
+#    primitives (over the setu codec, via net.cyr). The framing/codec survive
+#    the naadi swap; the socket calls do not.
 # =========================================================================
 
 # Connect to the compositor's setu endpoint (loopback : SETU_TCP_PORT). Returns the
 # connected fd (>= 0), or -2 (socket) / -3 (connect). `setu_connect_error` /
 # `setu_connect_rc` separate the two failures, which otherwise collapse to one message.
+# ⛔ This dials an IP address for a LOCAL channel, which is the wrong premise itself.
+# The naadi replacement is handed a channel at spawn and dials nothing.
 var setu_conn_err = 0;      # -2 socket, -3 connect. 0 = last one worked.
 var setu_conn_rc = 0;       # raw sys_sock_connect return behind a -3.
 fn setu_connect_error(): i64 { return setu_conn_err; }
@@ -34,8 +81,15 @@ fn setu_connect(path): i64 {
     if (is_ok(s) == 0) { setu_conn_err = 0 - 2; return 0 - 2; }
     var fd = result_unwrap(s);
     #ifdef CYRIUS_TARGET_AGNOS
-    # ⚠ Requires agnos >= 1.56.35 (`net_src_for`): older kernels stamped net_ip as the
-    # source of every outbound segment, so a loopback SYN's reply never matched the 4-tuple.
+    # ⚠ Requires agnos >= 1.56.34 (`net_src_for`): older kernels stamped net_ip as the
+    # source of every outbound segment, so a loopback SYN's reply never matched the 4-tuple —
+    # i.e. THIS LINE COULD NOT CONNECT ON ANY ORDINARY BOOT for the whole life of the feature,
+    # and the one smoke that said otherwise was rigged (see the banner at the top of this file).
+    # ⛔ `net_src_for` is a RECEIPT OF THE WRONG PREMISE, not a vindication of it: route-derived
+    # source selection is a NETWORKING concept that had to be added to the kernel so a LOCAL
+    # channel could reach ITSELF. It is one of the six accommodations that together falsify this
+    # transport (agnos `planning/ipc.md` §10.0). ⚠ `net_src_for` itself STAYS — it is correct for
+    # the network (§10.4). What is retired is a display protocol riding TCP.
     var conn = sys_sock_connect(0x7F000001, SETU_TCP_PORT, 0);
     setu_conn_rc = conn;
     if (conn < 0) {
@@ -61,6 +115,11 @@ fn setu_connect(path): i64 {
 # Bind + listen on the setu endpoint (loopback : SETU_TCP_PORT). `path` advisory.
 # Returns the listening fd (>= 0), or -2 (socket) / -3 (bind) / -4 (listen). The
 # fd is set non-blocking so setu_accept polls (agnos #57 is already non-blocking).
+# ⛔ RETIRED WRONG PREMISE — see the banner at the top of this file. A compositor should
+# not be a network LISTENER: on agnos this costs a well-known port plus TWO of the eight
+# system-wide TCP conn slots per loopback connection, so listener + 3 clients exhausts the
+# table the NETWORK is supposed to use (agnos `planning/ipc.md` §10.1). The naadi
+# replacement places a channel instead of accepting dials. Kept only until §9.6 lands.
 fn setu_listen(path): i64 {
     var s = tcp_socket();
     if (is_ok(s) == 0) { return 0 - 2; }
@@ -110,9 +169,26 @@ fn setu_send(fd, msg): i64 {
     return enc;
 }
 
-# Read at least 1 byte into `buf` (cap `cap`), blocking until data / EOF. Absorbs
-# agnos's non-blocking recv (0 = would-block → yield + bounded retry) vs Linux's
-# blocking read (0 = EOF). Returns bytes (> 0), or -6 on EOF / error / timeout.
+# Read at least 1 byte into `buf` (cap `cap`), blocking until data / EOF.
+# Returns bytes (> 0), or -6 on EOF / error / timeout.
+#
+# ⛔ THE agnos ARM'S RETRY BUDGET IS NOT WHAT IT LOOKS LIKE, and the old comment here
+# ("0 = would-block → yield + bounded retry", "~10s cap at 5000*2ms") was wrong about
+# BOTH halves. On agnos a TAGGED socket fd's `sys_read` does not reach the kernel
+# directly — the cyrius stdlib routes it to `_agnos_sock_recv_block`
+# (`syscalls_x86_64_agnos.cyr:1084`), which itself polls `sock_recv #49` under a
+# 30 s wall-clock deadline (`AGNOS_SOCK_RECV_TIMEOUT_S = 30`) plus a 6000-spin
+# backstop, and returns **0 for BOTH EOF and timeout**. So:
+#   - `r == 0` NEVER means "would-block, try again in 2 ms". It means the wrapper has
+#     already burned up to 30 seconds, or the peer is gone.
+#   - the loop below therefore multiplies a ~30 s call by up to 5001 iterations, and
+#     the sleep between them is noise against that.
+# ⚠ Left as-is deliberately: the working desktop path runs through here today and the
+# blocking semantics are a KERNEL/stdlib gap (ring 3 has no way to ask "is a byte
+# waiting?" and get an immediate answer), not a defect this function can honestly fix
+# on its own. Tracked as a 1.56.35 kernel item. Do not "tighten" the retry count
+# without measuring first — the budget that matters is the inner wrapper's, not this
+# loop's.
 fn setu_read_blk(fd, buf, cap): i64 {
     var tries = 0;
     while (tries <= 5000) {
@@ -120,8 +196,8 @@ fn setu_read_blk(fd, buf, cap): i64 {
         #ifdef CYRIUS_TARGET_AGNOS
         if (r < 0) { return 0 - 6; }               # -1 = EOF / error
         if (r > 0) { return r; }                   # got bytes
-        tries = tries + 1;                          # r == 0 → would-block
-        sys_sleep_ms(2);                            # yield (~10s cap at 5000*2ms)
+        tries = tries + 1;                          # r == 0 → EOF *or* the wrapper's 30 s timeout
+        sys_sleep_ms(2);
         #endif
         #ifndef CYRIUS_TARGET_AGNOS
         if (r <= 0) { return 0 - 6; }               # 0 = EOF on Linux
@@ -142,9 +218,15 @@ fn setu_recv(fd, msg_out): i64 {
     return setu_decode(buf, n, msg_out);
 }
 
-# NON-BLOCKING poll for ONE inbound frame (the S->C input channel). Returns 1 and fills
-# `msg_out` when a frame arrived, 0 when nothing is pending, or -6 on EOF/error — the
-# caller's animation loop never stalls.
+# Poll for ONE inbound frame (the S->C input channel). Returns 1 and fills `msg_out`
+# when a frame arrived, 0 when nothing is pending, or -6 on EOF/error.
+# ⛔ "NON-BLOCKING ... never stalls" was the claim here and it is FALSE ON agnos. The
+# single `sys_read` below routes a tagged socket fd through the stdlib's
+# `_agnos_sock_recv_block`, which polls under a 30 s deadline before returning 0. On a
+# frame with nothing pending this can stall the caller's loop. It has not been observed
+# to bite (the desktop measures ~10 ms/frame in QEMU, i.e. data is pending on the polls
+# that matter) but the contract as written is not the contract as implemented.
+# See setu_read_blk above; the fix belongs in the kernel/stdlib, not here.
 # ⚠ Decodes only the FIRST frame of each recv; coalesced or split frames are dropped.
 # Kept for API compat — stream consumers use setu_client_poll_input, which reassembles.
 fn setu_poll_input(fd, msg_out): i64 {
@@ -209,7 +291,13 @@ var SETU_C_INBUF_CAP = 512;   # ≥ 6 widest frames ((2+8)*8 = 80 B); input fram
 # Connect to the compositor's setu endpoint. Returns a *SetuClient, or 0 on
 # failure. The surface is created lazily on the first setu_client_present.
 # ⛔ No retry loop here: agnos `sock_connect` #47 holds preempt for the whole attempt,
-# so a retrying client starves the compositor it is waiting for.
+# so a retrying client starves the compositor it is waiting for. (200 retries stretched a
+# 30 s compositor budget to 72 s with ZERO connections; a `sched_yield` between attempts does
+# not help — the cost is INSIDE the blocking syscall.)
+# ⛔ Do not read this rule as tuning. It is one of the six accommodations that falsify the TCP
+# transport itself (agnos `planning/ipc.md` §10.0) — a transport whose connect primitive starves
+# the peer being dialled is the wrong primitive. The hazard CEASES TO EXIST with the naadi
+# migration (§9.6), because a placed channel is never dialled. Until then the rule stands.
 fn setu_client_connect(path): i64 {
     var fd = setu_connect(path);
     if (fd < 0) { return 0; }
@@ -358,8 +446,8 @@ fn setu_client_poll_input(c, msg_out): i64 {
         if (setu__inbuf_take(c, msg_out) == 1) { return 1; }
         return 0;                                # partial frame — completes next poll
     }
-    if (r == 0) { return 0; }                    # agnos: would-block; Linux: EOF-as-idle
-    # (matches setu_poll_input's semantics)
+    if (r == 0) { return 0; }                    # agnos: EOF *or* the wrapper's 30 s timeout; Linux: EOF-as-idle
+    # (matches setu_poll_input's semantics — including its blocking caveat)
     if (len > 0) { return 0; }                   # error but bytes pending — drain first
     return 0 - 6;                                # EOF / error
 }

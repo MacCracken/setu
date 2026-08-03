@@ -9,12 +9,36 @@ message **types**, a pure wire **codec** (marshal / unmarshal as pure,
 host-testable functions), and — since **v0.2.0** — the **reference client
 transport** (`client.cyr`): the persistent connection every app owns
 (`setu_client_connect` → `setu_client_present` → `setu_client_recv` →
-`setu_client_close`). Since **v0.3.0** that transport is **TCP over loopback**
-(`127.0.0.1 : 7700`) via the cyrius `net.cyr` socket layer — CROSS-PLATFORM by
-construction: it routes to Linux BSD sockets on the host AND to agnos's kernel
-TCP band (`sock_connect`/`sock_listen`/`sock_accept`, tagged-fd send/recv) on
-the sovereign kernel, so the desktop runs on agnos, not just Linux (this
-replaced the Linux-only AF_UNIX path, which fail-closed on agnos). The codec
+`setu_client_close`).
+
+> ## ⛔ The transport is a RETIRED WRONG PREMISE (2026-08-03)
+>
+> Since **v0.3.0** that transport has been **TCP over loopback** (`127.0.0.1 : 7700`) via the
+> cyrius `net.cyr` socket layer. **That was the wrong choice**, made because a TCP stack
+> happened to exist, never put to the operator, and then carried for a month behind six
+> accommodations. A local display protocol has nothing to route, nothing to checksum, no window
+> to negotiate, and **no business owning a port**.
+>
+> ⛔ **It also never worked on agnos.** The compositor↔client handshake could not complete on an
+> ordinary agnos boot — the SYN-ACK came back addressed to `net_ip` and `tcp_find_conn` never
+> matched. The one test that showed it green, `aethersafha-setu-smoke.sh`, passed **by accident**:
+> the kernel hook `AETHERSAFHA_SETU_SELFTEST` assigned `net_ip = 0x7F000001` first. **Every
+> "proven on the sovereign kernel" claim tied to that smoke is a FALSE GREEN.** Hook and smoke
+> were deleted 2026-08-03.
+>
+> ⭐ **The replacement is the agnos socket — `naadi`**, designed in agnos
+> [`docs/development/planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)
+> §9: a channel handed to the child at spawn, not an address dialled over a network stack.
+>
+> ⚠ **The TCP code still ships** only because `naadi` does not exist yet and the migration is a
+> staged twelve-bite cut (§9.6) — removing it today would leave the desktop with no transport at
+> all. **Its presence is not an endorsement.** Do not extend it and do not cite it as working.
+>
+> ⚠ **Unaffected:** the setu **codec / message ABI** (pure, transport-agnostic, survives the swap
+> untouched), the **shared-buffer present path** (`sys_shm` — the pixels already left this wire),
+> and the **Linux arm** (a different target, not an agnos fallback).
+
+The codec
 stays pure; the client is the **one**
 implementation both consumers share — `dhancha` renders widgets → pixels,
 `puka` renders a cell grid → pixels, and both present raw buffers through it —

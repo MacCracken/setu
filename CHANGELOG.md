@@ -4,6 +4,100 @@ All notable changes to **setu** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+---
+
+## ⛔ STANDING RETRACTION 2026-08-03 — TCP-on-loopback was never the desktop transport
+
+**`SETU_TCP_PORT = 7700` / TCP over loopback is a RETIRED WRONG PREMISE.** It was chosen at 0.3.0
+because a TCP stack happened to exist, was never put to the operator, and was then carried for a
+month behind a stack of accommodations. Its replacement is the **agnos socket (`naadi`)**, designed
+in agnos [`docs/development/planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)
+§9. The transport code still ships only because `naadi` does not exist yet and the migration is a
+staged twelve-bite cut (ipc.md §9.6) — **its continued presence is not an endorsement.**
+
+⛔ **AND THE ONLY TEST THAT EVER PROVED IT ON agnos PASSED BY ACCIDENT.** The kernel hook
+`AETHERSAFHA_SETU_SELFTEST` assigned `net_ip = 0x7F000001` before launching the compositor. agnos
+stamped `net_ip` as the *source* of every outbound segment, so a SYN to `127.0.0.1` was answered to
+`net_ip` and `tcp_find_conn` never matched — **except** under the selftest, where the assignment made
+`src == dst == 127.0.0.1`. **The compositor↔client handshake could therefore NEVER complete on an
+ordinary agnos boot** (agnos `kernel/core/net.cyr:183-190` states this outright).
+
+**Therefore: every claim in the entries below that a setu client connected to the compositor ON agnos,
+dated before [0.7.2] (2026-08-02), is a FALSE GREEN and must not be cited as proof of anything.** The
+individually-marked sites are the explicit ones; this rule covers the rest. Entries are preserved
+rather than deleted because the audit trail of the mistake is the point — read them as a record of a
+wrong path, not as achievements.
+
+⚠ **What is NOT retracted:** the setu **codec / message ABI** (pure, host-tested, transport-agnostic,
+survives the transport change untouched), the **shared-buffer present path** (`sys_shm`, which is
+exactly the workload leaving the wire), and setu's **Linux arm** (a different target, not an agnos
+fallback). ⛔ If the Linux TCP arm ever becomes reachable *on agnos*, that is the wrong path returning.
+
+---
+
+## [0.7.3] - 2026-08-02
+
+### Changed — the connect workaround is reverted; the fix belongs to (and is now in) the kernel
+
+0.7.2 made `setu_connect` dial `sys_net_ip()` because a loopback SYN's reply came back on a 4-tuple the
+client's own conn could not match. That was a userland workaround for a kernel behaviour, and the kernel
+has since fixed it properly: **agnos `net_src_for`** (`kernel/core/net.cyr:203-206`) derives an outbound
+segment's source from its **destination**, so a loopback SYN goes out `src = dst = 127.0.0.1` and its
+SYN-ACK matches.
+
+`setu_connect` therefore dials `0x7F000001` again.
+
+> ⛔ **RETRACTED 2026-08-03** — this entry originally ended *"which is what a local display protocol
+> should have been doing all along."* **That is exactly backwards.** A local display protocol should
+> not have been dialling an IP address *at all*. `net_src_for` is a **receipt of the wrong premise**,
+> not a vindication of it: route-derived source selection is a networking concept that had to be added
+> to the kernel so a **local** channel could reach **itself**. It is listed in agnos
+> [`planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)
+> §10.0 among the six accommodations that together falsify the choice. ⚠ `net_src_for` itself **stays**
+> (§10.4) — it is correct for the network. What is retracted is the claim that dialling loopback was
+> ever the right shape for a desktop transport. The replacement is the agnos socket (`naadi`, §9).
+
+⚠ **This raises the kernel floor: agnos >= 1.56.34.** On an older kernel a client built from this
+release cannot connect at all. The requirement is stated at the call site; `net_src_for` is documented in
+agnos's 1.56.34 section, added there retroactively at that cycle's close because it had shipped with no
+entry under any version — which is why setu's own comments briefly cited 1.56.34 and 1.56.35
+inconsistently. They now agree.
+
+⭐ 0.7.2's entry below is **not** wrong and is left as written: it accurately documents the tag that
+shipped and the reasoning that was correct at the time. This release supersedes it; it does not correct it.
+
+### Fixed — three comments that described the opposite of what the code does on agnos
+
+No control flow changed. These were **contract lies**, and the contract is what callers build on.
+
+⛔ **`setu_read_blk`'s retry budget is not what it looks like.** Its old comment claimed
+`0 = would-block → yield + bounded retry` with a *"~10s cap at 5000*2ms"*. On agnos a **tagged** socket
+fd's `sys_read` does not reach the kernel directly — the cyrius stdlib routes it to
+`_agnos_sock_recv_block` (`syscalls_x86_64_agnos.cyr:1084`), which polls `sock_recv #49` under a **30 s
+wall-clock deadline** (`AGNOS_SOCK_RECV_TIMEOUT_S = 30`) plus a 6000-spin backstop, and returns **0 for
+both EOF and timeout**. So `r == 0` never means "try again in 2 ms"; it means up to 30 seconds are
+already gone. The outer loop then multiplies that by up to 5001 iterations, and the 2 ms sleep between
+them is noise against it.
+
+⛔ **`setu_poll_input` is documented "NON-BLOCKING … never stalls" and its body is a `sys_read`** — the
+same 30 s wrapper. `setu_client_poll_input`, which every client's frame loop calls, inherits it.
+
+⚠ **Deliberately not "fixed" here.** The working desktop path runs through these functions today and
+measures ~10 ms/frame in QEMU, so data is pending on the polls that matter — this is a latent hazard,
+not an observed stall. More to the point, ring 3 has **no way to ask "is a byte waiting?" and get an
+immediate answer**, so no change confined to this file can honestly provide non-blocking semantics. It
+is a kernel/stdlib gap, filed as an agnos 1.56.35 item, and the fix wants a measurement before a design.
+The call sites now say so, so the next reader does not "tighten" a retry count that was never the budget
+that mattered.
+
+### Verified
+
+Both targets build for all four programs (`present_probe`, `smoke`, `codec_test`, `client_test`); the
+two RUN-tests pass — `codec_test: PASS (roundtrip all kinds + reject short/bad-argc/unknown)` and
+`client_test: PASS (port + create-surface round-trip + reassembly + buf lifecycle)`. `dist/setu.cyr`
+regenerated at v0.7.3 (1133 lines) — consumers read the bundle, not `src/`, so a src-only change would
+not have reached crab or puka.
+
 ## [0.7.2] - 2026-08-02
 
 ### Fixed — ⛔ CLIENTS COULD NEVER CONNECT ON A REAL agnos BOOT: connect to `net_ip`, not 127.0.0.1
@@ -21,10 +115,23 @@ in an outbound SYN's *source* field, and its TCP stack matches a reply on the fu
 slot is zeroed — and every client reported the same opaque `setu connect failed`.
 
 ⛔ **THE agnos SELFTEST HOOK HID THIS FOR THE WHOLE LIFE OF THE FEATURE.**
-`AETHERSAFHA_SETU_SELFTEST` assigns `net_ip = 0x7F000001` in the kernel before it launches the
-compositor (agnos `kernel/core/main.cyr`, and the hook's own comment explains why). That makes
-`src == dst == 127.0.0.1`, the 4-tuple matches, and `aethersafha-setu-smoke.sh` passes. **No ordinary
-boot has that fixup**, so the smoke was green while the real launch path had never once worked.
+`AETHERSAFHA_SETU_SELFTEST` assigned `net_ip = 0x7F000001` in the kernel before it launched the
+compositor. That made `src == dst == 127.0.0.1`, the 4-tuple matched, and `aethersafha-setu-smoke.sh`
+passed. **No ordinary boot had that fixup**, so the smoke was green while the real launch path had
+never once worked.
+
+> ⛔ **RETRACTED / RESTATED 2026-08-03 — READ THIS AS A FALSE GREEN, NOT AS A MECHANISM.** The
+> paragraph above described the rig neutrally, as though it were a quirk that a fix then cleared.
+> It is not. **`aethersafha-setu-smoke.sh` was never a passing test — it was a test that could not
+> fail**, because the kernel it ran under had been edited to make the one condition under test true.
+> Every "GATE 4 GREEN", every "green on agnos", every "proven on the sovereign target" claim anywhere
+> in this ecosystem that traces to that smoke is **manufactured**, and citing one is how the wrong
+> premise gets resurrected.
+> The hook, its `build.sh` define, and the smoke itself have been **DELETED** (2026-08-03) —
+> scaffolding that manufactures a false pass has no historical value; it is the trap. What survives is
+> this record that it existed. See agnos `kernel/core/net.cyr:183-190` and
+> [`planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)
+> §10.1.
 ⚠ The kernel's *other* loopback proof (`loopback-smoke.sh`, 5/5) connects to **net_ip** and never to
 127.0.0.1 — two green proofs disagreeing about the address, and the bug lived in the gap.
 
@@ -51,6 +158,13 @@ the call site so it is not re-attempted.
 `aethersafha` launched **in the foreground** from the agnsh prompt in QEMU: both clients connect and
 present, confirmed on the **framebuffer** (not the serial log) — the slim `present_probe` and crab's
 dual-pane file manager, composited as windows.
+
+> ⚠ **Qualified 2026-08-03.** This observation is **honest** — it used no selftest hook, and it is the
+> first and only time a setu client is known to have connected to the compositor on agnos without a
+> rigged kernel. It is retained for exactly that reason. ⛔ But it does **not** make TCP-on-loopback a
+> correct desktop transport, and it must not be cited as one: it is the measurement that finally showed
+> what the previous month of "greens" had been hiding. The transport is retired in favour of the agnos
+> socket (`naadi`); see the STANDING RETRACTION at the top of this file.
 
 ## [0.7.1] - 2026-08-02
 
@@ -88,8 +202,14 @@ already existed (`SETU_SURF_FULL_KEYS` is bit 0), so existing clients send 0 or 
 ⚠ **Opt-in, and it must stay that way.** On agnos the compositor composites an unflagged surface with
 `gpu_blit_shm` **#87** — an opaque copy that ignores byte 3 — and a flagged one with `gpu_shader_op` **#92**
 op 0x01, premultiplied src-over, which **reads** byte 3. A surface whose alpha byte is 0 (exactly what a
-bare `0x00RRGGBB` colour produces, and what several painters in the stack emitted until this week) becomes
-**fully transparent** under #92: the window vanishes. Defaulting this on would break every existing client.
+bare `0x00RRGGBB` colour produces, and what several painters in the stack emitted until this week) renders
+**wrong** under #92. Defaulting this on would break every existing client.
+
+> ⛔ **Corrected 2026-08-02** — this entry originally said such a surface becomes *"fully transparent under
+> #92: the window vanishes."* That is wrong. The kernel shader is `out = src + dst*(1 - src_a)`, so alpha 0
+> gives `out = src + dst` — an **additive over-bright ghost**, not a disappearance. It is nearly invisible
+> over the near-black desktop void and blows out over bright chrome, which makes it *harder* to spot than a
+> missing window. The opt-in rule above stands unchanged; only the predicted symptom was wrong.
 
 ⚠ **Premultiplied means each channel is already scaled by alpha.** Passing straight alpha does **not** error
 anywhere in the stack — it renders washed out, silently, with no diagnostic. `sadish`'s `sd_premul()` is the
@@ -193,10 +313,22 @@ aethersafha desktop); the compositor honours the flag per-surface (aethersafha).
 - `SetuClient` gains a `SETU_C_FLAGS` field carrying the requested `CREATE_SURFACE` flags into
   the lazy first-present handshake.
 
-## [0.4.0] — 2026-07-09 — INPUT + FOCUS over setu, proven end-to-end on the sovereign kernel
+## [0.4.0] — 2026-07-09 — INPUT + FOCUS over setu ~~proven end-to-end on the sovereign kernel~~
+
+> ⛔ **RETRACTED 2026-08-03 — "proven end-to-end on the sovereign kernel" IS A FALSE GREEN.** Every
+> agnos-side proof in this entry required a compositor↔client TCP connection, and on this date **no such
+> connection could complete on an ordinary agnos boot** — the SYN-ACK came back addressed to `net_ip`
+> and `tcp_find_conn` never matched (that defect was not even *found* until [0.7.2], 2026-08-02, three
+> weeks later). These harnesses ran against a kernel built with `AETHERSAFHA_SETU_SELFTEST`, which
+> assigned `net_ip = 0x7F000001` and made the mismatch vanish. **The input and focus behaviour was
+> demonstrated only under a rigged kernel; it was never proven on the sovereign target.** The version
+> tag and its API additions stand — the *proof* does not. See the STANDING RETRACTION at the top of
+> this file and agnos [`planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)
+> §10.1.
 
 The input milestone. setu's S→C input channel — non-blocking poll (0.3.2), keys, and now
-**focus** — is demonstrated end-to-end on agnos: the reference client `present_probe` runs as
+**focus** — is ~~demonstrated end-to-end on agnos~~ (⛔ false green, see above — demonstrated only
+under a rigged kernel): the reference client `present_probe` runs as
 a multi-window desktop where the compositor (aethersafha) routes keystrokes to the focused
 window and moves focus on TAB, and each client renders its own state from the wire.
 Minor bump to mark the milestone — the **library API is unchanged since 0.3.2** (`setu_poll_input`
@@ -211,14 +343,22 @@ client and the proof.
   the existing `SETU_INPUT_KEY` reaction (bar flashes white), the client now demonstrates the
   full S→C input surface.
 
-### Proven (on agnos, QEMU USB-xHCI keyboard `sendkey`)
+### ⛔ ~~Proven (on agnos, QEMU USB-xHCI keyboard `sendkey`)~~ — RETRACTED 2026-08-03, ALL THREE ARE FALSE GREENS
 
-- **Keyboard routed to the focused window** — injecting a key flips only the focused client
-  (white bar), the unfocused client untouched (`setu-input-test.py`).
-- **Focus cycles over setu** — TAB moves the bright (focused) border cleanly from one client to
+> ⛔ **None of the three below proved anything about agnos.** Each needed a live client↔compositor
+> setu connection, which on an ordinary boot of this era **could not be established at all**; they ran
+> against `AETHERSAFHA_SETU_SELFTEST` kernels whose `net_ip = 0x7F000001` fixup made the 4-tuple match
+> by accident. `aethersafha-setu-smoke.sh` has since been **deleted**. Recorded verbatim as the
+> falsified claim, **not** as evidence:
+
+- ~~**Keyboard routed to the focused window**~~ — injecting a key flips only the focused client
+  (white bar), the unfocused client untouched (`setu-input-test.py`). ⛔ FALSE GREEN — rigged kernel.
+- ~~**Focus cycles over setu**~~ — TAB moves the bright (focused) border cleanly from one client to
   the other; focus is client-rendered, driven by `SETU_INPUT_FOCUS` (`setu-focus-test.py`).
-- **Multi-window** — two clients composited as distinct cascaded windows, each live-animating
-  its own shared buffer (`aethersafha-setu-smoke.sh`).
+  ⛔ FALSE GREEN — rigged kernel.
+- ~~**Multi-window**~~ — two clients composited as distinct cascaded windows, each live-animating
+  its own shared buffer (`aethersafha-setu-smoke.sh`). ⛔ FALSE GREEN — this is the selftest smoke
+  itself, the single test the whole corruption rests on. Deleted 2026-08-03.
 
 ## [0.3.2] — 2026-07-09 — non-blocking client input poll (the S→C input channel)
 
@@ -238,8 +378,12 @@ blocking its animation loop.
   loopback, so a single recv delivers a whole frame (no reassembly at this milestone).
 - **`programs/present_probe.cyr` reacts to forwarded keys** — latches on `SETU_INPUT_KEY` and
   flips its border + bar to WHITE, the on-screen proof that a keystroke routed through setu to
-  the focused window. Validated on agnos by an injection harness (`setu-input-test.py`) that
-  boots with a QEMU USB-xHCI keyboard and drives `sendkey`.
+  the focused window. ~~Validated on agnos by an injection harness (`setu-input-test.py`) that
+  boots with a QEMU USB-xHCI keyboard and drives `sendkey`.~~
+  > ⛔ **RETRACTED 2026-08-03 — "validated on agnos" IS A FALSE GREEN.** The harness booted an
+  > `AETHERSAFHA_SETU_SELFTEST` kernel, whose `net_ip = 0x7F000001` assignment is the only reason the
+  > client could connect at all; an ordinary agnos boot of this era could not complete the handshake.
+  > The `setu_poll_input` API addition above stands; the agnos validation does not.
 
 ## [0.3.1] — 2026-07-09 — SHARED-BUFFER present (out-of-band pixels) + the on-device tagged-fd read/write fix
 
@@ -248,8 +392,20 @@ compositor through a **shared buffer** referenced by id. On agnos this is what m
 real surface composite: a hundreds-of-KB inline pixel payload can't drain through the 2 KB
 `TCP_RX_RING` while the single-CPU sender holds preemption in `sock_send`#48 — it deadlocks.
 Shared-buffer sidesteps it (and is lower-copy). The `setu_serve_probe`+`present_probe`
-round-trip is proven on Linux, and `aethersafha-setu-smoke.sh` is **green on the sovereign
-kernel**. Cyrius pin **6.4.25 → 6.4.34** (for the native `sys_shm_*` wrappers).
+round-trip is proven on Linux, and ~~`aethersafha-setu-smoke.sh` is **green on the sovereign
+kernel**~~. Cyrius pin **6.4.25 → 6.4.34** (for the native `sys_shm_*` wrappers).
+
+> ⛔ **RETRACTED 2026-08-03 — "green on the sovereign kernel" IS A FALSE GREEN.**
+> `aethersafha-setu-smoke.sh` ran against a kernel built with `AETHERSAFHA_SETU_SELFTEST`, which
+> assigned `net_ip = 0x7F000001` so that `src == dst == 127.0.0.1` and the 4-tuple matched. Without
+> that edit the compositor↔client handshake could not complete on any ordinary boot. The smoke has been
+> **deleted**. ⚠ The **Linux** round-trip in the same sentence was real, and the shared-buffer path
+> itself is real and survives — but note what this entry is actually reporting: **the pixels left the
+> wire because the wire could not carry them.** That was the workload voting against the transport, and
+> it was read backwards at the time ("keep the small control channel on TCP") when it meant *TCP is the
+> wrong primitive*. PCM did the same thing independently a few weeks later. See agnos
+> [`planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)
+> §10.0.
 
 ### Added
 
@@ -275,15 +431,40 @@ kernel**. Cyrius pin **6.4.25 → 6.4.34** (for the native `sys_shm_*` wrappers)
   the `VFS_SOCK → tcp_send/tcp_recv` dispatch — so on agnos the first client→compositor write
   failed (`rc=-41`) and the compositor could never read a client frame. Now they call the
   tagged-fd-aware `sys_write`/`sys_read` (setu already links `net`+`syscalls`; Linux `sys_write`
-  is a plain `write`, so it stays portable). This is what let the on-device present complete.
+  is a plain `write`, so it stays portable). ~~This is what let the on-device present complete.~~
+  > ⛔ **RETRACTED 2026-08-03** — the on-device present completed only under an
+  > `AETHERSAFHA_SETU_SELFTEST` kernel; an ordinary agnos boot could not get a connection to write on
+  > in the first place. The tagged-fd defect described above was **real** and the fix was correct — but
+  > it was not the last thing standing between this transport and a working desktop, and this sentence
+  > must not be read as saying it was.
 
 ## [0.3.0] — 2026-07-08
 
+> ⛔ **THIS IS THE ENTRY THAT INTRODUCED THE WRONG PREMISE. RETRACTED 2026-08-03.**
+> Choosing **TCP over loopback** as the AGNOS desktop transport was wrong, and it was wrong on the day
+> it was written — not merely superseded later. It was picked because a TCP stack happened to exist,
+> labelled a stopgap, **never put to the operator**, and then defended for a month by six
+> accommodations (`net_src_for` · the no-connect-retry rule · sub-window chunking · a boot-path DHCP
+> wait before a display handshake · `SO_REUSEADDR` on the audio port · a selftest that made the only
+> passing test pass by accident) plus an advisory `path` argument that six consumers carried, ignored
+> and passed identically. A local display protocol has nothing to route, nothing to checksum, no window
+> to negotiate, no RTO to wait out, and **no business owning a port**.
+> ⛔ **And the claim below — "so the sovereign desktop runs on the sovereign kernel" — was never true.**
+> On an ordinary agnos boot the compositor↔client handshake could not complete at all, from this
+> release until [0.7.2] (2026-08-02). Every agnos "green" in that window came from an
+> `AETHERSAFHA_SETU_SELFTEST` kernel. The end-to-end `puka` ↔ `aethersafha` PPM proof cited here was a
+> **Linux host** result.
+> ⭐ The replacement is the **agnos socket (`naadi`)** — agnos
+> [`planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)
+> §9. The transport code below still ships **only** because `naadi` does not exist yet and its
+> migration is a staged twelve-bite cut (§9.6); removing it today would leave the desktop with no
+> transport at all. ⚠ setu's **Linux arm stays** — Linux is a different target, not an agnos fallback.
+
 The reference transport goes **cross-platform** (item 3b of the road-to-desktop):
 setu now speaks **TCP over loopback** (`127.0.0.1 : 7700`) on Linux **and** on
-agnos, so the sovereign desktop runs on the sovereign kernel — not just the host.
+agnos, ~~so the sovereign desktop runs on the sovereign kernel — not just the host~~.
 This **replaces** the 0.2.0 AF_UNIX client, which was Linux-only and fail-closed
-on agnos. Proven end-to-end: `puka` (client) connects over TCP and presents a
+on agnos. Proven end-to-end (**on the Linux host**): `puka` (client) connects over TCP and presents a
 rendered 320×192 terminal frame → `aethersafha`'s server accepts (non-blocking
 poll) and composites it → a valid PPM with real content (grey grid on black).
 
