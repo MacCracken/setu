@@ -52,6 +52,39 @@ fallback). ⛔ If the Linux TCP arm ever becomes reachable *on agnos*, that is t
 
 ---
 
+## [0.7.4] - 2026-08-03
+
+### Fixed — the 0.7.3 retraction over-reached and said something false
+
+0.7.3 retired the TCP-on-loopback transport correctly, but its retraction text over-corrected into
+**"it never worked on agnos"** — in `src/client.cyr`, `README.md`, and this file's standing retraction
+block. That claim is false, and because `dist/setu.cyr` ships to consumers it propagated byte-identically
+into five materialized `lib/setu.cyr` copies (aethersafha, crab, dhancha, jalwa, puka) and two
+hand-vendored ones (cyrius-doom, cyrius-mine-cart). Two consumer READMEs ended up denying a result their
+own binaries produced.
+
+**The corrected, scoped statement, now used everywhere:**
+
+- **Before `net_src_for` (agnos 1.56.34)** the compositor↔client handshake could not complete on an
+  ordinary boot. Every green from that era came off the `AETHERSAFHA_SETU_SELFTEST` kernel hook's
+  `net_ip = 0x7F000001` assignment and **remains retracted**.
+- **After `net_src_for` it did connect, un-rigged.** `agnos/scripts/harness/aethersafha-clients-test.py`
+  reached `connected: 2, presented: 2` on 2026-08-02 — setu's `present_probe` and dhancha's `crab`. That
+  harness byte-scans the kernel and hard-exits if it carries any selftest hook, and attaches a virtio NIC
+  so DHCP yields a real `net_ip`; it is what caught the rigging. Scope: **QEMU at `-smp 1`**, never shown
+  on iron, `-smp 4` fault-kills, and "presented" is the compositor's serial claim, not framebuffer evidence.
+- **The transport is retired as the WRONG PRIMITIVE for local display IPC, not because it was broken.**
+  Replacement is the agnos socket (`naadi`), agnos `docs/development/planning/ipc.md` §9; removal
+  inventory §10.
+
+Why the distinction is load-bearing: "retired because it was the wrong primitive" and "retired because it
+was broken" justify different futures, and only the first survives someone later getting TCP to work.
+Erasing the one un-rigged result destroys the evidence that the retirement was right for the right reason.
+
+Changed: `src/client.cyr` (transport banner), `README.md`, this file's standing retraction block, and
+`dist/setu.cyr` regenerated from source. **No code change** — comments, docs and the regenerated bundle
+only. The transport implementation, the codec/message ABI, and setu's Linux arm are all untouched.
+
 ## [0.7.3] - 2026-08-02
 
 ### Changed — the connect workaround is reverted; the fix belongs to (and is now in) the kernel
