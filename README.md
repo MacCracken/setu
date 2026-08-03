@@ -19,12 +19,25 @@ transport** (`client.cyr`): the persistent connection every app owns
 > accommodations. A local display protocol has nothing to route, nothing to checksum, no window
 > to negotiate, and **no business owning a port**.
 >
-> ⛔ **It also never worked on agnos.** The compositor↔client handshake could not complete on an
-> ordinary agnos boot — the SYN-ACK came back addressed to `net_ip` and `tcp_find_conn` never
-> matched. The one test that showed it green, `aethersafha-setu-smoke.sh`, passed **by accident**:
-> the kernel hook `AETHERSAFHA_SETU_SELFTEST` assigned `net_ip = 0x7F000001` first. **Every
-> "proven on the sovereign kernel" claim tied to that smoke is a FALSE GREEN.** Hook and smoke
-> were deleted 2026-08-03.
+> ⛔ **Before agnos 1.56.34 it could not complete on an ordinary boot.** The SYN-ACK came back
+> addressed to `net_ip` and `tcp_find_conn` never matched. The one test that showed it green in
+> that era, `aethersafha-setu-smoke.sh`, passed **by accident**: the kernel hook
+> `AETHERSAFHA_SETU_SELFTEST` assigned `net_ip = 0x7F000001` first. **Every "proven on the
+> sovereign kernel" claim tied to that smoke is a FALSE GREEN.** Hook and smoke were deleted
+> 2026-08-03.
+>
+> ⚠ **After the kernel fix it DID connect, un-rigged — and that is not why it is retired.** agnos
+> 1.56.34's `net_src_for` derives an outbound segment's source from its destination, so a loopback
+> SYN goes out `src = dst = 127.0.0.1`. On **2026-08-02**, on 1.56.34+, agnos
+> `scripts/harness/aethersafha-clients-test.py` reached **`connected: 2, presented: 2`** — setu's
+> own `present_probe` (staged as `/bin/puka`) and the real dhancha `crab` both connected and
+> presented. That harness byte-scans `build/agnos` and hard-exits if the kernel carries any
+> selftest hook, and attaches a virtio NIC so DHCP yields a real `net_ip`; **it is the harness that
+> caught the rigging**, so its green is honest. ⚠ Scope it exactly: **QEMU at `-smp 1`**, never
+> shown on iron, and `-smp 4` fault-kills.
+>
+> ⛔ **The ruling is architectural, not empirical.** This transport is retired for being the **wrong
+> primitive** (operator ruling, 2026-08-03), not for being broken. "It connects" was never the bar.
 >
 > ⭐ **The replacement is the agnos socket — `naadi`**, designed in agnos
 > [`docs/development/planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)

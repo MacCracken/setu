@@ -6,7 +6,7 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## ⛔ STANDING RETRACTION 2026-08-03 — TCP-on-loopback was never the desktop transport
+## ⛔ STANDING RETRACTION 2026-08-03 — TCP-on-loopback was the wrong primitive for the desktop transport
 
 **`SETU_TCP_PORT = 7700` / TCP over loopback is a RETIRED WRONG PREMISE.** It was chosen at 0.3.0
 because a TCP stack happened to exist, was never put to the operator, and was then carried for a
@@ -15,12 +15,29 @@ in agnos [`docs/development/planning/ipc.md`](https://github.com/MacCracken/agno
 §9. The transport code still ships only because `naadi` does not exist yet and the migration is a
 staged twelve-bite cut (ipc.md §9.6) — **its continued presence is not an endorsement.**
 
-⛔ **AND THE ONLY TEST THAT EVER PROVED IT ON agnos PASSED BY ACCIDENT.** The kernel hook
+⛔ **AND EVERY agnos "PROOF" OF IT BEFORE 1.56.34 PASSED BY ACCIDENT.** The kernel hook
 `AETHERSAFHA_SETU_SELFTEST` assigned `net_ip = 0x7F000001` before launching the compositor. agnos
 stamped `net_ip` as the *source* of every outbound segment, so a SYN to `127.0.0.1` was answered to
 `net_ip` and `tcp_find_conn` never matched — **except** under the selftest, where the assignment made
-`src == dst == 127.0.0.1`. **The compositor↔client handshake could therefore NEVER complete on an
-ordinary agnos boot** (agnos `kernel/core/net.cyr:183-190` states this outright).
+`src == dst == 127.0.0.1`. **The compositor↔client handshake could therefore not complete on an
+ordinary agnos boot BEFORE `net_src_for` (agnos 1.56.34)** (agnos `kernel/core/net.cyr:183-190`
+describes the pre-fix behaviour).
+
+⚠ **AFTER `net_src_for` IT DID CONNECT ON agnos, UN-RIGGED — and that is NOT the reason it is being
+replaced.** `net_src_for` (agnos `kernel/core/net.cyr:203-206`) derives an outbound segment's source
+from its *destination*, so a loopback SYN goes out `src = dst = 127.0.0.1` and its SYN-ACK matches. On
+**2026-08-02**, on agnos 1.56.34+, `agnos/scripts/harness/aethersafha-clients-test.py` reached
+**`connected: 2, presented: 2`** — setu's own `present_probe` (staged as `/bin/puka`) and the real
+dhancha `crab` both connected and presented. That harness is honest by construction: it byte-scans
+`build/agnos` and **hard-exits if the kernel carries any selftest hook** (a kernel carrying one does
+not fail the test, it *invalidates* it), and it attaches a virtio NIC so DHCP yields a real `net_ip`.
+**It is the harness that caught the rigging**, so its green is evidence. ⚠ Scope it exactly: that run
+was **QEMU at `-smp 1`**; it was never shown on iron, and `-smp 4` fault-kills.
+
+⭐ **So the ruling is architectural, not empirical.** The transport is retired for being the **wrong
+primitive** — a local display protocol has nothing to route, checksum, window, or retransmit and no
+business owning a port — **not** for being broken. Those two justify different futures, and the
+operator's ruling is the first. Do not restate this retraction as "it never worked on agnos."
 
 **Therefore: every claim in the entries below that a setu client connected to the compositor ON agnos,
 dated before [0.7.2] (2026-08-02), is a FALSE GREEN and must not be cited as proof of anything.** The

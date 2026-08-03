@@ -765,15 +765,35 @@ fn setu_buf_close(buf_id): i64 {
 # nothing to route, nothing to checksum, no window to negotiate, no RTO to wait
 # out, and NO BUSINESS OWNING A PORT.
 #
-# ⛔ AND IT NEVER WORKED ON agnos. The only test that ever showed it passing —
-# `aethersafha-setu-smoke.sh` — passed BY ACCIDENT: the kernel hook
-# `AETHERSAFHA_SETU_SELFTEST` assigned `net_ip = 0x7F000001` before launching
-# the compositor. agnos stamped `net_ip` as the SOURCE of every outbound
-# segment, so a SYN to 127.0.0.1 was answered to `net_ip` and `tcp_find_conn`
-# never matched — except under that hook, where the assignment made
-# src == dst == 127.0.0.1. On an ordinary boot the compositor↔client handshake
-# COULD NOT COMPLETE. See agnos `kernel/core/net.cyr:183-190`. The hook and the
-# smoke were DELETED 2026-08-03; no claim tracing to that smoke is evidence.
+# ⛔ AND IT COULD NOT COMPLETE ON agnos BEFORE 1.56.34 / `net_src_for`. The only
+# test that ever showed it passing in that era — `aethersafha-setu-smoke.sh` —
+# passed BY ACCIDENT: the kernel hook `AETHERSAFHA_SETU_SELFTEST` assigned
+# `net_ip = 0x7F000001` before launching the compositor. agnos stamped `net_ip`
+# as the SOURCE of every outbound segment, so a SYN to 127.0.0.1 was answered to
+# `net_ip` and `tcp_find_conn` never matched — except under that hook, where the
+# assignment made src == dst == 127.0.0.1. On an ordinary boot OF THAT ERA the
+# compositor↔client handshake COULD NOT COMPLETE. See agnos
+# `kernel/core/net.cyr:183-190`. The hook and the smoke were DELETED 2026-08-03;
+# no claim tracing to that smoke is evidence.
+#
+# ⚠ AFTER `net_src_for` IT DID CONNECT, UN-RIGGED — and that is NOT the reason
+# it is retired. agnos 1.56.34's `net_src_for` (`kernel/core/net.cyr:203-206`)
+# derives an outbound segment's source from its DESTINATION, so a loopback SYN
+# goes out src = dst = 127.0.0.1 and its SYN-ACK matches. On 2026-08-02, on
+# agnos 1.56.34+, `agnos/scripts/harness/aethersafha-clients-test.py` reached
+# **connected: 2, presented: 2** — setu's own slim `present_probe` (staged as
+# `/bin/puka`) AND the real dhancha `crab` both connected and presented. That
+# harness is honest by construction: it byte-scans `build/agnos` and HARD-EXITS
+# if the kernel carries any selftest hook (a kernel carrying one does not fail
+# that test, it INVALIDATES it), and it attaches a virtio NIC so DHCP yields a
+# real `net_ip`. It is the harness that CAUGHT the rigging. ⚠ Scope it exactly:
+# that run was QEMU at `-smp 1`. It was never shown on iron, and `-smp 4`
+# fault-kills.
+#
+# ⛔ SO THE RULING IS ARCHITECTURAL, NOT EMPIRICAL: this transport is retired for
+# being the WRONG PRIMITIVE (operator ruling, 2026-08-03), not for being broken.
+# "It connects" was never the bar — a local display protocol has no business on a
+# network stack even when the network stack delivers.
 #
 # ⭐ THE REPLACEMENT is the agnos socket — `naadi` (नाडी), designed in agnos
 # `docs/development/planning/ipc.md` §9. A channel handed to the child at spawn,

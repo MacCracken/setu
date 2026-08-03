@@ -8,11 +8,21 @@
 # the puka terminal's GPU stack (mabda uses Linux `SYS_IOCTL`).
 #
 # ⛔ RETRACTED 2026-08-03 — this header used to claim it "proves the desktop path ON THE
-# SOVEREIGN KERNEL". IT PROVED NOTHING ON agnos. Every agnos run of this probe before
-# setu 0.7.2 needed an `AETHERSAFHA_SETU_SELFTEST` kernel (`net_ip = 0x7F000001`) to get a
-# connection at all; on an ordinary boot the handshake could not complete. The TCP transport
-# it dials is a RETIRED WRONG PREMISE, replaced by the agnos socket `naadi` — see the banner
-# at the top of setu `src/client.cyr` and agnos `docs/development/planning/ipc.md` §9/§10.
+# SOVEREIGN KERNEL". Every agnos run of this probe BEFORE setu 0.7.2 / agnos 1.56.34 needed
+# an `AETHERSAFHA_SETU_SELFTEST` kernel (`net_ip = 0x7F000001`) to get a connection at all;
+# on an ordinary boot of that era the handshake could not complete, so those greens are
+# FALSE and stay retracted.
+#
+# ⚠ IT DID CONNECT UN-RIGGED AFTER THE KERNEL FIX. On 2026-08-02, on agnos 1.56.34+ (with
+# `net_src_for`), `agnos/scripts/harness/aethersafha-clients-test.py` reached
+# `connected: 2, presented: 2` — THIS probe (staged as `/bin/puka`) and the dhancha `crab`
+# both connected and presented, on a kernel the harness byte-scans and hard-rejects if it
+# carries any selftest hook. ⚠ Scope: QEMU at `-smp 1`; never shown on iron, `-smp 4`
+# fault-kills.
+#
+# ⛔ The TCP transport it dials is nonetheless RETIRED — as the WRONG PRIMITIVE, not as
+# broken — replaced by the agnos socket `naadi`. See the banner at the top of setu
+# `src/client.cyr` and agnos `docs/development/planning/ipc.md` §9/§10.
 #
 # The compositor spawns `/bin/puka`; the (now-deleted) smoke seeded this binary there.
 #
