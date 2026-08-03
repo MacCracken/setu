@@ -801,28 +801,19 @@ fn setu_connect(path): i64 {
     if (is_ok(s) == 0) { setu_conn_err = 0 - 2; return 0 - 2; }
     var fd = result_unwrap(s);
     #ifdef CYRIUS_TARGET_AGNOS
-    # ⛔ CONNECT TO net_ip, NOT 127.0.0.1 — agnos loopback TCP only closes the handshake when the
-    # two addresses AGREE, and 127.0.0.1 makes them disagree on every real boot.
+    # Dial 127.0.0.1 — the honest local address, and what every other stack uses for a
+    # compositor<->client connection.
     #
-    # Trace it: the client's SYN carries `src = net_ip` (the stack has one source address) and
-    # `dst = 127.0.0.1`, which `net_is_loopback` accepts, so the SYN is lo_ring-delivered and the
-    # passive open records `peer = net_ip`. Its SYN-ACK then goes out with `src = net_ip` — but the
-    # client's conn was created with `dst_ip = 127.0.0.1`, so `tcp_find_conn(..., src_ip = net_ip)`
-    # finds NO match, the reply lands on an unknown 4-tuple, and the conn dies. `sock_connect` #47
-    # returns -1 with the client's own slot zeroed.
-    #
-    # ⚠ THE agnos SELFTEST HOOK HID THIS FOR THE WHOLE LIFE OF THE FEATURE. `AETHERSAFHA_SETU_SELFTEST`
-    # assigns `net_ip = 0x7F000001` in the kernel before launching the compositor — which makes
-    # src == dst == 127.0.0.1 and the match succeed. That is why `aethersafha-setu-smoke.sh` passes
-    # and why no ordinary boot ever has. The kernel's own loopback proof (`loopback-smoke.sh`,
-    # "TCP handshake to net_ip completed over lo") connects to **net_ip** and never to 127.0.0.1.
-    #
-    # ⚠ `net_ip == 0` (a box with no NIC, so no DHCP) cannot be fixed from here: the reply's dst
-    # would be 0, which `net_is_loopback` explicitly excludes. Fall back to 127.0.0.1 so behaviour is
-    # unchanged there rather than newly broken, and leave that case to the kernel.
-    var setu_dst = sys_net_ip();
-    if (setu_dst == 0) { setu_dst = 0x7F000001; }
-    var conn = sys_sock_connect(setu_dst, SETU_TCP_PORT, 0);
+    # ⚠ THIS DID NOT WORK BEFORE agnos 1.56.35 AND THE BUG WAS IN THE KERNEL, NOT HERE. Every
+    # outbound segment claimed `net_ip` as its source, including loopback ones, so a SYN to
+    # 127.0.0.1 came back addressed to net_ip and this side's conn — which holds dst_ip =
+    # 127.0.0.1 — could not match it. `sock_connect` #47 returned -1 instantly with its own slot
+    # zeroed. The kernel now derives the source from the destination (`net_src_for`), so a loopback
+    # destination gets a loopback source and the 4-tuple closes.
+    # ⚠ 0.7.2 worked around it here by dialling `sys_net_ip()` instead. That is no longer needed and
+    # was never right: it made a client's address depend on whether the box had DHCP'd yet, and it
+    # could not work at all on a NIC-less box (net_ip 0).
+    var conn = sys_sock_connect(0x7F000001, SETU_TCP_PORT, 0);
     setu_conn_rc = conn;
     if (conn < 0) {
         sock_close(fd);

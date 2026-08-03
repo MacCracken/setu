@@ -1,27 +1,17 @@
-# client.cyr — setu's reference CLIENT transport (persistent connection).
+# client.cyr — setu's reference CLIENT + SERVER transport (persistent connection),
+# shared by every consumer (dhancha, puka, crab) so there is ONE client, not three.
+# setu = the protocol CONTRACT (proto/codec) + this transport.
 #
-# Promoted into setu (from dhancha's dh_setu_* / DhClient) so BOTH consumers —
-# dhancha (widget toolkit) and puka (terminal) — share ONE client. setu is the
-# protocol CONTRACT (proto/codec) + this reference CLIENT/SERVER transport.
+# Transport: TCP over loopback : SETU_TCP_PORT via cyrius `net.cyr` — Linux BSD
+# sockets on the host, the agnos kernel TCP band on agnos (connect #47, send/recv
+# #48/#49, listen/accept #56/#57). `path` params are advisory (API compat only).
 #
-# TRANSPORT (item 3b) = TCP over loopback (127.0.0.1 : SETU_TCP_PORT) via the
-# cyrius `net.cyr` socket layer — CROSS-PLATFORM by construction: net.cyr routes
-# to Linux BSD sockets on the host AND to agnos's kernel TCP band
-# (sock_connect #47 / sock_listen #56 / sock_accept #57, tagged-fd send/recv
-# #48/#49) on agnos. This REPLACES the earlier AF_UNIX path (which fail-closed on
-# agnos): setu now speaks the same wire on Linux AND agnos, so puka + the desktop
-# run on the sovereign kernel, not just Linux. One well-known loopback port —
-# the desktop has a single compositor endpoint; `path` params are kept for API
-# compatibility but are advisory (the transport is TCP:SETU_TCP_PORT).
+# Two agnos socket semantics the framing absorbs (both #ifdef-guarded, so Linux
+# behaviour is unchanged):
+#   - `sock_recv` #49 is NON-BLOCKING: 0 = would-block, -1 = EOF (inverted from Linux).
+#   - `sock_send` #48 may send < len, so writes loop.
 #
-# Two agnos socket semantics the framing must absorb (both #ifdef-guarded so
-# Linux behaviour is byte-identical to before):
-#   - `sock_recv` (#49) is NON-BLOCKING: 0 = would-block, -1 = EOF (inverted from
-#     Linux's 0 = EOF). setu_read_blk retries-with-yield (bounded) on agnos.
-#   - `sock_send` (#48) may send < len. setu_write_all loops until the whole
-#     buffer is out (a large pixel payload can't go in one syscall).
-# RAW-BUFFER persistent client: connect once → create surface once → ATTACH +
-# inline pixels + COMMIT per present → recv frames. Consumers layer their render.
+# Model: connect once → create surface once → ATTACH + pixels + COMMIT per present.
 
 var SETU_TCP_PORT = 7700;   # the compositor's well-known setu loopback port
 
@@ -29,19 +19,11 @@ var SETU_TCP_PORT = 7700;   # the compositor's well-known setu loopback port
 # TCP transport + framing primitives (over the setu codec, via net.cyr)
 # =========================================================================
 
-# Connect to the compositor's setu endpoint (loopback : SETU_TCP_PORT). `path` is
-# advisory (kept for API compat). Returns the connected fd (>= 0), or -2 (socket)
-# / -3 (connect). Cross-platform via net.cyr.
-# ⛔ WHY THE FAILURE REASON IS RECORDED. Every client collapses a failed connect into one
-# message — `present_probe: setu connect failed`, `crab: setu connect failed` — because
-# `setu_client_connect` returns 0 for BOTH the socket-creation failure and the connect failure.
-# On the 2026-08-02 desktop bring-up that made an instant, reproducible failure unreadable: two
-# different faults, one indistinguishable symptom, and no way to tell a full conn table from an RST
-# from a bad port without another boot. The raw syscall return is the one fact that separates them.
-# ⚠ agnos `sock_connect` #47 blocks up to ~8 s polling for the SYN-ACK, so a failure that returns
-# INSTANTLY is already known not to be a handshake timeout.
-var setu_conn_err = 0;      # last setu_connect failure: -2 socket, -3 connect. 0 = last one worked.
-var setu_conn_rc = 0;       # the raw sys_sock_connect return behind a -3, where the reason lives.
+# Connect to the compositor's setu endpoint (loopback : SETU_TCP_PORT). Returns the
+# connected fd (>= 0), or -2 (socket) / -3 (connect). `setu_connect_error` /
+# `setu_connect_rc` separate the two failures, which otherwise collapse to one message.
+var setu_conn_err = 0;      # -2 socket, -3 connect. 0 = last one worked.
+var setu_conn_rc = 0;       # raw sys_sock_connect return behind a -3.
 fn setu_connect_error(): i64 { return setu_conn_err; }
 fn setu_connect_rc(): i64 { return setu_conn_rc; }
 
@@ -52,28 +34,9 @@ fn setu_connect(path): i64 {
     if (is_ok(s) == 0) { setu_conn_err = 0 - 2; return 0 - 2; }
     var fd = result_unwrap(s);
     #ifdef CYRIUS_TARGET_AGNOS
-    # ⛔ CONNECT TO net_ip, NOT 127.0.0.1 — agnos loopback TCP only closes the handshake when the
-    # two addresses AGREE, and 127.0.0.1 makes them disagree on every real boot.
-    #
-    # Trace it: the client's SYN carries `src = net_ip` (the stack has one source address) and
-    # `dst = 127.0.0.1`, which `net_is_loopback` accepts, so the SYN is lo_ring-delivered and the
-    # passive open records `peer = net_ip`. Its SYN-ACK then goes out with `src = net_ip` — but the
-    # client's conn was created with `dst_ip = 127.0.0.1`, so `tcp_find_conn(..., src_ip = net_ip)`
-    # finds NO match, the reply lands on an unknown 4-tuple, and the conn dies. `sock_connect` #47
-    # returns -1 with the client's own slot zeroed.
-    #
-    # ⚠ THE agnos SELFTEST HOOK HID THIS FOR THE WHOLE LIFE OF THE FEATURE. `AETHERSAFHA_SETU_SELFTEST`
-    # assigns `net_ip = 0x7F000001` in the kernel before launching the compositor — which makes
-    # src == dst == 127.0.0.1 and the match succeed. That is why `aethersafha-setu-smoke.sh` passes
-    # and why no ordinary boot ever has. The kernel's own loopback proof (`loopback-smoke.sh`,
-    # "TCP handshake to net_ip completed over lo") connects to **net_ip** and never to 127.0.0.1.
-    #
-    # ⚠ `net_ip == 0` (a box with no NIC, so no DHCP) cannot be fixed from here: the reply's dst
-    # would be 0, which `net_is_loopback` explicitly excludes. Fall back to 127.0.0.1 so behaviour is
-    # unchanged there rather than newly broken, and leave that case to the kernel.
-    var setu_dst = sys_net_ip();
-    if (setu_dst == 0) { setu_dst = 0x7F000001; }
-    var conn = sys_sock_connect(setu_dst, SETU_TCP_PORT, 0);
+    # ⚠ Requires agnos >= 1.56.35 (`net_src_for`): older kernels stamped net_ip as the
+    # source of every outbound segment, so a loopback SYN's reply never matched the 4-tuple.
+    var conn = sys_sock_connect(0x7F000001, SETU_TCP_PORT, 0);
     setu_conn_rc = conn;
     if (conn < 0) {
         sock_close(fd);
@@ -179,13 +142,11 @@ fn setu_recv(fd, msg_out): i64 {
     return setu_decode(buf, n, msg_out);
 }
 
-# NON-BLOCKING poll for ONE inbound frame (the S->C input channel). Does a single
-# recv; if no data is buffered (agnos sock_recv #49 returns 0 = would-block) it
-# returns 0 IMMEDIATELY — the caller's animation loop never stalls. Returns 1 and
-# fills `msg_out` when a frame arrived, 0 when nothing is pending, or -6 on EOF/error.
-# CAVEAT: decodes only the FIRST frame of each recv — coalesced or split frames are
-# dropped (TCP has no message boundaries). Kept for API compat; stream consumers
-# should use setu_client_poll_input (0.5.1), which reassembles across reads.
+# NON-BLOCKING poll for ONE inbound frame (the S->C input channel). Returns 1 and fills
+# `msg_out` when a frame arrived, 0 when nothing is pending, or -6 on EOF/error — the
+# caller's animation loop never stalls.
+# ⚠ Decodes only the FIRST frame of each recv; coalesced or split frames are dropped.
+# Kept for API compat — stream consumers use setu_client_poll_input, which reassembles.
 fn setu_poll_input(fd, msg_out): i64 {
     var cap = 256;
     var buf = alloc(cap);
@@ -233,12 +194,10 @@ enum SetuClientOff {
     SETU_C_FD    = 0;    # connected setu fd
     SETU_C_SID   = 8;    # compositor-assigned surface id (0 until first present)
     SETU_C_FLAGS = 16;   # CREATE_SURFACE flags to request (e.g. SETU_SURF_FULL_KEYS)
-    SETU_C_BUFID = 24;   # cached shared-buffer id (0 = none) — ONE buffer per client,
-    # reused across presents; recreated on resize, freed at close.
-    # (Pre-0.5.1 a buffer was created EVERY present and never freed:
-    # agnos exhausted its 16 kernel shm slots in <0.5 s of 35 Hz
-    # presents — a system-wide present DoS — and Linux leaked one
-    # /dev/shm/setu-buf-* tmpfs file per frame.)
+    SETU_C_BUFID = 24;   # cached shared-buffer id (0 = none) — ONE per client, reused
+    # across presents, recreated on resize, freed at close.
+    # ⛔ Never create one per present: that exhausts agnos's 16
+    # kernel shm slots in under a second at 35 Hz.
     SETU_C_BUFSZ = 32;   # size in bytes of the cached shared buffer
     SETU_C_INBUF = 40;   # input stream-reassembly buffer (lazily alloc'd, 0 until first poll)
     SETU_C_INLEN = 48;   # bytes currently buffered in SETU_C_INBUF
@@ -249,12 +208,8 @@ var SETU_C_INBUF_CAP = 512;   # ≥ 6 widest frames ((2+8)*8 = 80 B); input fram
 
 # Connect to the compositor's setu endpoint. Returns a *SetuClient, or 0 on
 # failure. The surface is created lazily on the first setu_client_present.
-# ⛔ DO NOT ADD A CONNECT RETRY LOOP HERE WITHOUT RE-MEASURING. It was tried on 2026-08-02 and it
-# made things STRICTLY WORSE: agnos `sock_connect` #47 runs with preempt DISABLED for the whole
-# attempt, so a client retrying in a loop holds the CPU the compositor needs in order to make any
-# progress at all. With 200 tries the compositor's 30 s budget stretched to 72 s of wall clock and
-# still saw zero connections — the retry starved the peer it was waiting for. A `sched_yield`
-# between attempts does not fix it, because the cost is inside the blocking syscall, not between them.
+# ⛔ No retry loop here: agnos `sock_connect` #47 holds preempt for the whole attempt,
+# so a retrying client starves the compositor it is waiting for.
 fn setu_client_connect(path): i64 {
     var fd = setu_connect(path);
     if (fd < 0) { return 0; }
@@ -283,31 +238,23 @@ fn setu_client_request_keys(c): i64 {
     return 0;
 }
 
-# @public — declare that this client's surface pixels are PREMULTIPLIED BGRA (c <= a), so the compositor
-# may blend it per-pixel instead of copying it opaquely. Call BEFORE setu_client_connect, like
-# setu_client_request_keys — the flag rides the CREATE_SURFACE handshake.
-#
-# ⚠ ONLY call this if you actually emit premultiplied pixels. It flips the compositor from an opaque copy
-# (gpu_blit_shm#87, which ignores byte 3) to premultiplied src-over (gpu_shader_op#92 op 0x01, which READS
-# byte 3). A surface whose alpha byte is 0 — which is what a bare 0x00RRGGBB colour produces — becomes
-# FULLY TRANSPARENT under #92 and the window disappears.
-#
-# ⚠ Premultiplied means each channel is ALREADY scaled by alpha. Straight alpha does not error; it renders
-# washed out, silently, with no diagnostic anywhere in the stack. sadish's sd_premul() is the sanctioned
-# producer — use it rather than multiplying by hand.
+# @public — declare that this client's surface pixels are PREMULTIPLIED BGRA (c <= a), so the
+# compositor blends per-pixel (gpu_shader_op#92 op 0x01) instead of copying opaquely
+# (gpu_blit_shm#87). Call BEFORE setu_client_connect — the flag rides CREATE_SURFACE.
+# ⚠ Only set this if the pixels really are premultiplied (each channel already scaled by
+# alpha). The kernel shader is `out = src + dst*(1 - src_a)`, so straight-alpha pixels
+# render as an over-bright ghost, silently. sadish's sd_premul() is the sanctioned producer.
 fn setu_client_request_premultiplied(c): i64 {
     store64(c + SETU_C_FLAGS, load64(c + SETU_C_FLAGS) | SETU_SURF_PREMULTIPLIED);
     return 0;
 }
 
-# Present an already-rendered w*h BGRA pixel buffer `pix`. On the first present it
-# creates the surface once (CREATE_SURFACE -> SURFACE_CREATED, storing the id) and
-# the shared buffer once (cached in the client, rewritten in place every present,
-# recreated on resize, freed at close); each present hands the pixels to the
-# compositor via that SHARED BUFFER (the sovereign path — ATTACH-by-id, no inline
-# stream) and falls back to INLINE pixels only when the shared-buffer backend is
-# unavailable. Returns 0 or a negative code (-41 create send, -6 recv, -8 unexpected
-# reply, -42 attach send, -43 pixel write, -44 commit send, -45 buffer map).
+# Present an already-rendered w*h BGRA pixel buffer `pix`. The first present creates
+# the surface (CREATE_SURFACE -> SURFACE_CREATED) and the shared buffer; each present
+# hands pixels over by buffer id (ATTACH-by-id), falling back to inline pixels when the
+# shared-buffer backend is unavailable. Returns 0 or a negative code (-41 create send,
+# -6 recv, -8 unexpected reply, -42 attach send, -43 pixel write, -44 commit send,
+# -45 buffer map).
 fn setu_client_present(c, pix, w, h): i64 {
     var fd = setu_client_fd(c);
     var id = setu_client_sid(c);
@@ -321,11 +268,9 @@ fn setu_client_present(c, pix, w, h): i64 {
     }
     var stride = w * 4;
     var nbytes = h * stride;
-    # --- Shared-buffer present (sidesteps the single-CPU two-proc TCP flow-control
-    #     deadlock on agnos: TCP_RX_RING is 2 KB but a surface is hundreds of KB).
-    #     The buffer is created ONCE and reused every present (the compositor re-reads
-    #     the id it holds on each commit, so rewriting in place is the designed path);
-    #     a resize closes + recreates it. Freed in setu_client_close. ---
+    # --- Shared-buffer present. Created once and rewritten in place every present (the
+    #     compositor re-reads the id it holds on each commit); a resize recreates it.
+    #     Freed in setu_client_close. ---
     var buf_id = load64(c + SETU_C_BUFID);
     if (buf_id > 0) {
         if (load64(c + SETU_C_BUFSZ) != nbytes) {          # resize -> recreate
@@ -354,8 +299,8 @@ fn setu_client_present(c, pix, w, h): i64 {
         store64(c + SETU_C_BUFID, 0);
         store64(c + SETU_C_BUFSZ, 0);
     }
-    # --- Inline fallback (shared-buffer backend unavailable; works single-consumer or
-    #     multi-core). ATTACH's arg5 (buf_id) stays 0 → the server reads inline pixels. ---
+    # --- Inline fallback: shared-buffer backend unavailable. ATTACH's arg5 (buf_id)
+    #     stays 0 → the server reads inline pixels. ---
     if (setu_send(fd, setu_attach(id, w, h, stride, 1)) < 0) { return 0 - 42; }
     if (setu_write_all(fd, pix, nbytes) < 0) { return 0 - 43; }
     if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }
@@ -392,13 +337,11 @@ fn setu__inbuf_take(c, msg_out): i64 {
     return 1;
 }
 
-# NON-BLOCKING poll for the next inbound frame with STREAM REASSEMBLY. Unlike the
-# bare setu_poll_input (which decodes only the FIRST frame of each recv and drops
-# any coalesced/split tail — TCP has no message boundaries, so a fast key sequence
-# lost events, and a lost key-RELEASE means a stuck key for FULL_KEYS consumers),
-# this buffers leftover bytes in the client and hands frames out one per call.
-# Returns 1 and fills `msg_out` when a frame is ready, 0 when nothing is pending,
-# or -6 on EOF/error with nothing buffered. Call in a loop until 0 to drain.
+# NON-BLOCKING poll for the next inbound frame with STREAM REASSEMBLY: buffers leftover
+# bytes in the client and hands out one frame per call. Use this, not setu_poll_input —
+# a dropped coalesced tail loses key-RELEASE events, which sticks keys for FULL_KEYS
+# consumers. Returns 1 and fills `msg_out` when a frame is ready, 0 when nothing is
+# pending, or -6 on EOF/error with nothing buffered. Call in a loop until 0 to drain.
 fn setu_client_poll_input(c, msg_out): i64 {
     var ib = load64(c + SETU_C_INBUF);
     if (ib == 0) {
