@@ -10,7 +10,7 @@ host-testable functions), and — since **v0.2.0** — the **reference client
 transport** (`client.cyr`): the persistent connection every app owns
 (`setu_client_connect` → `setu_client_present` → `setu_client_recv` →
 `setu_client_close`).
-
+ 
 > ## ⛔ The transport is a RETIRED WRONG PREMISE (2026-08-03)
 >
 > Since **v0.3.0** that transport has been **TCP over loopback** (`127.0.0.1 : 7700`) via the
