@@ -56,6 +56,18 @@ Wayland's `WAYLAND_SOCKET` shape, where the parent decides the number and the ch
 ⛔ **No scan fallback.** Scanning would find a channel this process was not given, and on a kernel where
 that succeeds inert-by-construction is broken — the right behaviour is to fail loudly, not paper over it.
 
+### ⛔ Consumers must add `args` to their `[deps] stdlib` when they repin
+
+The agnos arm reads `getenv("AGNOS_CHAN")`, which resolves to `_agnos_getenv` (`args_agnos.cyr`) —
+agnos has no `/proc`, so `io.cyr`'s `getenv` delegates there. **`dist/setu.deps` does NOT list it.**
+
+⚠ The sidecar under-reports in general — it names 8 leaves (`string fmt alloc vec str io syscalls
+assert`) while this package's own `[deps] stdlib` needs 12; `net`, `chrono` and `result` are missing
+too, and were before this release. Verified by building a throwaway consumer with *exactly* the
+sidecar's 8 leaves against `dist/setu.cyr` under `--agnos`: it fails on `_agnos_getenv` (plus
+`tcp_socket` / `sock_bind` / `INADDR_LOOPBACK` / `sock_close` from the absent `net`). So the sidecar is
+a starting point, not a contract — and `args` is the one this release newly requires.
+
 ⚠ **Not yet runtime-proven end to end.** Nothing sets `AGNOS_CHAN` yet — that is bite 7, where
 aethersafha mints, endows and spawns clients placed. This bite is verified as: builds `--agnos`, builds
 for Linux unchanged, and the agnos arm contains no socket call.
