@@ -6,7 +6,7 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased] — the agnos client no longer dials anything (channel-band cutover, bite 6)
+## [0.8.0] — 2026-08-06 — the agnos client no longer dials anything (channel-band cutover, bite 6)
 
 ⭐⭐ **On agnos, `setu_connect` DOES NOT DIAL.** No socket, no connect, no port, no loopback address —
 four executable lines: check the kernel floor, read the fd the compositor endowed us, return it. The
