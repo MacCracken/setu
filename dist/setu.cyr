@@ -795,11 +795,11 @@ fn setu_buf_close(buf_id): i64 {
 # "It connects" was never the bar — a local display protocol has no business on a
 # network stack even when the network stack delivers.
 #
-# ⭐ THE REPLACEMENT is the agnos socket — `naadi` (नाडी), designed in agnos
+# ⭐ THE REPLACEMENT is the agnos socket — `anu` (नाडी), designed in agnos
 # `docs/development/planning/ipc.md` §9. A channel handed to the child at spawn,
 # not an address dialled over a network stack.
 #
-# ⚠ WHY THIS CODE IS STILL HERE: `naadi` does not exist yet, and the migration
+# ⚠ WHY THIS CODE IS STILL HERE: `anu` does not exist yet, and the migration
 # is a staged twelve-bite cut (ipc.md §9.6). Ripping the transport out today
 # would leave the desktop with no transport at all. ITS PRESENCE IS NOT AN
 # ENDORSEMENT — do not extend it, do not add accommodations to it, and do not
@@ -813,7 +813,7 @@ fn setu_buf_close(buf_id): i64 {
 # wrong path returning.
 # ============================================================================
 #
-# Transport (as implemented, pending the naadi migration): TCP over loopback :
+# Transport (as implemented, pending the anu migration): TCP over loopback :
 # SETU_TCP_PORT via cyrius `net.cyr` — Linux BSD sockets on the host, the agnos
 # kernel TCP band on agnos (connect #47, send/recv #48/#49, listen/accept
 # #56/#57). `path` params are advisory — they were never real, and are one of the
@@ -828,20 +828,20 @@ fn setu_buf_close(buf_id): i64 {
 # Model: connect once → create surface once → ATTACH + pixels + COMMIT per present.
 
 # ⛔ RETIRED WRONG PREMISE (see the banner above). A local display protocol has no
-# business owning a well-known port; this one goes away with the naadi migration.
+# business owning a well-known port; this one goes away with the anu migration.
 var SETU_TCP_PORT = 7700;   # the compositor's TCP loopback port — NOT the sanctioned transport
 
 # =========================================================================
 # ⛔ RETIRED TCP transport (see the banner at the top of this file) + framing
 #    primitives (over the setu codec, via net.cyr). The framing/codec survive
-#    the naadi swap; the socket calls do not.
+#    the anu swap; the socket calls do not.
 # =========================================================================
 
 # Connect to the compositor's setu endpoint (loopback : SETU_TCP_PORT). Returns the
 # connected fd (>= 0), or -2 (socket) / -3 (connect). `setu_connect_error` /
 # `setu_connect_rc` separate the two failures, which otherwise collapse to one message.
 # ⛔ This dials an IP address for a LOCAL channel, which is the wrong premise itself.
-# The naadi replacement is handed a channel at spawn and dials nothing.
+# The anu replacement is handed a channel at spawn and dials nothing.
 var setu_conn_err = 0;      # -2 socket, -3 connect. 0 = last one worked.
 var setu_conn_rc = 0;       # raw sys_sock_connect return behind a -3.
 fn setu_connect_error(): i64 { return setu_conn_err; }
@@ -891,7 +891,7 @@ fn setu_connect(path): i64 {
 # ⛔ RETIRED WRONG PREMISE — see the banner at the top of this file. A compositor should
 # not be a network LISTENER: on agnos this costs a well-known port plus TWO of the eight
 # system-wide TCP conn slots per loopback connection, so listener + 3 clients exhausts the
-# table the NETWORK is supposed to use (agnos `planning/ipc.md` §10.1). The naadi
+# table the NETWORK is supposed to use (agnos `planning/ipc.md` §10.1). The anu
 # replacement places a channel instead of accepting dials. Kept only until §9.6 lands.
 fn setu_listen(path): i64 {
     var s = tcp_socket();
@@ -1069,7 +1069,7 @@ var SETU_C_INBUF_CAP = 512;   # ≥ 6 widest frames ((2+8)*8 = 80 B); input fram
 # not help — the cost is INSIDE the blocking syscall.)
 # ⛔ Do not read this rule as tuning. It is one of the six accommodations that falsify the TCP
 # transport itself (agnos `planning/ipc.md` §10.0) — a transport whose connect primitive starves
-# the peer being dialled is the wrong primitive. The hazard CEASES TO EXIST with the naadi
+# the peer being dialled is the wrong primitive. The hazard CEASES TO EXIST with the anu
 # migration (§9.6), because a placed channel is never dialled. Until then the rule stands.
 fn setu_client_connect(path): i64 {
     var fd = setu_connect(path);

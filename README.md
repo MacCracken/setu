@@ -39,11 +39,11 @@ transport** (`client.cyr`): the persistent connection every app owns
 > ⛔ **The ruling is architectural, not empirical.** This transport is retired for being the **wrong
 > primitive** (operator ruling, 2026-08-03), not for being broken. "It connects" was never the bar.
 >
-> ⭐ **The replacement is the agnos socket — `naadi`**, designed in agnos
+> ⭐ **The replacement is the agnos socket — `anu`**, designed in agnos
 > [`docs/development/planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)
 > §9: a channel handed to the child at spawn, not an address dialled over a network stack.
 >
-> ⚠ **The TCP code still ships** only because `naadi` does not exist yet and the migration is a
+> ⚠ **The TCP code still ships** only because `anu` does not exist yet and the migration is a
 > staged twelve-bite cut (§9.6) — removing it today would leave the desktop with no transport at
 > all. **Its presence is not an endorsement.** Do not extend it and do not cite it as working.
 >

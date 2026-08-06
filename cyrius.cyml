@@ -7,7 +7,7 @@ repository = "https://github.com/MacCracken/setu"
 language = "cyrius"
 # Toolchain pin — matched to the dhancha client (setu's primary consumer)
 # so the contract lib and its consumer build on the identical compiler.
-cyrius = "6.5.5"
+cyrius = "6.5.8"
 
 # setu is a library — no CLI binary. `cyrius build` targets a smoke
 # program that links the full include chain to prove lib.cyr parses clean.
@@ -57,4 +57,8 @@ stdlib = [
     "result",   # Result (Ok/Err/is_ok/result_unwrap) — net.cyr's return type
     "net",      # cross-platform TCP sockets (tcp_socket/sock_*) — the 3b transport
     "chrono",   # sys_sleep_ms — the agnos would-block read yield
+    # 1.56.40 cutover: `getenv` reads AGNOS_CHAN, the fd the compositor endowed us. On agnos this
+    # resolves to `_agnos_getenv` (args_agnos.cyr) walking the envp the kernel staged on our init
+    # stack — agnos has no /proc, so io.cyr's getenv delegates there.
+    "args",
 ]

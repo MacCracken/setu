@@ -6,13 +6,67 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased] — the agnos client no longer dials anything (channel-band cutover, bite 6)
+
+⭐⭐ **On agnos, `setu_connect` DOES NOT DIAL.** No socket, no connect, no port, no loopback address —
+four executable lines: check the kernel floor, read the fd the compositor endowed us, return it. The
+client is HANDED a channel at spawn. Requires **agnos >= 1.56.40** (`#97 chan_op`) and **cyrius 6.5.8**
+(the `sys_chan_*` peer).
+
+⛔ **The TCP arm is DELETED on agnos, not gated.** agnos `planning/ipc.md` §9.6 is explicit that a plan
+which preserves the old path "has not done the job"; revertibility comes from bite ORDER — bites 0-5
+landed no consumer — not from keeping a rejected transport compiled in. **Linux keeps its own
+transport, and that is not a fallback: Linux is a different target.**
+
+**What went with it, and why none of it is a loss:** `sock_connect #47` holding preempt disabled for
+the whole attempt and starving the compositor being dialled · the retry loop that could not be added
+because of it (200 tries stretched a 30 s budget to 72 s with zero connections) · the ~2 KB loopback
+window · a **DHCP dependency in a local display protocol** · and the `net_ip` source semantics that made
+`net_src_for` necessary. Six accommodations around one choice — which is what falsified it (§10.0).
+⚠ `net_src_for` itself **stays**: route-derived source selection is correct for the *network* (§10.4).
+
+### Changed — records, not streams
+
+`setu_write_all` on agnos is a single `chan_send`. ⛔ There is no partial send to loop over — framing is
+a property of the CHANNEL, fixed at mint — so a frame over 64 B is now an **error** rather than
+something to split. Splitting would reintroduce in userland exactly the message-boundary problem the
+band was chosen to remove.
+
+### Fixed — WOULD_BLOCK is finally a distinct, immediate answer
+
+`setu_read_blk` on agnos calls `chan_recv`. The old `sys_read` path routed a tagged socket fd through
+the stdlib's `_agnos_sock_recv_block`, which polled under a **30 second** deadline and returned 0 for
+**both** EOF and timeout — so `r == 0` could never mean "would-block", and this function's retry loop
+multiplied a ~30 s call. `chan_recv` answers immediately and says *which*: `-CH_E_WOULDBLOCK` nothing
+yet, `-CH_E_PEERGONE` peer gone. The long-standing note that ring 3 "has no way to ask whether a byte is
+waiting" is obsolete on this path.
+
+### Added — the kernel floor is ENFORCED, not documented
+
+`setu_chan_floor_ok()` calls `CH_CAPS` and refuses unless SEND, RECV **and** region-reachability are all
+present. §9.9's last kill criterion: *"If a client silently appears to work on a pre-`#97` kernel instead
+of refusing at startup, `CH_CAPS` is not doing its job."* ⛔ An unknown syscall number on agnos falls
+through the dispatch chain and the caller reads the fall-through value as data, so "it returned
+something" is not evidence the band exists — the caps block is.
+
+### Added — announcement, read not searched
+
+`setu_chan_announced_fd()` reads `AGNOS_CHAN` from the environment the compositor staged at spawn —
+Wayland's `WAYLAND_SOCKET` shape, where the parent decides the number and the child never searches.
+⛔ **No scan fallback.** Scanning would find a channel this process was not given, and on a kernel where
+that succeeds inert-by-construction is broken — the right behaviour is to fail loudly, not paper over it.
+
+⚠ **Not yet runtime-proven end to end.** Nothing sets `AGNOS_CHAN` yet — that is bite 7, where
+aethersafha mints, endows and spawns clients placed. This bite is verified as: builds `--agnos`, builds
+for Linux unchanged, and the agnos arm contains no socket call.
+
 ## ⛔ STANDING RETRACTION 2026-08-03 — TCP-on-loopback was the wrong primitive for the desktop transport
 
 **`SETU_TCP_PORT = 7700` / TCP over loopback is a RETIRED WRONG PREMISE.** It was chosen at 0.3.0
 because a TCP stack happened to exist, was never put to the operator, and was then carried for a
-month behind a stack of accommodations. Its replacement is the **agnos socket (`naadi`)**, designed
+month behind a stack of accommodations. Its replacement is the **agnos socket (`anu`)**, designed
 in agnos [`docs/development/planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)
-§9. The transport code still ships only because `naadi` does not exist yet and the migration is a
+§9. The transport code still ships only because `anu` does not exist yet and the migration is a
 staged twelve-bite cut (ipc.md §9.6) — **its continued presence is not an endorsement.**
 
 ⛔ **AND EVERY agnos "PROOF" OF IT BEFORE 1.56.34 PASSED BY ACCIDENT.** The kernel hook
@@ -74,7 +128,7 @@ own binaries produced.
   so DHCP yields a real `net_ip`; it is what caught the rigging. Scope: **QEMU at `-smp 1`**, never shown
   on iron, `-smp 4` fault-kills, and "presented" is the compositor's serial claim, not framebuffer evidence.
 - **The transport is retired as the WRONG PRIMITIVE for local display IPC, not because it was broken.**
-  Replacement is the agnos socket (`naadi`), agnos `docs/development/planning/ipc.md` §9; removal
+  Replacement is the agnos socket (`anu`), agnos `docs/development/planning/ipc.md` §9; removal
   inventory §10.
 
 Why the distinction is load-bearing: "retired because it was the wrong primitive" and "retired because it
@@ -105,7 +159,7 @@ SYN-ACK matches.
 > [`planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)
 > §10.0 among the six accommodations that together falsify the choice. ⚠ `net_src_for` itself **stays**
 > (§10.4) — it is correct for the network. What is retracted is the claim that dialling loopback was
-> ever the right shape for a desktop transport. The replacement is the agnos socket (`naadi`, §9).
+> ever the right shape for a desktop transport. The replacement is the agnos socket (`anu`, §9).
 
 ⚠ **This raises the kernel floor: agnos >= 1.56.34.** On an older kernel a client built from this
 release cannot connect at all. The requirement is stated at the call site; `net_src_for` is documented in
@@ -214,7 +268,7 @@ dual-pane file manager, composited as windows.
 > rigged kernel. It is retained for exactly that reason. ⛔ But it does **not** make TCP-on-loopback a
 > correct desktop transport, and it must not be cited as one: it is the measurement that finally showed
 > what the previous month of "greens" had been hiding. The transport is retired in favour of the agnos
-> socket (`naadi`); see the STANDING RETRACTION at the top of this file.
+> socket (`anu`); see the STANDING RETRACTION at the top of this file.
 
 ## [0.7.1] - 2026-08-02
 
@@ -504,9 +558,9 @@ kernel**~~. Cyrius pin **6.4.25 → 6.4.34** (for the native `sys_shm_*` wrapper
 > release until [0.7.2] (2026-08-02). Every agnos "green" in that window came from an
 > `AETHERSAFHA_SETU_SELFTEST` kernel. The end-to-end `puka` ↔ `aethersafha` PPM proof cited here was a
 > **Linux host** result.
-> ⭐ The replacement is the **agnos socket (`naadi`)** — agnos
+> ⭐ The replacement is the **agnos socket (`anu`)** — agnos
 > [`planning/ipc.md`](https://github.com/MacCracken/agnos/blob/main/docs/development/planning/ipc.md)
-> §9. The transport code below still ships **only** because `naadi` does not exist yet and its
+> §9. The transport code below still ships **only** because `anu` does not exist yet and its
 > migration is a staged twelve-bite cut (§9.6); removing it today would leave the desktop with no
 > transport at all. ⚠ setu's **Linux arm stays** — Linux is a different target, not an agnos fallback.
 

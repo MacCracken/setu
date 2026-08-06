@@ -4,7 +4,7 @@
 # ⛔ They were claimed here as "proven end-to-end by the puka <-> aethersafha integration
 # over TCP loopback (item 3b)". That integration was proven ON LINUX ONLY; the agnos-side
 # greens came from `AETHERSAFHA_SETU_SELFTEST`-rigged kernels and are FALSE GREENS. The TCP
-# transport is a RETIRED WRONG PREMISE (replaced by the agnos socket `naadi`) — see the
+# transport is a RETIRED WRONG PREMISE (replaced by the agnos socket `anu`) — see the
 # banner at the top of `src/client.cyr`.
 # Here we assert the pure/linkable surface: the well-known
 # transport port + a framed round-trip through the codec the client sends/reads,
@@ -21,7 +21,7 @@ fn check(got, want): i64 {
 }
 
 fn main(): i64 {
-    # ⛔ Pins the RETIRED TCP port so the naadi migration (ipc.md §9.6) has to touch this test
+    # ⛔ Pins the RETIRED TCP port so the anu migration (ipc.md §9.6) has to touch this test
     # deliberately. This asserts what the code currently IS, not what the transport SHOULD BE.
     check(SETU_TCP_PORT, 7700);
 

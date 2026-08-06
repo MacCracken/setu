@@ -21,12 +21,12 @@
 # fault-kills.
 #
 # ⛔ The TCP transport it dials is nonetheless RETIRED — as the WRONG PRIMITIVE, not as
-# broken — replaced by the agnos socket `naadi`. See the banner at the top of setu
+# broken — replaced by the agnos socket `anu`. See the banner at the top of setu
 # `src/client.cyr` and agnos `docs/development/planning/ipc.md` §9/§10.
 #
 # The compositor spawns `/bin/puka`; the (now-deleted) smoke seeded this binary there.
 #
-# Run: it needs a live compositor listening on setu loopback:7700 (pending naadi).
+# Run: it needs a live compositor listening on setu loopback:7700 (pending anu).
 
 include "src/lib.cyr"
 
