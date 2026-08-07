@@ -80,6 +80,13 @@ jobs:
           fi
           echo "dist/setu.cyr matches src/"
 
+      - name: No TCP on the agnos target
+        # ⛔ setu 0.8.0's changelog states "the TCP arm is DELETED on agnos". It was deleted from
+        # `setu_connect` only — `setu_listen`/`setu_accept` kept calling tcp_socket/sock_bind/
+        # sock_listen/sock_accept with no #ifdef and survived FOUR cuts while every doc said otherwise.
+        # A claim in a changelog is not a property of the code; this makes it one.
+        run: sh scripts/check-no-tcp-on-agnos.sh
+
       - name: Verify dep sidecar states the DECLARED stdlib
         # ⛔ `cyrius distlib` (run in the step above) OVERWRITES dist/setu.deps with a fixed core
         # subset — 8 leaves where setu declares 12, dropping result/net/chrono/args. Measured: a

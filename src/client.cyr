@@ -3,69 +3,35 @@
 # setu = the protocol CONTRACT (proto/codec) + this transport.
 #
 # ============================================================================
-# ⛔ THE TRANSPORT BELOW IS A RETIRED WRONG PREMISE — DO NOT BUILD ON IT
+# ⭐ TRANSPORT: RECORDS ON BOTH TARGETS. TCP IS GONE.
 # ============================================================================
-# TCP over loopback (`127.0.0.1 : SETU_TCP_PORT`) is NOT the AGNOS desktop
-# transport and never should have been. It was chosen at setu 0.3.0 because a
-# TCP stack happened to exist, was never put to the operator, and was then
-# carried for a month behind six accommodations. A local display protocol has
-# nothing to route, nothing to checksum, no window to negotiate, no RTO to wait
-# out, and NO BUSINESS OWNING A PORT.
+#   agnos — the `#97` channel band. The client does NOT dial: the compositor mints a channel,
+#           endows one end, and spawns the client already holding it. `setu_connect` reads which fd
+#           it landed on out of `AGNOS_CHAN` and returns it. Four lines, no socket, no port.
+#   Linux — AF_UNIX / SOCK_SEQPACKET. A local, connected, RECORD transport: same delivery semantics
+#           as the band, a filesystem path as the rendezvous, and its permissions as the access
+#           control loopback:7700 never had.
 #
-# ⛔ AND IT COULD NOT COMPLETE ON agnos BEFORE 1.56.34 / `net_src_for`. The only
-# test that ever showed it passing in that era — `aethersafha-setu-smoke.sh` —
-# passed BY ACCIDENT: the kernel hook `AETHERSAFHA_SETU_SELFTEST` assigned
-# `net_ip = 0x7F000001` before launching the compositor. agnos stamped `net_ip`
-# as the SOURCE of every outbound segment, so a SYN to 127.0.0.1 was answered to
-# `net_ip` and `tcp_find_conn` never matched — except under that hook, where the
-# assignment made src == dst == 127.0.0.1. On an ordinary boot OF THAT ERA the
-# compositor↔client handshake COULD NOT COMPLETE. See agnos
-# `kernel/core/net.cyr:183-190`. The hook and the smoke were DELETED 2026-08-03;
-# no claim tracing to that smoke is evidence.
+# ⭐ THE TWO ARMS AGREE ON SEMANTICS, WHICH IS THE POINT. One send is one record; one record is one
+# message; a frame that does not fit a record is an ERROR rather than something to split. Because both
+# arms obey that, `setu_read_msg` has no `#ifdef` at all, and a consumer cannot be correct on one
+# target and broken on the other for a framing reason.
 #
-# ⚠ AFTER `net_src_for` IT DID CONNECT, UN-RIGGED — and that is NOT the reason
-# it is retired. agnos 1.56.34's `net_src_for` (`kernel/core/net.cyr:203-206`)
-# derives an outbound segment's source from its DESTINATION, so a loopback SYN
-# goes out src = dst = 127.0.0.1 and its SYN-ACK matches. On 2026-08-02, on
-# agnos 1.56.34+, `agnos/scripts/harness/aethersafha-clients-test.py` reached
-# **connected: 2, presented: 2** — setu's own slim `present_probe` (staged as
-# `/bin/puka`) AND the real dhancha `crab` both connected and presented. That
-# harness is honest by construction: it byte-scans `build/agnos` and HARD-EXITS
-# if the kernel carries any selftest hook (a kernel carrying one does not fail
-# that test, it INVALIDATES it), and it attaches a virtio NIC so DHCP yields a
-# real `net_ip`. It is the harness that CAUGHT the rigging. ⚠ Scope it exactly:
-# that run was QEMU at `-smp 1`. It was never shown on iron, and `-smp 4`
-# fault-kills.
+# ⛔ WHY TCP WAS REMOVED — AND WHY REMOVING IT ONLY FROM agnos WAS NOT ENOUGH. TCP-on-loopback was
+# adopted at 0.3.0 because a TCP stack happened to exist; it was never put to the operator, and was
+# carried behind six accommodations. A local display protocol has nothing to route, nothing to
+# checksum, no window to negotiate, no RTO to wait out, and no business owning a port. That is a
+# property of the PROBLEM, not of the kernel — so scoping the removal to agnos left the rejected
+# primitive alive on the target that was easiest to keep testing against, and it survived four cuts
+# there while every changelog asserted it was gone. setu 0.1.0 was AF_UNIX; this restores it.
 #
-# ⛔ SO THE RULING IS ARCHITECTURAL, NOT EMPIRICAL: this transport is retired for
-# being the WRONG PRIMITIVE (operator ruling, 2026-08-03), not for being broken.
-# "It connects" was never the bar — a local display protocol has no business on a
-# network stack even when the network stack delivers.
-#
-# ⭐ THE REPLACEMENT is the agnos socket — `anu` (नाडी), designed in agnos
-# `docs/development/planning/ipc.md` §9. A channel handed to the child at spawn,
-# not an address dialled over a network stack.
-#
-# ⚠ WHY THIS CODE IS STILL HERE: `anu` does not exist yet, and the migration
-# is a staged twelve-bite cut (ipc.md §9.6). Ripping the transport out today
-# would leave the desktop with no transport at all. ITS PRESENCE IS NOT AN
-# ENDORSEMENT — do not extend it, do not add accommodations to it, and do not
-# cite it as the working/proven/correct desktop path.
-#
-# ⚠ NOT retired: the setu CODEC and message ABI below (pure, transport-agnostic,
-# survives the swap untouched); the shared-buffer present path (`sys_shm`) —
-# which is precisely the workload having ALREADY left this wire; and the LINUX
-# arm — Linux is a DIFFERENT TARGET with a different kernel, not an agnos
-# fallback. ⛔ If the Linux arm ever becomes reachable on agnos, that is the
-# wrong path returning.
+# ⛔ HISTORICAL, KEPT BECAUSE THE LESSON OUTLIVES THE TRANSPORT: the only test that ever showed the
+# agnos TCP path passing before 1.56.34 / `net_src_for` passed BY ACCIDENT. The kernel hook
+# `AETHERSAFHA_SETU_SELFTEST` assigned `net_ip = 0x7F000001` before launching the compositor; agnos
+# stamped `net_ip` as the source of every outbound segment, so a SYN to 127.0.0.1 was answered to
+# `net_ip` and `tcp_find_conn` never matched — except under that hook, where src == dst made it match.
+# A harness that rigs the system under test is not evidence about the system.
 # ============================================================================
-#
-# Transport (as implemented, pending the anu migration): TCP over loopback :
-# SETU_TCP_PORT via cyrius `net.cyr` — Linux BSD sockets on the host, the agnos
-# kernel TCP band on agnos (connect #47, send/recv #48/#49, listen/accept
-# #56/#57). `path` params are advisory — they were never real, and are one of the
-# six accommodations named above; six consumers carried, ignored and passed them
-# identically. They go away with the transport.
 #
 # Two agnos socket semantics the framing absorbs (both #ifdef-guarded, so Linux
 # behaviour is unchanged):
@@ -74,19 +40,91 @@
 #
 # Model: connect once → create surface once → ATTACH + pixels + COMMIT per present.
 
-# ⛔ RETIRED WRONG PREMISE (see the banner above). A local display protocol has no
-# business owning a well-known port; this one goes away with the anu migration.
-var SETU_TCP_PORT = 7700;   # the compositor's TCP loopback port — NOT the sanctioned transport
+# ⛔⛔ TCP IS GONE FROM setu ON BOTH TARGETS. The operator's ruling was that TCP-on-loopback is the
+# WRONG PRIMITIVE for LOCAL DISPLAY IPC — a property of the problem, not of the kernel. Scoping the
+# removal to agnos and leaving Linux on TCP kept the rejected primitive alive in the one place it was
+# easiest to keep testing against, which is how it survived four cuts.
+#
+# ⭐ LINUX NOW SPEAKS AF_UNIX / SOCK_SEQPACKET, which is the SAME SEMANTIC as the agnos channel band:
+# a connected, local, RECORD transport with all-or-nothing message delivery and no namespace anyone
+# else can squat. That is not a coincidence — the band's own host semantic proof
+# (`agnos/tests/chan/chantest.cyr`) is written against `socketpair(SOCK_SEQPACKET)`, and its negative
+# control over `SOCK_STREAM` fails exactly the six framing assertions. Both arms now agree, so the
+# stream-vs-record class of bug that caused three consecutive setu cuts cannot recur on one arm only.
+#
+# ⚠ setu 0.1.0 WAS AF_UNIX. TCP was adopted because agnos had a TCP stack and no AF_UNIX — reuse, not
+# design. This restores the original primitive on the host and pairs it with the sovereign one.
+#ifndef CYRIUS_TARGET_AGNOS
+var SETU_UNIX_PATH = "/tmp/setu-display.sock";   # the compositor's rendezvous point on the host
+
+# ⛔ SOCKET SYSCALL NUMBERS ARE PER-ARCH, AND UNGUARDED ONES ARE A SILENT MIS-DISPATCH — NOT A BUILD
+# ERROR. On aarch64 Linux, 41 is not `socket`; the call would simply do something else. The aarch64
+# backend's `ESYSXLAT` does NOT rescue this: it is the macOS Linux→BSD map and contains no socket
+# numbers at all (read/write/open/close/mmap/mprotect/munmap/lseek/exit/execve only).
+# ⚠ `lib/net.cyr` has exactly this defect and it is an OPEN cyrius ticket
+# (`2026-07-30-net-cyr-x86-only-socket-syscall-numbers.md`). Copying its shape would have copied its
+# bug — the reason to read a dependency's issue list before imitating it.
+#ifdef CYRIUS_ARCH_X86
+var NSYS_SOCKET_   = 41;
+var NSYS_CONNECT_  = 42;
+var NSYS_ACCEPT_   = 43;
+var NSYS_RECVFROM_ = 45;
+var NSYS_BIND_     = 49;
+var NSYS_LISTEN_   = 50;
+#endif
+#ifdef CYRIUS_ARCH_AARCH64
+var NSYS_SOCKET_   = 198;
+var NSYS_CONNECT_  = 203;
+var NSYS_ACCEPT_   = 202;
+var NSYS_RECVFROM_ = 207;
+var NSYS_BIND_     = 200;
+var NSYS_LISTEN_   = 201;
+#endif
+
+# ⚠ `unlink` is x86-only: aarch64 Linux has no `unlink(2)`, only `unlinkat(AT_FDCWD, path, 0)`.
+# A shared constant cannot express that, because the ARITY differs — so it is a function, not a number.
+#ifdef CYRIUS_ARCH_X86
+fn setu_un_unlink(path): i64 { return syscall(87, path); }
+#endif
+#ifdef CYRIUS_ARCH_AARCH64
+fn setu_un_unlink(path): i64 { return syscall(35, 0 - 100, path, 0); }   # unlinkat(AT_FDCWD, path, 0)
+#endif
+
+var SETU_AF_UNIX        = 1;
+var SETU_SOCK_SEQPACKET = 5;
+var SETU_SOCK_NONBLOCK  = 2048;    # 0o4000 — set on the LISTEN fd only; accepted fds do not inherit it
+var SETU_MSG_DONTWAIT   = 64;      # 0x40 — per-call non-blocking recv, for the frame-loop polls
+
+# Build a `sockaddr_un` at `sa` (needs >= 112 bytes) and return its addrlen.
+# Layout: u16 sun_family, then the NUL-terminated path. addrlen = 2 + len + 1.
+fn setu_un_addr(path, sa): i64 {
+    var n = strlen(path);
+    if (n > 100) { return 0 - 1; }                 # sun_path is 108; stay well inside it
+    store8(sa, SETU_AF_UNIX);                      # little-endian u16 family
+    store8(sa + 1, 0);
+    var i = 0;
+    while (i < n) { store8(sa + 2 + i, load8(path + i)); i = i + 1; }
+    store8(sa + 2 + n, 0);
+    return 2 + n + 1;
+}
+
+# The path to rendezvous on: the caller's `path` when it gave one, else the default.
+fn setu_un_path(path): i64 {
+    if (path == 0) { return SETU_UNIX_PATH; }
+    if (strlen(path) == 0) { return SETU_UNIX_PATH; }
+    return path;
+}
+#endif
 
 # =========================================================================
-# ⛔ RETIRED TCP transport (see the banner at the top of this file) + framing
-#    primitives (over the setu codec, via net.cyr). The framing/codec survive
-#    the anu swap; the socket calls do not.
+# Transport + framing primitives (over the setu codec). See the banner at the
+# top of this file: agnos = the `#97` channel band, Linux = AF_UNIX/SOCK_SEQPACKET.
 # =========================================================================
 
-# Connect to the compositor's setu endpoint (loopback : SETU_TCP_PORT). Returns the
-# connected fd (>= 0), or -2 (socket) / -3 (connect). `setu_connect_error` /
-# `setu_connect_rc` separate the two failures, which otherwise collapse to one message.
+# Connect to the compositor. Linux: AF_UNIX/SOCK_SEQPACKET at `path` (or the default rendezvous).
+# agnos: NO DIAL — returns the endowed fd named by `AGNOS_CHAN`. Returns the fd (>= 0), or -2
+# (socket) / -3 (connect) on Linux, -8 (no usable chan band) / -9 (no announcement) on agnos.
+# `setu_connect_error` / `setu_connect_rc` separate failures that otherwise collapse to one message.
 # ⛔ This dials an IP address for a LOCAL channel, which is the wrong premise itself.
 # The anu replacement is handed a channel at spawn and dials nothing.
 var setu_conn_err = 0;      # -2 socket, -3 connect. 0 = last one worked.
@@ -174,12 +212,19 @@ fn setu_connect(path): i64 {
     return afd;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var s = tcp_socket();
-    if (is_ok(s) == 0) { setu_conn_err = 0 - 2; return 0 - 2; }
-    var fd = result_unwrap(s);
-    if (is_ok(sock_connect(fd, INADDR_LOOPBACK(), SETU_TCP_PORT)) == 0) {
-        sock_close(fd);
+    # ⭐ AF_UNIX / SOCK_SEQPACKET — a LOCAL, CONNECTED, RECORD transport. No route, no checksum, no
+    # window, no RTO, no port. The filesystem path is the rendezvous, and its permissions are the
+    # access control TCP-on-loopback never had (anything on the host could dial 7700).
+    var sa = alloc(128);
+    var alen = setu_un_addr(setu_un_path(path), sa);
+    if (alen < 0) { setu_conn_err = 0 - 2; return 0 - 2; }
+    var fd = syscall(NSYS_SOCKET_, SETU_AF_UNIX, SETU_SOCK_SEQPACKET, 0);
+    if (fd < 0) { setu_conn_err = 0 - 2; setu_conn_rc = fd; return 0 - 2; }
+    var rc = syscall(NSYS_CONNECT_, fd, sa, alen);
+    if (rc < 0) {
+        sys_close(fd);
         setu_conn_err = 0 - 3;
+        setu_conn_rc = rc;
         return 0 - 3;
     }
     return fd;
@@ -188,7 +233,8 @@ fn setu_connect(path): i64 {
 
 # --- server transport (the compositor owns the listener) ---------------------
 
-# Bind + listen on the setu endpoint (loopback : SETU_TCP_PORT). `path` advisory.
+# Bind + listen on the setu endpoint. Linux: AF_UNIX/SOCK_SEQPACKET at `path`. agnos: REFUSES —
+# there is no listener on the channel band; clients are placed, never accepted.
 # Returns the listening fd (>= 0), or -2 (socket) / -3 (bind) / -4 (listen). The
 # fd is set non-blocking so setu_accept polls (agnos #57 is already non-blocking).
 # ⛔ RETIRED WRONG PREMISE — see the banner at the top of this file. A compositor should
@@ -197,27 +243,53 @@ fn setu_connect(path): i64 {
 # table the NETWORK is supposed to use (agnos `planning/ipc.md` §10.1). The anu
 # replacement places a channel instead of accepting dials. Kept only until §9.6 lands.
 fn setu_listen(path): i64 {
-    var s = tcp_socket();
-    if (is_ok(s) == 0) { return 0 - 2; }
-    var fd = result_unwrap(s);
-    #ifndef CYRIUS_TARGET_AGNOS
-    sock_reuse(fd);                                  # SO_REUSEADDR — rebind after a restart
+    #ifdef CYRIUS_TARGET_AGNOS
+    # ⛔ THERE IS NO LISTENER ON AGNOS. A compositor does not accept connections on the channel band —
+    # it MINTS a channel per client, ENDOWS one end, and spawns the client already holding it. Nothing
+    # dials, so there is nothing to bind, nothing to listen on, and no port to own.
+    # ⛔ THIS FUNCTION USED TO OPEN loopback:7700 ON AGNOS. setu 0.8.0 claimed the agnos TCP arm was
+    # deleted; it was deleted from `setu_connect` only, and this one was missed through four cuts. It
+    # is the reason `net` was still a live agnos dependency and the reason ipc bite 8 ("nothing dials
+    # 7700/7701") was false while being treated as reachable.
+    # ⛔ REFUSE, DO NOT EMULATE. A caller reaching here on agnos is using the retired transport shape,
+    # and the correct answer is a loud failure, not a channel dressed up as a socket.
+    return 0 - 2;
     #endif
-    if (is_ok(sock_bind(fd, INADDR_LOOPBACK(), SETU_TCP_PORT)) == 0) { sock_close(fd); return 0 - 3; }
-    if (is_ok(sock_listen(fd, 8)) == 0) { sock_close(fd); return 0 - 4; }
     #ifndef CYRIUS_TARGET_AGNOS
-    sock_set_nonblocking(fd);                        # accept polls (agnos accept is already non-blocking)
-    #endif
+    # ⛔ UNLINK FIRST. An AF_UNIX path is a filesystem entry that OUTLIVES the process: a compositor
+    # killed without a clean shutdown leaves the node behind and every later bind fails EADDRINUSE.
+    # That is the same "run 2 hosts nothing and looks healthy" failure the TCP listener had when it
+    # leaked port 7700 — same shape, and the fix belongs here, at bind time, not in a shutdown path
+    # that a crash skips.
+    var up = setu_un_path(path);
+    var sa = alloc(128);
+    var alen = setu_un_addr(up, sa);
+    if (alen < 0) { return 0 - 3; }
+    setu_un_unlink(up);                              # ENOENT is fine and expected on a clean start
+    # SOCK_NONBLOCK on the LISTEN fd so `setu_accept` polls and the frame loop never stalls.
+    # ⚠ Accepted fds do NOT inherit it on Linux — which is what we want: the per-client fd stays
+    # blocking for `setu_read_blk`, and the frame-loop polls use MSG_DONTWAIT per call instead.
+    var fd = syscall(NSYS_SOCKET_, SETU_AF_UNIX, SETU_SOCK_SEQPACKET | SETU_SOCK_NONBLOCK, 0);
+    if (fd < 0) { return 0 - 2; }
+    if (syscall(NSYS_BIND_, fd, sa, alen) < 0) { sys_close(fd); return 0 - 3; }
+    if (syscall(NSYS_LISTEN_, fd, 8) < 0) { sys_close(fd); return 0 - 4; }
     return fd;
+    #endif
 }
 
 # Accept the next pending client on `sfd`. Returns the client fd (>= 0), or -5
 # when none is pending (WOULD_BLOCK — the compositor polls again next frame).
 # Non-blocking on BOTH targets, so the frame loop never stalls on accept.
 fn setu_accept(sfd): i64 {
-    var a = sock_accept(sfd);
-    if (is_ok(a) == 1) { return result_unwrap(a); }
+    #ifdef CYRIUS_TARGET_AGNOS
+    # ⛔ NOTHING TO ACCEPT — see setu_listen. Clients are PLACED, never accepted.
+    return 0 - 5;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var cfd = syscall(NSYS_ACCEPT_, sfd, 0, 0);
+    if (cfd >= 0) { return cfd; }
     return 0 - 5;                                    # EAGAIN / no client pending
+    #endif
 }
 
 # --- write --------------------------------------------------------------------
@@ -237,12 +309,12 @@ fn setu_write_all(fd, buf, n): i64 {
     return n;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var sent = 0;
-    while (sent < n) {
-        var w = sys_write(fd, buf + sent, n - sent);
-        if (w <= 0) { return 0 - 7; }
-        sent = sent + w;
-    }
+    # ⭐ SAME RULE AS AGNOS. On SOCK_SEQPACKET a write IS a record — there is no partial send to loop
+    # over, and the loop this function used to run was a stream artifact. Keeping the 64-byte ceiling
+    # on both arms is deliberate: a frame that does not fit one record is an ERROR on both targets, so
+    # a client cannot be correct on Linux and broken on agnos (or the reverse) for a framing reason.
+    if (n > 64) { return 0 - 7; }
+    if (sys_write(fd, buf, n) != n) { return 0 - 7; }
     return n;
     #endif
 }
@@ -372,9 +444,13 @@ fn setu_poll_input(fd, msg_out): i64 {
     if (r < 0) { return 0 - 6; }   # peer gone / bad fd / record did not fit — all terminal here
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var r = sys_read(fd, buf, cap);        # Linux: 0 = would-block/EOF, -1 = error
-    if (r == 0) { return 0; }              # nothing buffered → no input this frame
-    if (r < 0)  { return 0 - 6; }          # EOF / error
+    # ⭐ MSG_DONTWAIT, not a non-blocking fd. The accepted/connected fd stays BLOCKING so
+    # `setu_read_blk` can actually block; only the frame-loop poll asks for a non-blocking answer.
+    # ⛔ `sys_read` here was a real bug in the old arm too: it BLOCKS on a blocking fd, so a poll that
+    # promised "never stalls" stalled the whole frame loop whenever no input was pending.
+    var r = syscall(NSYS_RECVFROM_, fd, buf, cap, SETU_MSG_DONTWAIT, 0, 0);
+    if (r < 0)  { return 0; }              # EAGAIN — nothing this frame (the common case)
+    if (r == 0) { return 0 - 6; }          # EOF — peer gone
     #endif
     if (setu_decode(buf, r, msg_out) < 0) { return 0; }   # partial/garbled → skip
     return 1;
@@ -383,24 +459,11 @@ fn setu_poll_input(fd, msg_out): i64 {
 # Read EXACTLY `n` bytes from `fd` into `buf`, looping over short/would-block
 # reads. Returns `n` (>= 0) or -6 on EOF/error.
 fn setu_read_exact(fd, buf, n): i64 {
-    #ifdef CYRIUS_TARGET_AGNOS
-    # ⛔ "READ EXACTLY N BYTES" HAS NO MEANING ON A RECORD CHANNEL, and emulating it would re-import
-    # the message-boundary problem the band was chosen to delete. Refuse rather than adapt.
-    # ⚠ The only caller on this path is the INLINE-pixel branch of the compositor's handshake
-    # (`buf_id <= 0`), which agnos clients do not take — they present through shm. If this ever fires
-    # on agnos it means a client tried to stream a surface down the control channel, and failing here
-    # is the correct, loud answer.
+    # ⛔ REFUSED ON BOTH TARGETS AS OF THE AF_UNIX CUTOVER. "Read exactly N bytes" is a STREAM idiom
+    # and both arms are now record transports; emulating it would re-import, in userland, the
+    # message-boundary problem both were chosen to delete. It is kept as a symbol only so consumers
+    # that still reference it fail loudly at the call rather than mysteriously at the wire.
     return 0 - 6;
-    #endif
-    #ifndef CYRIUS_TARGET_AGNOS
-    var got = 0;
-    while (got < n) {
-        var r = setu_read_blk(fd, buf + got, n - got);
-        if (r <= 0) { return 0 - 6; }
-        got = got + r;
-    }
-    return got;
-    #endif
 }
 
 # Read ONE full setu frame from `fd` into `msg_out` using length-from-header
@@ -408,42 +471,27 @@ fn setu_read_exact(fd, buf, n): i64 {
 # length (> 0), -6 on EOF / short read / bad argc, or a negated SetuErr. Use this
 # (not setu_recv) when reading a continuous stream of frames — the input path.
 fn setu_read_msg(fd, msg_out): i64 {
+    # ⭐⭐ NO `#ifdef` HERE ANY MORE, AND THAT IS THE POINT OF THE AF_UNIX CUTOVER. agnos delivers a
+    # record over the `#97` channel band; Linux delivers a record over AF_UNIX/SOCK_SEQPACKET. One
+    # record is one message on both, so this function has ONE body and the two targets cannot drift.
+    #
+    # ⛔ THE STREAM SHAPE THIS REPLACES FAILED SILENTLY FOR TWO RELEASES. Reading 16 bytes of header
+    # first asks for a PREFIX of a record: the agnos kernel truncated to the caller's buffer and
+    # advanced past the remainder, so the header read consumed the ENTIRE message and the body read
+    # found nothing — surfacing as an unexplained handshake failure inside aethersafha, two layers and
+    # one repo from the cause. It would have done the same thing on SOCK_SEQPACKET.
+    # (agnos 1.56.40 now returns -CH_E_ARG and leaves the record queued, so the mistake is loud
+    # instead of silent — but the fix is to stop making it.)
+    #
+    # ⛔ AND IT MUST STILL BLOCK. An early cut returned on WOULD_BLOCK, dropping the retry the stream
+    # version got for free. The handshake is three messages and the caller reaches here for ATTACH and
+    # COMMIT *before the client has sent them*, so a non-retrying read fails whenever the peer is a few
+    # microseconds behind. `setu_read_blk` owns the retry policy and reads one record per attempt, so
+    # the record shape and the blocking shape compose rather than conflict.
     var buf = alloc(128);
-    #ifdef CYRIUS_TARGET_AGNOS
-    # ⭐ ONE RECORD IS ONE MESSAGE. No header-then-body split, because there is nothing to split: the
-    # channel delivers the whole frame or nothing, and the length it returns IS the frame length.
-    #
-    # ⛔ THE STREAM SHAPE BELOW COULD NOT WORK HERE, AND FAILED SILENTLY FOR TWO RELEASES. Reading 16
-    # bytes of header first asks for a PREFIX of a record. The agnos kernel used to truncate to the
-    # caller's buffer and advance past the remainder, so the header read consumed the ENTIRE message
-    # and the body read then found nothing — surfacing as an unexplained handshake failure inside
-    # aethersafha, two layers and one repo from the cause. (agnos 1.56.40 now returns -CH_E_ARG and
-    # leaves the record queued, which makes the same mistake loud instead of silent — but the fix is
-    # to stop making it.)
-    #
-    # ⚠ Read into the FULL buffer, then trust the returned length. Asking for less than a record is
-    # the bug; asking for more is fine.
-    # ⛔ AND IT MUST STILL BLOCK. The first cut of this arm returned -6 on WOULD_BLOCK, which silently
-    # dropped the retry the stream version got from `setu_read_exact` -> `setu_read_blk`. The handshake
-    # is three messages; the caller reaches this for ATTACH and COMMIT *before the client has sent
-    # them*, so a non-retrying read fails every time the peer is merely a few microseconds behind.
-    # `setu_read_blk` already owns the retry-with-yield policy and, on agnos, already reads ONE record
-    # per attempt — so the record shape and the blocking shape compose here rather than conflicting.
     var r = setu_read_blk(fd, buf, 128);
     if (r <= 0) { return 0 - 6; }
     return setu_decode(buf, r, msg_out);
-    #endif
-    #ifndef CYRIUS_TARGET_AGNOS
-    if (setu_read_exact(fd, buf, 16) < 0) { return 0 - 6; }
-    var argc = setu_get_i64(buf, 8);
-    if (argc < 0) { return 0 - 6; }
-    if (argc > SETU_MAX_ARGS) { return 0 - 6; }
-    var total = (2 + argc) * 8;
-    if (total > 16) {
-        if (setu_read_exact(fd, buf + 16, total - 16) < 0) { return 0 - 6; }
-    }
-    return setu_decode(buf, total, msg_out);
-    #endif
 }
 
 # =========================================================================
@@ -627,7 +675,10 @@ fn setu_client_poll_input(c, msg_out): i64 {
     if (r == 0 - CH_E_PEERGONE) { r = 0 - 1; }
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var r = sys_read(load64(c + SETU_C_FD), ib + len, SETU_C_INBUF_CAP - len);
+    # See setu_poll_input: MSG_DONTWAIT keeps the fd blocking for read_blk while this poll returns
+    # immediately. EAGAIN maps to the "idle" convention (0) this function already uses.
+    var r = syscall(NSYS_RECVFROM_, load64(c + SETU_C_FD), ib + len, SETU_C_INBUF_CAP - len, SETU_MSG_DONTWAIT, 0, 0);
+    if (r < 0) { r = 0; }
     #endif
     if (r > 0) {
         store64(c + SETU_C_INLEN, len + r);
@@ -647,6 +698,15 @@ fn setu_client_close(c): i64 {
         store64(c + SETU_C_BUFID, 0);
         store64(c + SETU_C_BUFSZ, 0);
     }
-    sock_close(setu_client_fd(c));
+    # ⛔ A CHANNEL ENDPOINT IS RELEASED BY `CH_CLOSE`, NOT BY `sock_close`. `sock_close` lands on
+    # `sys_close` → `vfs_close_inner`, which has cases for PIPE and SOCK but **none for VFS_CHAN** — it
+    # zeroes the fd slot and leaves `chan_end_open`/`chan_end_owner` set until the process dies. That is
+    # an endpoint leak for the whole life of a long-running client.
+    #ifdef CYRIUS_TARGET_AGNOS
+    sys_chan_close(setu_client_fd(c));
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    sys_close(setu_client_fd(c));
+    #endif
     return 0;
 }

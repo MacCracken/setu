@@ -21,9 +21,20 @@ fn check(got, want): i64 {
 }
 
 fn main(): i64 {
-    # ⛔ Pins the RETIRED TCP port so the anu migration (ipc.md §9.6) has to touch this test
-    # deliberately. This asserts what the code currently IS, not what the transport SHOULD BE.
-    check(SETU_TCP_PORT, 7700);
+    # ⭐ THE PORT ASSERTION IS GONE BECAUSE THE PORT IS GONE. It used to read `check(SETU_TCP_PORT,
+    # 7700)`, pinning the retired transport so a migration had to touch this test deliberately — and it
+    # worked exactly as intended: it is what failed the build when the constant was finally removed.
+    # What replaces it asserts the two things that are now true of BOTH targets: the rendezvous is a
+    # filesystem path (Linux) and there is no dial at all (agnos).
+    #ifndef CYRIUS_TARGET_AGNOS
+    var sa = alloc(128);
+    var alen = setu_un_addr(SETU_UNIX_PATH, sa);
+    check(alen, 2 + strlen(SETU_UNIX_PATH) + 1);   # sockaddr_un addrlen
+    check(load8(sa), SETU_AF_UNIX);                # sun_family low byte
+    check(load8(sa + 1), 0);                       # sun_family high byte
+    check(load8(sa + 2), load8(SETU_UNIX_PATH));   # path starts at offset 2
+    check(setu_un_path(0), SETU_UNIX_PATH);        # no path given -> the default rendezvous
+    #endif
 
     # A framed round-trip through the client's send/read shape: build a
     # CREATE_SURFACE, encode it into a frame buffer, decode it back, and assert
@@ -101,7 +112,7 @@ fn main(): i64 {
     check(setu_buf_read(bid, bdst, 1024), 0 - 1);   # gone after close
 
     if (g_fails == 0) {
-        var ok = "client_test: PASS (port + create-surface round-trip + reassembly + buf lifecycle)\n";
+        var ok = "client_test: PASS (sockaddr_un + create-surface round-trip + reassembly + buf lifecycle)\n";
         syscall(SYS_WRITE, 1, ok, strlen(ok));
     } else {
         var f = "client_test: FAIL\n";

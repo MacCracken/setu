@@ -6,6 +6,94 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.4] — 2026-08-07 — TCP is GONE from setu. Linux speaks AF_UNIX/SOCK_SEQPACKET.
+
+⛔⛔ **THE RULING WAS THAT TCP-ON-LOOPBACK IS THE WRONG PRIMITIVE FOR LOCAL DISPLAY IPC — A PROPERTY OF
+THE PROBLEM, NOT OF THE KERNEL.** 0.8.0–0.8.3 scoped the removal to agnos and kept Linux on TCP behind
+a rationalisation ("Linux is a different target, not a fallback") that was never asked for. That left
+the rejected primitive alive on the target easiest to keep testing against, where it survived four
+cuts while every changelog and planning doc asserted it was gone.
+
+⛔ **AND THE agnos REMOVAL ITSELF WAS INCOMPLETE.** 0.8.0 states "the TCP arm is DELETED on agnos". It
+was deleted from `setu_connect` only. `setu_listen` and `setu_accept` kept calling `tcp_socket` /
+`sock_bind(INADDR_LOOPBACK(), 7700)` / `sock_listen` / `sock_accept` with no `#ifdef` around any of it.
+ipc bite 8's premise — *"nothing dials 7700/7701"* — was false the entire time it was treated as
+reachable.
+
+### Changed — Linux transport is AF_UNIX / SOCK_SEQPACKET
+
+`setu_connect` / `setu_listen` / `setu_accept` now use `AF_UNIX` + `SOCK_SEQPACKET` via raw syscalls,
+with a `sockaddr_un` built by `setu_un_addr` and a filesystem path as the rendezvous. Its permissions
+are the access control loopback:7700 never had — anything on the host could dial a port.
+
+⭐ **SOCK_SEQPACKET is the same semantic as the `#97` channel band**: local, connected, record-framed,
+all-or-nothing delivery. That is not a coincidence — the band's own host semantic proof
+(`agnos/tests/chan/chantest.cyr`) is written against `socketpair(SOCK_SEQPACKET)`, with a `SOCK_STREAM`
+negative control that fails exactly its six framing assertions.
+
+⚠ **setu 0.1.0 WAS AF_UNIX.** TCP was adopted at 0.3.0 because agnos had a TCP stack and no AF_UNIX —
+reuse, not design. This restores the original primitive on the host and pairs it with the sovereign one.
+
+⛔ `setu_listen` **unlinks the path before binding.** An AF_UNIX node outlives its process, so a
+compositor killed without a clean shutdown leaves it behind and every later bind fails `EADDRINUSE` —
+the same "run 2 hosts nothing and looks perfectly healthy" failure the leaked TCP listener had. The fix
+belongs at bind time, not in a shutdown path a crash skips.
+
+⛔ **`sys_read` in the poll paths was a real bug on Linux too** — it blocks on a blocking fd, so a poll
+documented as "never stalls" stalled the frame loop whenever no input was pending. Both polls now use
+`MSG_DONTWAIT` per call, leaving the fd blocking so `setu_read_blk` can still block.
+
+### Changed — `setu_read_msg` has NO `#ifdef` any more
+
+Both arms are record transports, so one record is one message on both and the function has **one body**.
+The two targets can no longer drift on framing — which is the entire class of bug that caused three
+consecutive releases. `setu_write_all` applies the same one-record rule on both arms, and
+`setu_read_exact` now refuses on both (a stream idiom with no meaning on either transport).
+
+### Added — `scripts/check-no-tcp-on-agnos.sh`, gated in CI
+
+Strips every `#ifndef CYRIUS_TARGET_AGNOS` block and fails if any TCP symbol remains in agnos-active
+code. ⭐ It caught a real remnant on its first run — `var SETU_TCP_PORT = 7700` was still compiled on
+agnos — so it is not vacuous. **A claim in a changelog is not a property of the code; this makes it one.**
+
+### Added — `programs/unix_transport_test.cyr`, a real wire test
+
+`reach_test` proves the surface links; `client_test` proves the codec round-trips in memory. Neither
+opens a socket. This one binds, connects, accepts, and exchanges framed messages in **both** directions
+in a single process (AF_UNIX `connect()` completes against a listening socket before `accept()`).
+
+⭐ **The load-bearing assertion is record framing.** Two writes of 24 and 16 bytes must come back as two
+reads of exactly 24 and 16 — no coalescing, no splitting. **Negative control run before trusting it:**
+with `SOCK_STREAM` substituted, the test fails `rec1 read len got=40 want=24` and then hangs waiting for
+a record that never arrives (exit 124). Everything else in the test passes on `SOCK_STREAM`.
+
+### Fixed — stale comments that described the deleted transport
+
+The file banner and three call-site comments still documented TCP-on-loopback, `net.cyr` routing, and
+"pending the anu migration". ⛔ Not cosmetic: 0.8.1's own changelog names a stale comment as the reason
+0.8.0's bug survived review, and these were still present three cuts later. `aethersafha` carried the
+same rot — a comment reading "ON agnos THE COMPOSITOR NO LONGER LISTENS" sat directly above code that
+still opened loopback:7700.
+
+### Fixed — the raw socket syscall numbers were x86-only
+
+⛔ **AN UNGUARDED SYSCALL NUMBER IS A SILENT MIS-DISPATCH, NOT A BUILD ERROR.** The first cut of the
+AF_UNIX arm hardcoded the x86_64 Linux numbers (41/42/43/45/49/50/87). On aarch64 Linux, 41 is not
+`socket` — the call would simply do something else, at runtime, with no diagnostic.
+
+⚠ **The aarch64 backend does NOT rescue this.** `ESYSXLAT` is the macOS Linux→BSD translation table and
+contains no socket numbers at all — only read/write/open/close/mmap/mprotect/munmap/lseek/exit/execve.
+
+Now split on `CYRIUS_ARCH_X86` / `CYRIUS_ARCH_AARCH64`. `unlink` is a **function**, not a constant,
+because aarch64 Linux has no `unlink(2)` — only `unlinkat(AT_FDCWD, path, 0)`, a different arity that a
+shared number cannot express.
+
+⚠ **`lib/net.cyr` has this exact defect and it is an open cyrius ticket**
+(`2026-07-30-net-cyr-x86-only-socket-syscall-numbers.md`). Imitating its shape would have imported its
+bug — the case for reading a dependency's issue list before copying its patterns.
+
+⚠ Consumers (`aethersafha`, `crab`) hold a TEMP `path = "../setu"` override until this is tagged.
+
 ## [0.8.3] — 2026-08-07 — 0.8.2 broke every Linux consumer, and CI could not see it
 
 ⛔ **`sys_uptime_ms` EXISTS ONLY ON AGNOS, AND 0.8.2 READ IT OUTSIDE THE `#ifdef`.** The wall-clock

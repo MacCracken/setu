@@ -1,0 +1,102 @@
+# programs/unix_transport_test.cyr — a REAL AF_UNIX/SOCK_SEQPACKET round-trip on Linux.
+#
+# ⛔ WHY THIS EXISTS. `reach_test.cyr` proves the transport surface LINKS; it never opens a socket.
+# `client_test.cyr` proves the CODEC round-trips in memory; it never touches the wire. Neither would
+# notice if `setu_listen` bound the wrong family, if `setu_accept` never returned a client, or — the
+# one that matters — if the transport silently behaved like a STREAM instead of a record channel.
+#
+# ⭐ THE LOAD-BEARING ASSERTION IS RECORD FRAMING (below). Everything else here would also pass on
+# SOCK_STREAM. Two sends of different sizes must come back as TWO reads of exactly those sizes, with
+# no coalescing and no splitting. That is the property the whole setu framing design rests on, and it
+# is the property that, when it was absent on the agnos arm, cost three consecutive releases.
+#
+# Single process: AF_UNIX `connect()` completes against a listening socket without the peer having
+# called `accept()` yet (the connection sits in the backlog), so no fork is needed to have both ends.
+
+include "src/lib.cyr"
+
+var fails = 0;
+
+fn ck(what, got, want) {
+    if (got != want) {
+        sys_write(1, "unix_transport_test: FAIL ", 26);
+        sys_write(1, what, strlen(what));
+        sys_write(1, " got=", 5); print_num(got);
+        sys_write(1, " want=", 6); print_num(want);
+        sys_write(1, "\n", 1);
+        fails = fails + 1;
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    #ifdef CYRIUS_TARGET_AGNOS
+    # agnos has no AF_UNIX and needs none — clients are PLACED on an endowed channel end. Nothing to
+    # exercise here; the agnos transport is covered by the kernel's own ring-3 exerciser (chanx).
+    sys_write(1, "unix_transport_test: SKIP (agnos has no AF_UNIX; clients are placed)\n", 68);
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var path = "/tmp/setu-unix-transport-test.sock";
+
+    var sfd = setu_listen(path);
+    if (sfd < 0) { sys_write(1, "unix_transport_test: FAIL listen\n", 33); return 1; }
+
+    var cfd = setu_connect(path);
+    if (cfd < 0) { sys_write(1, "unix_transport_test: FAIL connect\n", 34); return 1; }
+
+    var afd = setu_accept(sfd);
+    if (afd < 0) { sys_write(1, "unix_transport_test: FAIL accept\n", 33); return 1; }
+
+    # --- a real framed message, client -> server ---
+    var sent = setu_send(cfd, setu_create_surface(320, 200, 0));
+    ck("send rc", sent > 0, 1);
+    var got = setu_msg_new();
+    var rl = setu_read_msg(afd, got);
+    ck("read_msg rc", rl > 0, 1);
+    ck("kind", setu_msg_kind(got), SETU_CREATE_SURFACE);
+    ck("arg0 w", setu_msg_arg(got, 0), 320);
+    ck("arg1 h", setu_msg_arg(got, 1), 200);
+
+    # --- and server -> client, so both directions are proven ---
+    ck("reply rc", setu_send(afd, setu_surface_created(77)) > 0, 1);
+    var back = setu_msg_new();
+    ck("reply read", setu_read_msg(cfd, back) > 0, 1);
+    ck("reply kind", setu_msg_kind(back), SETU_SURFACE_CREATED);
+    ck("reply sid", setu_msg_arg(back, 0), 77);
+
+    # ⭐⭐ THE RECORD-BOUNDARY ASSERTION — the reason this file exists.
+    # Two writes of DIFFERENT sizes, then two reads. On SOCK_SEQPACKET each read returns exactly one
+    # record. On SOCK_STREAM the first read would return all 40 bytes coalesced and the second would
+    # block — which is precisely the stream-vs-record confusion that broke the agnos arm.
+    var a = alloc(64);
+    var b = alloc(64);
+    var i = 0;
+    while (i < 24) { store8(a + i, 65 + (i % 26)); i = i + 1; }   # 24-byte record
+    i = 0;
+    while (i < 16) { store8(b + i, 97 + (i % 26)); i = i + 1; }   # 16-byte record
+    ck("rec1 write", sys_write(cfd, a, 24), 24);
+    ck("rec2 write", sys_write(cfd, b, 16), 16);
+    var r1 = alloc(128);
+    var r2 = alloc(128);
+    ck("rec1 read len", setu_read_blk(afd, r1, 128), 24);   # NOT 40 — no coalescing
+    ck("rec2 read len", setu_read_blk(afd, r2, 128), 16);
+    ck("rec1 byte0", load8(r1), 65);
+    ck("rec2 byte0", load8(r2), 97);
+
+    sys_close(afd);
+    sys_close(cfd);
+    sys_close(sfd);
+
+    if (fails != 0) { sys_write(1, "unix_transport_test: FAILED\n", 28); return 1; }
+    var ok = "unix_transport_test: PASS (AF_UNIX SOCK_SEQPACKET: connect/accept,\n";
+    sys_write(1, ok, strlen(ok));
+    var ok2 = "  both directions, RECORD boundaries preserved)\n";
+    sys_write(1, ok2, strlen(ok2));
+    return 0;
+    #endif
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
