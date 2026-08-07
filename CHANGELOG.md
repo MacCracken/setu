@@ -6,6 +6,61 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.2] — 2026-08-07 — `setu_read_msg` was still stream-shaped on a record transport
+
+⛔ **THE HANDSHAKE READ NEVER MOVED OFF THE STREAM SHAPE.** 0.8.0/0.8.1 converted `setu_connect`,
+`setu_write_all`, `setu_read_blk` and both poll paths — but `setu_read_msg` still opened with
+`setu_read_exact(fd, buf, 16)` to peek a header, then read the remainder in a second call. That is a
+**byte-stream** idiom, and on the channel band `setu_read_exact` is the one function whose agnos arm
+deliberately *refuses* (`0 - 6`). So every agnos client that awaited `SURFACE_CREATED` failed at the
+first read, immediately, with the reply already sitting in its inbox.
+
+A record transport delivers all-or-nothing per SEND, so the header/body split has nothing to buy:
+
+    var r = setu_read_blk(fd, buf, 128);      # one record == one message
+    if (r <= 0) { return 0 - 6; }
+    return setu_decode(buf, r, msg_out);
+
+⛔ **`sys_sleep_ms` removed from `setu_read_blk`'s agnos retry.** It is the `preempt_disable; sti; hlt`
+spin ipc.md §9.4 names as the poison that made TCP toxic: a client blocking for `SURFACE_CREATED`
+starved the **compositor** that had to send it. Replaced with a preemptible spin under a wall-clock
+`sys_uptime_ms()` deadline — the retry counter alone timed out in ~0.1 s, which is not a block at all.
+
+⚠ **How it hid for a whole debugging session.** `present_probe` presented fine, because it never calls
+`setu_read_msg` on that path — so "one client works, the other doesn't" read as a *compositor* bug and
+sent the search into the kernel. Kernel tracing proved the reply was sent and never received; the
+client-side read was the last place looked. A partial cutover is diagnosed by whichever consumer
+happens to exercise the unconverted function.
+
+⚠ **And a dep-resolution trap doubled the cost.** `cyrius build` re-resolves `[deps]` and **overwrites**
+the consumer's `lib/setu.cyr` from the pinned tag — so hand-patching a consumer's materialized copy to
+add a diagnostic is silently reverted before the compiler ever sees it. Several instrumented runs were
+therefore vacuous: they measured tag 0.8.1 while appearing to measure the fix. Verify a materialized lib
+**after** the build, not before, or use a `path` override.
+[[reference_never_fix_in_materialized_libs]] · [[reference_path_override_disables_the_tag_as_a_test]]
+
+Proven on agnos 1.56.40 under QEMU `-smp 4`: two independent clients (`present_probe` + `crab`)
+connect over endowed channels and both present — `presented: 2`, framebuffer-confirmed at 3500
+client-coloured pixels.
+
+### Changed — `cyrius.cyml` single-sources the version from `VERSION`
+
+`version` was a hardcoded `"0.8.1"` string while `release.yml` states in its own log line that
+*"cyrius.cyml pulls from VERSION via ${file:VERSION}"*. It did not. The release gate only compares
+`VERSION` to the tag, so the manifest could sit a cut behind with **CI green** — and it did. Now
+`version = "${file:VERSION}"`, which makes the workflow's claim true and leaves one source of truth.
+`README.md`'s version line was three cuts stale (`0.7.2`) and is corrected to match.
+
+### Known issue — `dist/setu.deps` is not a dep contract
+
+⚠ The sidecar emits **8** stdlib leaves; setu needs **12** (`result`, `net`, `chrono`, `args` are
+missing). Measured, not assumed: it ignores the declared `[deps] stdlib` entirely (removing `assert`
+from the declaration leaves it in the sidecar) and it also misses directly-referenced symbols
+(`tcp_socket`, `is_ok`, `sys_sleep_ms`, `getenv` all appear at top level in `src/client.cyr`).
+**Consumers must take the twelve from `cyrius.cyml`, not from the sidecar** — `args` in particular,
+since the agnos `getenv` delegates to `args_agnos.cyr`'s `_agnos_getenv`. Filed as a cyrius defect:
+[`2026-08-07-distlib-deps-sidecar-under-reports.md`](docs/development/issues/2026-08-07-distlib-deps-sidecar-under-reports.md).
+
 ## [0.8.1] — 2026-08-06 — the cutover missed both poll paths
 
 ⛔ **0.8.0 CUT OVER THE RECORD AND STREAM HALVES AND LEFT THE POLL HALF ON `sys_read`.**

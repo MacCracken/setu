@@ -1,6 +1,6 @@
 [package]
 name = "setu"
-version = "0.8.1"
+version = "${file:VERSION}"
 description = "setu (सेतु — bridge) — the AGNOS native display-protocol CONTRACT lib: the dhancha client <-> aethersafha compositor wire. Carries ONLY pixel/input/surface-lifecycle message TYPES + a pure, allocation-light wire CODEC (encode/decode of little-endian i64 frames). No I/O in the lib — transport lives on each side. AGENT-FREE by construction: no agent/MCP concepts ride this plane (those ride a separate bote/t-ron/daimon endpoint). Consumed by both aethersafha (server) and dhancha (client)."
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/setu"

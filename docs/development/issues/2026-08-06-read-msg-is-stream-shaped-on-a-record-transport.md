@@ -1,6 +1,12 @@
 # `setu_read_msg` reads a header then a body — which cannot work on a record transport
 
-**Status:** 🔴 **OPEN — blocks the agnos desktop (agnos 1.56.40 bite 7).** Filed 2026-08-06.
+**Status:** ✅ **FIXED — shipped in setu 0.8.2 (2026-08-07).** Filed 2026-08-06.
+⭐ `setu_read_msg`'s agnos arm is now one `setu_read_blk` + `setu_decode` (one record == one message);
+`setu_read_blk`'s `sys_sleep_ms` retry is gone, replaced by a preemptible spin under a `sys_uptime_ms()`
+deadline. **agnos 1.56.40 bite 7 is proven on top of it**: two clients (`present_probe` + `crab`) both
+present under QEMU `-smp 4` — `presented: 2`, framebuffer-confirmed.
+⚠ **Consumers repin to `0.8.2`.** `crab` and `aethersafha` carry a TEMP `path = "../setu"` override in
+`cyrius.cyml` until the tag exists; both revert to `tag = "0.8.2"` the moment it does.
 **Affects:** setu 0.8.0, 0.8.1 (the channel-band cutover) on agnos only. Linux is unaffected.
 **Severity:** High — every setu handshake fails on agnos. The client connects, sends, and the
 compositor cannot read what it sent.
