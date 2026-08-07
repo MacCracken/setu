@@ -911,9 +911,20 @@ fn setu_connect(path): i64 {
     # ⛔ THE FLOOR IS ENFORCED, NOT DOCUMENTED. A client built against this must REFUSE on a kernel
     # without `#97` rather than appear to work — §9.9's last kill criterion names exactly that, and
     # `CH_CAPS` is what makes it checkable. `path` is now advisory (there is no namespace to look up).
-    if (setu_chan_floor_ok() == 0) { setu_conn_err = 0 - 8; return 0 - 8; }
+    # ⛔ DISTINCT ASCII STRINGS, NOT RETURN CODES. Three procs share one console unserialised on agnos,
+    # so a numeric code printed by the caller lands mid-line inside another proc's output and is
+    # unreadable. That cost several diagnostic cycles: the failure was inferred from silence instead of
+    # read. Each branch says what it is, in bytes that survive interleaving.
+    if (setu_chan_floor_ok() == 0) {
+        sys_write(1, "setu: refusing, kernel has no usable chan band\n", 46);
+        setu_conn_err = 0 - 8; return 0 - 8;
+    }
     var afd = setu_chan_announced_fd();
-    if (afd < 0) { setu_conn_err = 0 - 9; return 0 - 9; }
+    if (afd < 0) {
+        sys_write(1, "setu: refusing, AGNOS_CHAN absent or malformed\n", 46);
+        setu_conn_err = 0 - 9; return 0 - 9;
+    }
+    sys_write(1, "setu: connected on an endowed channel\n", 38);
     return afd;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
@@ -1082,8 +1093,13 @@ fn setu_poll_input(fd, msg_out): i64 {
     # was not, which is what makes a partial cutover worse than none: the working paths hide it.
     var r = sys_chan_recv(fd, buf, cap);
     if (r == 0 - CH_E_WOULDBLOCK) { return 0; }    # nothing this frame — the common case
-    if (r == 0 - CH_E_PEERGONE) { return 0 - 6; }
-    if (r < 0) { return 0 - 6; }
+    # ⛔ SAY WHICH. Collapsing every negative into -6 hid the actual cause for several cycles: the
+    # caller could not tell "peer gone" from "bad fd" from "record did not fit", which are three
+    # different bugs in three different places.
+    if (r == 0 - CH_E_PEERGONE) { sys_write(1, "setu: poll, peer gone\n", 22); return 0 - 6; }
+    if (r == 0 - CH_E_BADFD) { sys_write(1, "setu: poll, bad fd\n", 19); return 0 - 6; }
+    if (r == 0 - CH_E_ARG) { sys_write(1, "setu: poll, record did not fit\n", 31); return 0 - 6; }
+    if (r < 0) { sys_write(1, "setu: poll, other error\n", 24); return 0 - 6; }
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     var r = sys_read(fd, buf, cap);        # Linux: 0 = would-block/EOF, -1 = error
@@ -1097,6 +1113,16 @@ fn setu_poll_input(fd, msg_out): i64 {
 # Read EXACTLY `n` bytes from `fd` into `buf`, looping over short/would-block
 # reads. Returns `n` (>= 0) or -6 on EOF/error.
 fn setu_read_exact(fd, buf, n): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    # ⛔ "READ EXACTLY N BYTES" HAS NO MEANING ON A RECORD CHANNEL, and emulating it would re-import
+    # the message-boundary problem the band was chosen to delete. Refuse rather than adapt.
+    # ⚠ The only caller on this path is the INLINE-pixel branch of the compositor's handshake
+    # (`buf_id <= 0`), which agnos clients do not take — they present through shm. If this ever fires
+    # on agnos it means a client tried to stream a surface down the control channel, and failing here
+    # is the correct, loud answer.
+    return 0 - 6;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var got = 0;
     while (got < n) {
         var r = setu_read_blk(fd, buf + got, n - got);
@@ -1104,6 +1130,7 @@ fn setu_read_exact(fd, buf, n): i64 {
         got = got + r;
     }
     return got;
+    #endif
 }
 
 # Read ONE full setu frame from `fd` into `msg_out` using length-from-header
@@ -1112,6 +1139,31 @@ fn setu_read_exact(fd, buf, n): i64 {
 # (not setu_recv) when reading a continuous stream of frames — the input path.
 fn setu_read_msg(fd, msg_out): i64 {
     var buf = alloc(128);
+    #ifdef CYRIUS_TARGET_AGNOS
+    # ⭐ ONE RECORD IS ONE MESSAGE. No header-then-body split, because there is nothing to split: the
+    # channel delivers the whole frame or nothing, and the length it returns IS the frame length.
+    #
+    # ⛔ THE STREAM SHAPE BELOW COULD NOT WORK HERE, AND FAILED SILENTLY FOR TWO RELEASES. Reading 16
+    # bytes of header first asks for a PREFIX of a record. The agnos kernel used to truncate to the
+    # caller's buffer and advance past the remainder, so the header read consumed the ENTIRE message
+    # and the body read then found nothing — surfacing as an unexplained handshake failure inside
+    # aethersafha, two layers and one repo from the cause. (agnos 1.56.40 now returns -CH_E_ARG and
+    # leaves the record queued, which makes the same mistake loud instead of silent — but the fix is
+    # to stop making it.)
+    #
+    # ⚠ Read into the FULL buffer, then trust the returned length. Asking for less than a record is
+    # the bug; asking for more is fine.
+    # ⛔ AND IT MUST STILL BLOCK. The first cut of this arm returned -6 on WOULD_BLOCK, which silently
+    # dropped the retry the stream version got from `setu_read_exact` -> `setu_read_blk`. The handshake
+    # is three messages; the caller reaches this for ATTACH and COMMIT *before the client has sent
+    # them*, so a non-retrying read fails every time the peer is merely a few microseconds behind.
+    # `setu_read_blk` already owns the retry-with-yield policy and, on agnos, already reads ONE record
+    # per attempt — so the record shape and the blocking shape compose here rather than conflicting.
+    var r = setu_read_blk(fd, buf, 128);
+    if (r <= 0) { return 0 - 6; }
+    return setu_decode(buf, r, msg_out);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     if (setu_read_exact(fd, buf, 16) < 0) { return 0 - 6; }
     var argc = setu_get_i64(buf, 8);
     if (argc < 0) { return 0 - 6; }
@@ -1121,6 +1173,7 @@ fn setu_read_msg(fd, msg_out): i64 {
         if (setu_read_exact(fd, buf + 16, total - 16) < 0) { return 0 - 6; }
     }
     return setu_decode(buf, total, msg_out);
+    #endif
 }
 
 # =========================================================================
