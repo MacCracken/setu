@@ -1,0 +1,79 @@
+# programs/reach_test.cyr — force EVERY transport entry point to be REACHABLE, on both targets.
+#
+# ⛔ WHY THIS EXISTS, AND WHY `smoke.cyr` DOES NOT COVER IT. smoke.cyr proves the include chain parses
+# and links, but it calls nothing — so cycc's DCE marks the whole client surface unreachable, and an
+# undefined function inside it is demoted from an ERROR to `warning: undefined function`. setu 0.8.2
+# shipped exactly that: `setu_read_blk` read `sys_uptime_ms` (which exists ONLY in
+# `syscalls_x86_64_agnos.cyr`) outside its `#ifdef` arm. Both setu targets built green. The first
+# consumer that actually reached the function — crab, on Linux — got
+# `error: refusing to emit binary with 1 reachable undefined function(s)`.
+#
+# ⛔ A TARGET-ONLY SYMBOL IS INVISIBLE UNTIL SOMETHING MAKES IT REACHABLE. Building the lib on both
+# targets is NOT the test; being CALLED on both targets is. This program is that test.
+# [[reference_target_arm_contract_bugs_are_invisible_offtarget]]
+#
+# ⚠ NOTHING HERE IS MEANT TO RUN. The calls sit behind `argc() > 99`, which is false in every real
+# invocation but NOT provably false at compile time — so the call sites stay reachable for DCE while
+# the process never touches a socket, a channel, or an fd. The binary is built, not executed; the gate
+# is the compiler's undefined-symbol refusal.
+
+include "src/lib.cyr"
+
+fn touch_transport(): i64 {
+    var buf = alloc(256);
+    var m = setu_msg_new();
+    var fd = 3;
+
+    setu_connect("/nonexistent");
+    setu_listen("/nonexistent");
+    setu_accept(fd);
+    # ⚠ These two are agnos-only BY DESIGN — they live inside `#ifdef CYRIUS_TARGET_AGNOS` in
+    # client.cyr (the CH_CAPS floor check and the AGNOS_CHAN announcement reader have no Linux
+    # meaning). Gate them the same way, or this program asserts a surface the lib never promised.
+    # ⭐ This gate caught its own test being wrong before it caught anything else — which is the
+    # behaviour you want from a reachability check.
+    #ifdef CYRIUS_TARGET_AGNOS
+    setu_chan_floor_ok();
+    setu_chan_announced_fd();
+    #endif
+    setu_connect_error();
+    setu_connect_rc();
+
+    setu_write_all(fd, buf, 8);
+    setu_send(fd, m);
+    setu_read_blk(fd, buf, 256);
+    setu_read_exact(fd, buf, 16);
+    setu_read_msg(fd, m);
+    setu_recv(fd, m);
+    setu_poll_input(fd, m);
+
+    var c = setu_client_connect("/nonexistent");
+    setu_client_fd(c);
+    setu_client_sid(c);
+    setu_client_request_keys(c);
+    setu_client_request_premultiplied(c);
+    setu_client_present(c, buf, 1, 1);
+    setu_client_recv(c, m);
+    setu_client_poll_input(c, m);
+    setu_client_close(c);
+
+    var b = setu_buf_create(4096);
+    setu_buf_path(b, buf);
+    setu_buf_write(b, buf, 8);
+    setu_buf_read(b, buf, 8);
+    setu_buf_close(b);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    # ⛔ Guarded on argc(), not on a literal: a literal `if (0)` would let the compiler fold the whole
+    # block away and take the reachability — the entire point of this program — with it.
+    if (argc() > 99) { touch_transport(); }
+    var banner = "reach_test: full transport surface is reachable and links clean\n";
+    syscall(SYS_WRITE, 1, banner, strlen(banner));
+    return 0;
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

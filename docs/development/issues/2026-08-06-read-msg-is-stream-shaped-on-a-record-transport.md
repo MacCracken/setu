@@ -1,6 +1,11 @@
 # `setu_read_msg` reads a header then a body — which cannot work on a record transport
 
-**Status:** ✅ **FIXED — shipped in setu 0.8.2 (2026-08-07).** Filed 2026-08-06.
+**Status:** ✅ **FIXED — shipped in setu 0.8.2 (2026-08-07); Linux regression from the same change
+repaired in 0.8.3.** Filed 2026-08-06.
+⚠ The 0.8.2 fix added a wall-clock deadline that read `sys_uptime_ms` — an **agnos-only** symbol —
+outside its `#ifdef`, breaking every Linux consumer. setu's own gates missed it because `smoke.cyr`
+calls nothing, so DCE demoted the undefined function to a warning. 0.8.3 moves the read inside the arm
+and adds `programs/reach_test.cyr` (forces the transport surface reachable) plus an `--agnos` CI build.
 ⭐ `setu_read_msg`'s agnos arm is now one `setu_read_blk` + `setu_decode` (one record == one message);
 `setu_read_blk`'s `sys_sleep_ms` retry is gone, replaced by a preemptible spin under a `sys_uptime_ms()`
 deadline. **agnos 1.56.40 bite 7 is proven on top of it**: two clients (`present_probe` + `crab`) both

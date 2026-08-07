@@ -35,17 +35,37 @@ returned to `cc0874ddb9ba0859356eefdc371d794e` each time, so nothing here change
 
 So the sidecar is a **core subset**, not a derivation of either the declaration or the fold's symbols.
 
-## Why it costs real time
+## ⭐ The sidecar is what drives cyrius's OWN consumer dep check — so a wrong one disables it
 
-`args` is the sharp case. setu's agnos arm calls `getenv` to read `AGNOS_CHAN` (the fd the compositor
-endowed it). On agnos `io.cyr`'s `getenv` **delegates** to `args_agnos.cyr`'s `_agnos_getenv`, because
-agnos has no `/proc`. A consumer that builds its `[deps] stdlib` from the sidecar — which is exactly
-what the sidecar exists for — gets 8 leaves, compiles on Linux, and fails to link `_agnos_getenv` on
-agnos. **Verified against a throwaway consumer built with exactly those 8.**
+This is the part that makes it more than a documentation wart. Measured against a throwaway consumer
+(`vendor/setu.cyr` + a `setu_connect` call), agnos target:
 
-⛔ The failure surfaces in the *consumer*, on the *other target*, as an undefined symbol with no
-pointer back to the sidecar that caused it. A wrong list that looks authoritative is worse than no
-list: it is what a reader checks *instead of* the declaration.
+| dep sidecar | consumer declares | result |
+|---|---|---|
+| **corrected (12)** | 8 | ⭐ **hard error** — `dep setu requires 'chrono' but it is not in the cyrius stdlib`, `... requires 'args' ...`, `1 deps resolved, 3 errors` |
+| **raw distlib (8)** | 8 | ⛔ **`OK`** — builds clean, no error, no warning |
+| raw distlib (8) | 8, **Linux** target | ⛔ `OK`, with only `warning: undefined function 'sys_uptime_ms'` |
+
+So `cyrius deps` *does* validate a consumer's `[deps] stdlib` against the dep's sidecar — correctly and
+loudly. The under-reporting sidecar simply tells it there is nothing to complain about. **A wrong
+sidecar does not merely mislead a human reader; it switches off the machine check that exists to catch
+this exact mistake.**
+
+⚠ **Correction to an earlier framing.** This was first written up as "compiles on Linux, fails to link
+`_agnos_getenv` on agnos". The measured behaviour above is different and worse: the agnos build
+succeeds *silently*, and Linux downgrades the missing symbol to a warning. Nothing fails at the point
+of the mistake.
+
+`args` remains the sharp case: setu's agnos arm calls `getenv` to read `AGNOS_CHAN` (the fd the
+compositor endowed it), and on agnos `io.cyr`'s `getenv` **delegates** to `args_agnos.cyr`'s
+`_agnos_getenv` because agnos has no `/proc`.
+
+## What setu does about it in the meantime
+
+setu 0.8.2 ships `scripts/sync-deps-sidecar.sh`, which rewrites `dist/setu.deps` from the declared
+`[deps] stdlib` after every `cyrius distlib`, and a CI step that fails if the two drift. setu owns
+`dist/`, so setu states the truth there rather than waiting on a fix in another repo. Consumers of
+setu are therefore protected today — the machine check is back on for them.
 
 ## Ask
 
@@ -53,8 +73,11 @@ Either make `distlib` emit the declared `[deps] stdlib` verbatim (simplest, and 
 actually need), or make it a real transitive symbol closure that follows cross-module delegation like
 `io.getenv` → `args._agnos_getenv`. Until then the header comment overstates it.
 
-## Interim rule for consumers
+## Interim rule for OTHER libs' consumers
 
-⚠ **Treat `dist/*.deps` as a starting point, never a contract.** Take the lib's own `[deps] stdlib`
-from its `cyrius.cyml`. setu 0.8.2 consumers need all twelve, and `args` in particular must not be
-dropped from `aethersafha` or `crab`.
+⚠ **Treat `dist/*.deps` as a starting point, never a contract** — for every lib except setu, which now
+corrects its own. Take the lib's `[deps] stdlib` from its `cyrius.cyml`. ⛔ And do not read a clean
+build as evidence the list is complete: the table above shows an under-declared consumer building `OK`.
+
+⚠ Any lib that vendors a fold and is consumed on agnos has the same hole. The one-line check is
+`grep -vc '^#' dist/<lib>.deps` against the count in its `[deps] stdlib`.

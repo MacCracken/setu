@@ -285,7 +285,17 @@ fn setu_read_blk(fd, buf, cap): i64 {
     # magnitude: ~1e8 increments is ~0.1 s where the old sleep gave ~10 s, so a client gave up on
     # `surface_created` about a hundred times too early. The compositor was replying; nobody was left
     # listening. An iteration count silently means a different duration on every machine.
-    var deadline = sys_uptime_ms() + 8000;
+    # ⛔ THE DEADLINE IS READ INSIDE THE AGNOS ARM, NOT HOISTED. `sys_uptime_ms` exists ONLY in
+    # `syscalls_x86_64_agnos.cyr` — there is no Linux definition. Declared here (both targets need the
+    # slot) but only ASSIGNED under `#ifdef`, so the Linux build never references the symbol.
+    # ⚠ 0.8.2 hoisted the call and shipped: setu's own smoke does not REACH `setu_read_blk`, so cycc
+    # demoted it to `warning: undefined function` and the lib built green on both targets. The first
+    # consumer that actually calls it (crab) got `error: refusing to emit binary with 1 reachable
+    # undefined function(s)`. A target-only symbol is invisible until something makes it reachable.
+    var deadline = 0;
+    #ifdef CYRIUS_TARGET_AGNOS
+    deadline = sys_uptime_ms() + 8000;
+    #endif
     var tries = 0;
     while (tries <= 5000) {
         #ifdef CYRIUS_TARGET_AGNOS

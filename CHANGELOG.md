@@ -6,6 +6,47 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.3] — 2026-08-07 — 0.8.2 broke every Linux consumer, and CI could not see it
+
+⛔ **`sys_uptime_ms` EXISTS ONLY ON AGNOS, AND 0.8.2 READ IT OUTSIDE THE `#ifdef`.** The wall-clock
+deadline added to `setu_read_blk` was hoisted to the top of the function, so the Linux build
+referenced a symbol that has no Linux definition (`syscalls_x86_64_agnos.cyr:1090` is the only one).
+`deadline` is now declared unconditionally and **assigned only under `#ifdef CYRIUS_TARGET_AGNOS`**.
+
+⛔ **AND SETU'S OWN GATES SAID GREEN.** `smoke.cyr` links the include chain but *calls nothing*, so
+cycc's DCE marked the entire client surface unreachable and demoted the undefined function to
+`warning: undefined function`. Both setu targets built clean and 0.8.2 was tagged. The first consumer
+that actually reached it — `crab`, on Linux — got
+`error: refusing to emit binary with 1 reachable undefined function(s)`.
+
+### Added — `programs/reach_test.cyr`, a reachability gate
+
+Calls **every** public transport entry point (connect/listen/accept, write_all/send, read_blk/
+read_exact/read_msg/recv/poll_input, the whole `setu_client_*` surface, and `setu_buf_*`) behind an
+`argc() > 99` guard: false in every real invocation, **not provably false at compile time**, so the
+call sites stay reachable for DCE while nothing executes. The gate is the compiler's undefined-symbol
+refusal, not a runtime assertion.
+
+⚠ A literal `if (0)` would be folded away and take the reachability — the entire point — with it.
+
+**Negative control, run before trusting it.** With 0.8.2's hoist restored: `smoke.cyr` on Linux → `OK`
+(missed it); `reach_test.cyr` on Linux → `FAIL`. With the fix: `OK`. The gate also caught *its own
+first draft* being wrong — `setu_chan_floor_ok` / `setu_chan_announced_fd` are agnos-only by design
+(they live inside `#ifdef` in `client.cyr`), so calling them unguarded asserted a surface the lib never
+promised. Now gated the same way.
+
+### Added — CI builds the `--agnos` target
+
+⛔ **CI BUILT ONLY LINUX, AND SETU'S AGNOS ARM IS THE ONE THAT MATTERS.** Three consecutive cuts shipped
+agnos-arm defects through a green pipeline: **0.8.0** left both poll paths on `sys_read`, **0.8.1** left
+`setu_read_msg` stream-shaped, **0.8.2** hoisted an agnos-only symbol. A pipeline that never builds the
+target cannot be evidence about it. `smoke.cyr` and every `programs/*_test.cyr` now build under
+`--agnos`. They cannot be *run* — no agnos host — but each of those three defects was compile- or
+link-visible on that arm, so the build is a sufficient gate.
+
+⚠ **The three-in-a-row is the signal, not the individual bugs.** Each was found by a downstream
+consumer rather than by setu, which is what a missing target gate looks like from the inside.
+
 ## [0.8.2] — 2026-08-07 — `setu_read_msg` was still stream-shaped on a record transport
 
 ⛔ **THE HANDSHAKE READ NEVER MOVED OFF THE STREAM SHAPE.** 0.8.0/0.8.1 converted `setu_connect`,
@@ -51,14 +92,28 @@ client-coloured pixels.
 `version = "${file:VERSION}"`, which makes the workflow's claim true and leaves one source of truth.
 `README.md`'s version line was three cuts stale (`0.7.2`) and is corrected to match.
 
-### Known issue — `dist/setu.deps` is not a dep contract
+### Fixed — `dist/setu.deps` is a dep contract again, and it re-arms a machine check
 
-⚠ The sidecar emits **8** stdlib leaves; setu needs **12** (`result`, `net`, `chrono`, `args` are
-missing). Measured, not assumed: it ignores the declared `[deps] stdlib` entirely (removing `assert`
-from the declaration leaves it in the sidecar) and it also misses directly-referenced symbols
-(`tcp_socket`, `is_ok`, `sys_sleep_ms`, `getenv` all appear at top level in `src/client.cyr`).
-**Consumers must take the twelve from `cyrius.cyml`, not from the sidecar** — `args` in particular,
-since the agnos `getenv` delegates to `args_agnos.cyr`'s `_agnos_getenv`. Filed as a cyrius defect:
+⛔ **A WRONG SIDECAR DOES NOT JUST MISLEAD A READER — IT SWITCHES OFF `cyrius deps`' OWN VALIDATION.**
+`cyrius distlib` emits **8** stdlib leaves where setu declares **12**, dropping `result`, `net`,
+`chrono`, `args`. Measured against a throwaway consumer on the agnos target:
+
+| sidecar | consumer declares | result |
+|---|---|---|
+| corrected (12) | 8 | ⭐ hard error — `dep setu requires 'chrono' but it is not in the cyrius stdlib` |
+| raw distlib (8) | 8 | ⛔ **`OK`** — builds clean, no error, no warning |
+
+`cyrius deps` validates a consumer's `[deps] stdlib` against the dep's sidecar correctly and loudly.
+The under-reporting sidecar simply tells it there is nothing to complain about. So the consequence is
+not "a human might read the wrong list" — it is that the check built to catch this mistake was off.
+
+setu now ships **`scripts/sync-deps-sidecar.sh`**, which rewrites `dist/setu.deps` from the declared
+`[deps] stdlib` after every `cyrius distlib`, plus a **CI gate** that fails on drift. setu owns
+`dist/`, so setu states the truth there rather than waiting on another repo. ⚠ `distlib` overwrites
+the sidecar, so the sync script must run **after** it — that ordering is why this is a gate and not a
+one-time edit.
+
+Root defect filed against cyrius (both repos):
 [`2026-08-07-distlib-deps-sidecar-under-reports.md`](docs/development/issues/2026-08-07-distlib-deps-sidecar-under-reports.md).
 
 ## [0.8.1] — 2026-08-06 — the cutover missed both poll paths

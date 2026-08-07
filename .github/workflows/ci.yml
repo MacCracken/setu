@@ -80,6 +80,24 @@ jobs:
           fi
           echo "dist/setu.cyr matches src/"
 
+      - name: Verify dep sidecar states the DECLARED stdlib
+        # ⛔ `cyrius distlib` (run in the step above) OVERWRITES dist/setu.deps with a fixed core
+        # subset — 8 leaves where setu declares 12, dropping result/net/chrono/args. Measured: a
+        # consumer that declares only those 8 builds "OK" on agnos with NO error, and on Linux emits
+        # merely `warning: undefined function 'sys_uptime_ms'`. A correct sidecar instead makes cyrius
+        # HARD ERROR ("dep setu requires 'chrono'") when a consumer under-declares — so this gate is
+        # what turns a silent breakage into a build failure in the consumer's own repo.
+        # Defect: docs/development/issues/2026-08-07-distlib-deps-sidecar-under-reports.md
+        run: |
+          sh scripts/sync-deps-sidecar.sh
+          if ! git diff --quiet dist/setu.deps; then
+            echo "ERROR: dist/setu.deps does not match [deps] stdlib in cyrius.cyml."
+            echo "Run 'cyrius distlib && sh scripts/sync-deps-sidecar.sh' and commit the result."
+            git --no-pager diff dist/setu.deps
+            exit 1
+          fi
+          echo "dist/setu.deps matches the declared stdlib ($(grep -vc '^#' dist/setu.deps) leaves)"
+
       - name: Build (link-check, DCE on)
         run: |
           mkdir -p build
@@ -89,10 +107,33 @@ jobs:
       - name: Verify ELF
         run: xxd -l 4 build/setu-smoke | grep -q "7f45 4c46"
 
+      - name: Build (agnos target)
+        # ⛔ CI BUILT ONLY LINUX UNTIL 0.8.3, AND setu'S AGNOS ARM IS THE ONE THAT MATTERS. Three
+        # consecutive cuts shipped agnos-arm defects through a green pipeline: 0.8.0 left both poll
+        # paths on `sys_read`, 0.8.1 left `setu_read_msg` stream-shaped, 0.8.2 hoisted `sys_uptime_ms`
+        # (agnos-only) out of its `#ifdef`. None were reachable from Linux CI.
+        # ⚠ These cannot be RUN here — there is no agnos host — so the gate is the BUILD. That is
+        # enough: every defect above was a compile- or link-visible fact on the agnos arm.
+        run: |
+          mkdir -p build
+          cyrius build --agnos programs/smoke.cyr build/setu-smoke_agnos
+          for t in programs/*_test.cyr; do
+            [ -e "$t" ] || continue
+            name=$(basename "$t" .cyr)
+            echo "== --agnos $t =="
+            cyrius build --agnos "$t" "build/${name}_agnos"
+          done
+          echo "agnos target: all programs build"
+
       - name: Test (RUN suites)
         # Every programs/*_test.cyr is a self-checking RUN test: it exercises
         # the codec, asserts round-trip + rejection, and exits non-zero on
         # failure. Globbed so new suites are auto-picked.
+        # ⭐ `reach_test.cyr` is the odd one out: it asserts nothing at runtime. Its value is entirely
+        # at BUILD time — it forces the whole transport surface to be REACHABLE so that an undefined
+        # function in it is a hard error instead of `warning: undefined function`. smoke.cyr calls
+        # nothing, so DCE hid exactly that class. Do not "simplify" it by deleting the argc() guard:
+        # a literal-false guard folds the block away and takes the reachability with it.
         run: |
           mkdir -p build
           for t in programs/*_test.cyr; do
