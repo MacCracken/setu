@@ -57,38 +57,23 @@
 #ifndef CYRIUS_TARGET_AGNOS
 var SETU_UNIX_PATH = "/tmp/setu-display.sock";   # the compositor's rendezvous point on the host
 
-# ⛔ SOCKET SYSCALL NUMBERS ARE PER-ARCH, AND UNGUARDED ONES ARE A SILENT MIS-DISPATCH — NOT A BUILD
-# ERROR. On aarch64 Linux, 41 is not `socket`; the call would simply do something else. The aarch64
-# backend's `ESYSXLAT` does NOT rescue this: it is the macOS Linux→BSD map and contains no socket
-# numbers at all (read/write/open/close/mmap/mprotect/munmap/lseek/exit/execve only).
-# ⚠ `lib/net.cyr` has exactly this defect and it is an OPEN cyrius ticket
-# (`2026-07-30-net-cyr-x86-only-socket-syscall-numbers.md`). Copying its shape would have copied its
-# bug — the reason to read a dependency's issue list before imitating it.
-#ifdef CYRIUS_ARCH_X86
-var NSYS_SOCKET_   = 41;
-var NSYS_CONNECT_  = 42;
-var NSYS_ACCEPT_   = 43;
-var NSYS_RECVFROM_ = 45;
-var NSYS_BIND_     = 49;
-var NSYS_LISTEN_   = 50;
-#endif
-#ifdef CYRIUS_ARCH_AARCH64
-var NSYS_SOCKET_   = 198;
-var NSYS_CONNECT_  = 203;
-var NSYS_ACCEPT_   = 202;
-var NSYS_RECVFROM_ = 207;
-var NSYS_BIND_     = 200;
-var NSYS_LISTEN_   = 201;
-#endif
-
-# ⚠ `unlink` is x86-only: aarch64 Linux has no `unlink(2)`, only `unlinkat(AT_FDCWD, path, 0)`.
-# A shared constant cannot express that, because the ARITY differs — so it is a function, not a number.
-#ifdef CYRIUS_ARCH_X86
-fn setu_un_unlink(path): i64 { return syscall(87, path); }
-#endif
-#ifdef CYRIUS_ARCH_AARCH64
-fn setu_un_unlink(path): i64 { return syscall(35, 0 - 100, path, 0); }   # unlinkat(AT_FDCWD, path, 0)
-#endif
+# ⭐ NO PRIVATE SYSCALL TABLE. `sys_socket` / `sys_connect` / `sys_bind` / `sys_listen` /
+# `sys_accept4` / `sys_recvfrom` / `sys_unlinkat` already exist in the cyrius stdlib
+# (`lib/syscalls_linux_common.cyr`), are per-arch correct, and need no renumber chain.
+#
+# ⛔ THE FIRST CUT OF THIS ARM HARDCODED RAW x86 NUMBERS, AND THE REASONING WAS WRONG TWICE.
+# (1) It concluded "cyrius has no wrappers" after reading `net.cyr` — which indeed has no AF_UNIX —
+#     without checking the syscall PEERS, where every wrapper it needed already lived.
+# (2) It then claimed the aarch64 backend's `ESYSXLAT` had no socket rows, having read the **macho**
+#     block (`emit.cyr:760-773`); the Linux x86-compat socket block is at `:865-873` and does contain
+#     41→198, 42→203, 43→202, 49→200, 50→201.
+# ⚠ Both errors pointed the same way — toward hand-rolling — and the result would have been
+# PARTIALLY correct on aarch64, which is the worst outcome: the five socket numbers are renumbered,
+# but `recvfrom` (45) is not in that block at all, and `unlink` (87) cannot be renumbered on principle
+# because aarch64 Linux has no `unlink(2)` — only `unlinkat(AT_FDCWD, path, 0)`, a different ARITY.
+# A renumber chain rewrites x8; it cannot add an argument.
+# Filed against cyrius: `2026-07-30-net-cyr-x86-only-socket-syscall-numbers.md` §5a and §9.
+var SETU_AT_FDCWD = 0 - 100;
 
 var SETU_AF_UNIX        = 1;
 var SETU_SOCK_SEQPACKET = 5;
@@ -218,9 +203,9 @@ fn setu_connect(path): i64 {
     var sa = alloc(128);
     var alen = setu_un_addr(setu_un_path(path), sa);
     if (alen < 0) { setu_conn_err = 0 - 2; return 0 - 2; }
-    var fd = syscall(NSYS_SOCKET_, SETU_AF_UNIX, SETU_SOCK_SEQPACKET, 0);
+    var fd = sys_socket(SETU_AF_UNIX, SETU_SOCK_SEQPACKET, 0);
     if (fd < 0) { setu_conn_err = 0 - 2; setu_conn_rc = fd; return 0 - 2; }
-    var rc = syscall(NSYS_CONNECT_, fd, sa, alen);
+    var rc = sys_connect(fd, sa, alen);
     if (rc < 0) {
         sys_close(fd);
         setu_conn_err = 0 - 3;
@@ -265,14 +250,14 @@ fn setu_listen(path): i64 {
     var sa = alloc(128);
     var alen = setu_un_addr(up, sa);
     if (alen < 0) { return 0 - 3; }
-    setu_un_unlink(up);                              # ENOENT is fine and expected on a clean start
+    sys_unlinkat(SETU_AT_FDCWD, up, 0);              # ENOENT is fine and expected on a clean start
     # SOCK_NONBLOCK on the LISTEN fd so `setu_accept` polls and the frame loop never stalls.
     # ⚠ Accepted fds do NOT inherit it on Linux — which is what we want: the per-client fd stays
     # blocking for `setu_read_blk`, and the frame-loop polls use MSG_DONTWAIT per call instead.
-    var fd = syscall(NSYS_SOCKET_, SETU_AF_UNIX, SETU_SOCK_SEQPACKET | SETU_SOCK_NONBLOCK, 0);
+    var fd = sys_socket(SETU_AF_UNIX, SETU_SOCK_SEQPACKET | SETU_SOCK_NONBLOCK, 0);
     if (fd < 0) { return 0 - 2; }
-    if (syscall(NSYS_BIND_, fd, sa, alen) < 0) { sys_close(fd); return 0 - 3; }
-    if (syscall(NSYS_LISTEN_, fd, 8) < 0) { sys_close(fd); return 0 - 4; }
+    if (sys_bind(fd, sa, alen) < 0) { sys_close(fd); return 0 - 3; }
+    if (sys_listen(fd, 8) < 0) { sys_close(fd); return 0 - 4; }
     return fd;
     #endif
 }
@@ -286,7 +271,7 @@ fn setu_accept(sfd): i64 {
     return 0 - 5;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    var cfd = syscall(NSYS_ACCEPT_, sfd, 0, 0);
+    var cfd = sys_accept4(sfd, 0, 0, 0);             # == accept(fd, NULL, NULL); bote 3.2.1's swap
     if (cfd >= 0) { return cfd; }
     return 0 - 5;                                    # EAGAIN / no client pending
     #endif
@@ -448,7 +433,7 @@ fn setu_poll_input(fd, msg_out): i64 {
     # `setu_read_blk` can actually block; only the frame-loop poll asks for a non-blocking answer.
     # ⛔ `sys_read` here was a real bug in the old arm too: it BLOCKS on a blocking fd, so a poll that
     # promised "never stalls" stalled the whole frame loop whenever no input was pending.
-    var r = syscall(NSYS_RECVFROM_, fd, buf, cap, SETU_MSG_DONTWAIT, 0, 0);
+    var r = sys_recvfrom(fd, buf, cap, SETU_MSG_DONTWAIT, 0, 0);
     if (r < 0)  { return 0; }              # EAGAIN — nothing this frame (the common case)
     if (r == 0) { return 0 - 6; }          # EOF — peer gone
     #endif
@@ -677,7 +662,7 @@ fn setu_client_poll_input(c, msg_out): i64 {
     #ifndef CYRIUS_TARGET_AGNOS
     # See setu_poll_input: MSG_DONTWAIT keeps the fd blocking for read_blk while this poll returns
     # immediately. EAGAIN maps to the "idle" convention (0) this function already uses.
-    var r = syscall(NSYS_RECVFROM_, load64(c + SETU_C_FD), ib + len, SETU_C_INBUF_CAP - len, SETU_MSG_DONTWAIT, 0, 0);
+    var r = sys_recvfrom(load64(c + SETU_C_FD), ib + len, SETU_C_INBUF_CAP - len, SETU_MSG_DONTWAIT, 0, 0);
     if (r < 0) { r = 0; }
     #endif
     if (r > 0) {

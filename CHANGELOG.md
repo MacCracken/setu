@@ -75,22 +75,33 @@ The file banner and three call-site comments still documented TCP-on-loopback, `
 same rot — a comment reading "ON agnos THE COMPOSITOR NO LONGER LISTENS" sat directly above code that
 still opened loopback:7700.
 
-### Fixed — the raw socket syscall numbers were x86-only
+### Changed — the transport uses the stdlib's per-arch syscall wrappers; setu has no private syscall table
 
-⛔ **AN UNGUARDED SYSCALL NUMBER IS A SILENT MIS-DISPATCH, NOT A BUILD ERROR.** The first cut of the
-AF_UNIX arm hardcoded the x86_64 Linux numbers (41/42/43/45/49/50/87). On aarch64 Linux, 41 is not
-`socket` — the call would simply do something else, at runtime, with no diagnostic.
+`sys_socket` / `sys_connect` / `sys_bind` / `sys_listen` / `sys_accept4` / `sys_recvfrom` /
+`sys_unlinkat` all already exist in `lib/syscalls_linux_common.cyr`, are per-arch correct, and need no
+renumber chain. setu calls those. `sys_accept4(fd, 0, 0, 0)` is defined to be exactly
+`accept(fd, NULL, NULL)` — the same swap bote 3.2.1 shipped for the same reason.
 
-⚠ **The aarch64 backend does NOT rescue this.** `ESYSXLAT` is the macOS Linux→BSD translation table and
-contains no socket numbers at all — only read/write/open/close/mmap/mprotect/munmap/lseek/exit/execve.
+⛔ **THE FIRST CUT OF THIS ARM HARDCODED RAW x86 SYSCALL NUMBERS, ON TWO WRONG CONCLUSIONS.**
+Recorded because the reasoning failure is more reusable than the fix:
 
-Now split on `CYRIUS_ARCH_X86` / `CYRIUS_ARCH_AARCH64`. `unlink` is a **function**, not a constant,
-because aarch64 Linux has no `unlink(2)` — only `unlinkat(AT_FDCWD, path, 0)`, a different arity that a
-shared number cannot express.
+1. *"cyrius has no wrappers for this"* — reached by reading `net.cyr`, which genuinely has no AF_UNIX,
+   and not checking the syscall **peers**, where every needed wrapper already lived.
+2. *"`ESYSXLAT` has no socket rows, so raw x86 numbers break on aarch64"* — reached by reading the
+   **macho** block (`emit.cyr:760-773`). The Linux x86-compat socket block is at `:865-873` and does
+   contain `41→198 · 42→203 · 43→202 · 49→200 · 50→201`.
 
-⚠ **`lib/net.cyr` has this exact defect and it is an open cyrius ticket**
-(`2026-07-30-net-cyr-x86-only-socket-syscall-numbers.md`). Imitating its shape would have imported its
-bug — the case for reading a dependency's issue list before copying its patterns.
+⚠ **Both errors pointed the same way — toward hand-rolling — and would have produced a PARTIALLY
+correct result on aarch64, which is the worst outcome.** Five of the seven numbers are renumbered by
+that block; `recvfrom` (45) is not in it at all, and `unlink` (87) cannot be renumbered on principle,
+because aarch64 Linux has no `unlink(2)` — only `unlinkat(AT_FDCWD, path, 0)`, a different **arity**.
+A renumber chain rewrites `x8`; it cannot add an argument. The working majority would have read as
+evidence the pattern was sound.
+
+Both items are now filed against the root cyrius ticket
+(`2026-07-30-net-cyr-x86-only-socket-syscall-numbers.md` §5a and §9), together with the underlying
+gap: `net.cyr` exposes no `AF_UNIX`, no `SOCK_SEQPACKET`, and no `sockaddr_un` builder, which is why
+both known consumers left the stdlib rather than from any preference for raw syscalls.
 
 ⚠ Consumers (`aethersafha`, `crab`) hold a TEMP `path = "../setu"` override until this is tagged.
 
