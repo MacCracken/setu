@@ -6,6 +6,35 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.1] — 2026-08-06 — the cutover missed both poll paths
+
+⛔ **0.8.0 CUT OVER THE RECORD AND STREAM HALVES AND LEFT THE POLL HALF ON `sys_read`.**
+`setu_poll_input` and `setu_client_poll_input` — every client's **per-frame input poll** — still called
+`sys_read` on what is now a channel fd. A channel fd does not route through `sys_read` at all, so on
+agnos those polls read nothing: **no client would have received a single key or input event.**
+
+⛔ **The comment is what made it survive review.** It read *"agnos: non-blocking (0 = would-block, -1 =
+EOF)"* — accurate for the old TCP fd's stdlib wrapper, and meaningless for a channel. A stale comment
+that describes the transport you just deleted reads as a statement about the code in front of you.
+
+⛔ **And a partial cutover is worse than none, because the working paths hide it.** `present_probe`
+built, `setu_connect` returned, and a send/recv round-trip succeeded — so nothing in the build or the
+smoke said the input leg was dead. Found only by auditing every remaining `sys_read`/`sys_write` in
+`src/` while wiring the compositor side.
+
+Both now use `sys_chan_recv`, mapping `-CH_E_WOULDBLOCK` onto each function's existing "idle" return and
+`-CH_E_PEERGONE` onto its EOF return. The reassembly buffer in `setu_client_poll_input` stays: a record
+is all-or-nothing per SEND, but a client may still need more than one record to complete a frame, and
+the take/partial logic is transport-agnostic.
+
+**Audit result, so the next reader does not redo it:** three `sys_read` calls remain in `src/client.cyr`
+(`setu_read_blk`, `setu_poll_input`, `setu_client_poll_input`) and all three are inside
+`#ifndef CYRIUS_TARGET_AGNOS` arms — verified by walking the preprocessor arms, not by eye. `buf.cyr`'s
+reads and writes are on **files** opened by path (`sys_open`), the Linux shm-file arm — not channel fds,
+correctly untouched.
+
+Both targets build; `dist/setu.cyr` regenerated and idempotent.
+
 ## [0.8.0] — 2026-08-06 — the agnos client no longer dials anything (channel-band cutover, bite 6)
 
 ⭐⭐ **On agnos, `setu_connect` DOES NOT DIAL.** No socket, no connect, no port, no loopback address —

@@ -321,9 +321,22 @@ fn setu_recv(fd, msg_out): i64 {
 fn setu_poll_input(fd, msg_out): i64 {
     var cap = 256;
     var buf = alloc(cap);
-    var r = sys_read(fd, buf, cap);        # agnos: non-blocking (0 = would-block, -1 = EOF)
+    #ifdef CYRIUS_TARGET_AGNOS
+    # ⛔ MISSED BY THE 0.8.0 CUTOVER. This still called `sys_read`, whose comment claimed "agnos:
+    # non-blocking (0 = would-block)" — true of the old TCP fd's stdlib wrapper, and MEANINGLESS for a
+    # channel fd, which does not route through `sys_read` at all. Every client's per-frame input poll
+    # was therefore reading nothing on agnos. The record/stream halves were cut over and the POLL half
+    # was not, which is what makes a partial cutover worse than none: the working paths hide it.
+    var r = sys_chan_recv(fd, buf, cap);
+    if (r == 0 - CH_E_WOULDBLOCK) { return 0; }    # nothing this frame — the common case
+    if (r == 0 - CH_E_PEERGONE) { return 0 - 6; }
+    if (r < 0) { return 0 - 6; }
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var r = sys_read(fd, buf, cap);        # Linux: 0 = would-block/EOF, -1 = error
     if (r == 0) { return 0; }              # nothing buffered → no input this frame
     if (r < 0)  { return 0 - 6; }          # EOF / error
+    #endif
     if (setu_decode(buf, r, msg_out) < 0) { return 0; }   # partial/garbled → skip
     return 1;
 }
@@ -529,7 +542,17 @@ fn setu_client_poll_input(c, msg_out): i64 {
     # A complete frame may already be buffered from the last read — no syscall.
     if (setu__inbuf_take(c, msg_out) == 1) { return 1; }
     var len = load64(c + SETU_C_INLEN);
+    #ifdef CYRIUS_TARGET_AGNOS
+    # ⛔ SAME MISS AS setu_poll_input — see there. A channel fd never routes through `sys_read`.
+    # ⚠ The reassembly buffer below stays: a record is all-or-nothing per SEND, but a CLIENT may still
+    # need more than one record to make a frame, and the take/partial logic is transport-agnostic.
+    var r = sys_chan_recv(load64(c + SETU_C_FD), ib + len, SETU_C_INBUF_CAP - len);
+    if (r == 0 - CH_E_WOULDBLOCK) { r = 0; }       # map to the "idle" convention this function uses
+    if (r == 0 - CH_E_PEERGONE) { r = 0 - 1; }
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var r = sys_read(load64(c + SETU_C_FD), ib + len, SETU_C_INBUF_CAP - len);
+    #endif
     if (r > 0) {
         store64(c + SETU_C_INLEN, len + r);
         if (setu__inbuf_take(c, msg_out) == 1) { return 1; }
