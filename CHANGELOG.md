@@ -29,6 +29,17 @@ wrong the first time).
 Also drops a stale comment claiming the path was *"advisory; transport is loopback:7700"*, which
 predated both the AF_UNIX cutover and this change.
 
+### ⚠ `dist/setu.deps` regenerated with `scripts/sync-deps-sidecar.sh`, not left as distlib wrote it
+
+⛔ **`cyrius distlib` OVERWRITES the sidecar with a fixed core subset** — 8 leaves where setu declares
+12, dropping `result`/`net`/`chrono`/`args`. This cut's distlib run clobbered it and CI caught it, which
+is exactly what that gate exists for: a consumer declaring only the 8 builds "OK" on agnos with no
+error and merely warns `undefined function 'sys_uptime_ms'` on Linux, whereas a correct sidecar makes
+cyrius HARD ERROR in the consumer's own repo.
+⇒ **After any `cyrius distlib` here, run `sh scripts/sync-deps-sidecar.sh` before committing.**
+⚠ Verified stable through CI's exact sequence (distlib → sync → diff), and idempotent.
+⚠ No new leaf was needed for 0.8.5: `getenv` lives in `lib/io.cyr` and `io` was already declared.
+
 ### Changed — toolchain pin 6.5.8 → **6.5.20**
 
 `cyrius lib sync --full`. ⚠ `unix_transport_test` still PASSes — record boundaries preserved in both
