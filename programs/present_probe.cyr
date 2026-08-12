@@ -97,7 +97,9 @@ fn main(): i64 {
     var nbytes = w * h * 4;
     var pix = alloc(nbytes);
 
-    var path = "/tmp/aethersafha-setu.sock";     # advisory; transport is loopback:7700
+    # 0 = ask setu (`$SETU_SOCKET`, else SETU_UNIX_PATH). ⚠ The old literal here, plus the stale
+    # "advisory; transport is loopback:7700" comment, predated both the AF_UNIX cutover and 0.8.5.
+    var path = 0;
     var c = setu_client_connect(path);
     if (c == 0) {
         # ⛔ SAY WHICH FAILURE AND WHAT THE KERNEL RETURNED. "setu connect failed" alone cost a

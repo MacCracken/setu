@@ -6,6 +6,34 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.5] - 2026-08-12 — one place names the rendezvous
+
+⭐ **`setu_un_path` now resolves `$SETU_SOCKET`**, so a caller passing `0` means "ask setu". Precedence
+is explicit path > `$SETU_SOCKET` > `SETU_UNIX_PATH`.
+
+⛔ **What this replaces: four repos each spelling the same literal.** aethersafha, crab, puka and this
+repo's own `present_probe` all hardcoded `"/tmp/aethersafha-setu.sock"`, while `SETU_UNIX_PATH` sat
+here **unreachable because nothing ever passed 0**. ⚠ They agreed, so nothing was broken — the hazard
+was that four files had to be edited in step for that to stay true, and a fifth answer existed that no
+caller could reach. ⚠ And the override was worse than the default: **puka implemented `$SETU_SOCKET`
+itself while crab and present_probe did not**, so it worked for one client in three.
+
+⚠ **The default name is protocol-shaped, not compositor-shaped.** setu owns the wire, so the socket is
+`/tmp/setu-display.sock` and a second compositor speaking setu binds the same place; `$SETU_SOCKET` is
+how two coexist on one box. ⛔ Consumers must move together — a server binding setu's default while
+clients still dial their own literal fails every connect with ENOENT (measured while getting this
+wrong the first time).
+
+### Changed — `programs/present_probe.cyr` passes 0
+
+Also drops a stale comment claiming the path was *"advisory; transport is loopback:7700"*, which
+predated both the AF_UNIX cutover and this change.
+
+### Changed — toolchain pin 6.5.8 → **6.5.20**
+
+`cyrius lib sync --full`. ⚠ `unix_transport_test` still PASSes — record boundaries preserved in both
+directions, which is the property three consecutive cuts were lost to.
+
 ## [0.8.4] — 2026-08-07 — TCP is GONE from setu. Linux speaks AF_UNIX/SOCK_SEQPACKET.
 
 ⛔⛔ **THE RULING WAS THAT TCP-ON-LOOPBACK IS THE WRONG PRIMITIVE FOR LOCAL DISPLAY IPC — A PROPERTY OF
