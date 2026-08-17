@@ -6,6 +6,26 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.6] - 2026-08-17 — `present_probe` honours SETU_CLOSE instead of leaking a slot per launch
+
+### Fixed — the slim probe outlived its window and held a system-wide resource for the whole boot
+
+⛔⛔ **MEASURED ON IRON (1.56.44 and 1.56.45 burns): the compositor's `#86` slot budget fell
+16 → 15 → 14 → 13, one slot per desktop launch.** `present_probe` ignored `SETU_CLOSE` and span in its
+animation loop forever, so when the compositor exited and told its clients to close, this one did not —
+keeping one of only **16** GPU-visible shm slots, a `#97` channel end and a process-table row until
+reboot. Ceiling: roughly 16 desktop launches per boot.
+
+⚠ **It was the ONLY client that did this.** crab and puka both honour the message — QEMU, same boot:
+`crab: compositor closed the window -- exiting` / `puka: compositor closed the window -- exiting`.
+⛔ And puka's own source records the identical defect being fixed *in puka* on 2026-08-08: *"the
+terminal was left orphaned ALIVE holding one of only 16 system-wide shm slots for the rest of the
+boot."* The probe never received that fix, then inherited the exposure when it was staged into the
+`/bin/puka` slot as the default — so a fix that had already been paid for came back through a substitute.
+
+⇒ The loop now clears a `live` flag on `SETU_CLOSE` and falls out. ⚠ The teardown is not the message,
+it is the process EXIT: dying is what returns the slot and the channel end to the kernel.
+
 ## [0.8.5] - 2026-08-12 — one place names the rendezvous
 
 ⭐ **`setu_un_path` now resolves `$SETU_SOCKET`**, so a caller passing `0` means "ask setu". Precedence
