@@ -6,6 +6,19 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.7] - 2026-08-17 — toolchain pin to 6.5.27
+
+### Changed — `cyrius = "6.5.20"` -> **6.5.27**
+
+Stack-wide sweep so every repo in the desktop stack declares one toolchain. Pins had drifted across
+three lines (6.5.5 / 6.5.20 / 6.5.21) while the installed wrapper was 6.5.27, so every build ran with
+a drift warning and the declared graph did not describe what was actually compiled.
+
+⚠ **Measured byte-identical**: 6.5.20 and 6.5.27 produce the same artifact for this repo, so the bump carries no codegen risk here. Recorded because a pin that is assumed to be cosmetic is how a real change gets waved through later.
+
+⚠ The vendored `lib/` was re-synced to the 6.5.27 bundled set, which clears the
+`./lib/ shadows version-pinned` warning. Tests re-run green after both changes.
+
 ## [0.8.6] - 2026-08-17 — `present_probe` honours SETU_CLOSE instead of leaking a slot per launch
 
 ### Fixed — the slim probe outlived its window and held a system-wide resource for the whole boot
