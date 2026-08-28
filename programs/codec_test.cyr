@@ -72,6 +72,11 @@ fn main(): i64 {
     roundtrip(setu_input_ptr_move(42, 120, 340), buf, cap);
     roundtrip(setu_input_ptr_btn(42, 272, 1), buf, cap);
     roundtrip(setu_input_focus(42, 1), buf, cap);
+    # ⭐ 0.8.8 — the wheel. Both directions, because the delta is SIGNED and a wheel-down that arrived
+    # as a huge positive would scroll a client to the end of its list instead of up one notch.
+    roundtrip(setu_input_ptr_scroll(42, 1), buf, cap);
+    roundtrip(setu_input_ptr_scroll(42, 0 - 1), buf, cap);
+    roundtrip(setu_input_ptr_scroll(42, 0 - 120), buf, cap);
 
     # ---- (F) signed + large args survive LE i64 marshalling ----
     # Negative coords and a near-full-width value exercise sign + high bytes.
@@ -126,6 +131,21 @@ fn main(): i64 {
     var att = setu_attach(1, 2, 3, 4, 5);       # needs (2+5)*8 = 56 bytes
     var rc_enc = setu_encode(att, small, 16);
     check(rc_enc, 0 - SETU_ERR_SHORT);
+
+    # ---- (G) the scroll kind is a FIRST-CLASS kind, not a button in disguise (0.8.8) ----
+    # ⛔ THE ARGC TABLE IS THE GATE. A kind whose declared argc disagrees with what its constructor
+    # writes is rejected by `setu_msg_validate` on the WIRE, not at the call site — so a wrong entry
+    # here presents as "the compositor sends scrolls and no client ever receives one".
+    check(setu_kind_argc(SETU_INPUT_PTR_SCROLL), 2);
+    check(setu_kind_valid(SETU_INPUT_PTR_SCROLL), 1);
+    # ⚠ AND THE RANGE MOVED. `SETU_KIND_MAX` gates every decode; leaving it at 11 would make the new
+    # kind valid to construct and impossible to receive.
+    check(setu_kind_valid(SETU_KIND_MAX), 1);
+    check(setu_kind_valid(SETU_KIND_MAX + 1), 0);
+    # ⚠ It must NOT be confusable with the button kind — the X11 convention of spending buttons 4/5 on
+    # wheel detents is exactly what this kind exists to avoid.
+    check(setu_input_ptr_scroll(42, 1) != 0, 1);
+    check(setu_msg_kind(setu_input_ptr_scroll(42, 1)) == SETU_INPUT_PTR_BTN, 0);
 
     # ---- report ----
     if (g_fails == 0) {

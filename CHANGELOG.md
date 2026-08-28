@@ -6,6 +6,35 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.8] - 2026-08-27 — `SETU_INPUT_PTR_SCROLL`: the wheel reaches clients
+
+### Added
+
+- **`SETU_INPUT_PTR_SCROLL` (kind 12)** — `S->C: id, delta`. Signed, summed since the compositor's
+  last forward, **positive = wheel-up** (away from the user), matching the sign agnos reports in HID
+  report byte [3] and bhumi carries as `BHUMI_EV_SCROLL`. `setu_input_ptr_scroll(id, delta)`.
+- `SETU_KIND_MAX` 11 → 12; argc table entry 2; `setu_kind_name` entry.
+
+⛔ **A SEPARATE KIND, NOT A BUTTON CODE.** X11 spends buttons 4/5 on wheel detents. Doing that here
+would make `SETU_INPUT_PTR_BTN`'s `button` argument mean two different things, and would silently turn
+a scroll into a click on any client that range-checks buttons rather than enumerating them.
+
+⚠ **Two args, not four — a scroll carries no position.** The pointer is wherever the last
+`SETU_INPUT_PTR_MOVE` put it. Clients already track position themselves because
+`SETU_INPUT_PTR_BTN` carries none either; duplicating x/y here would invite trusting a stale pair.
+
+⚠ **This kind is only useful with agnos >= 1.56.49 and bhumi >= 1.4.3.** Before those the wheel byte
+was discarded in the kernel's HID drain — byte [3] of the boot-mouse report was documented and never
+read — so nothing upstream could produce a delta to forward.
+
+### Testing
+
+`codec_test` covers the round trip in both directions (the delta is signed; a wheel-down arriving as a
+large positive would scroll a client to the end of its list), the argc table entry, and the
+`SETU_KIND_MAX` range. Mutation-verified: leaving `SETU_KIND_MAX` at 11 fails, and a wrong argc fails
+— the latter is the one that would have presented as "the compositor sends scrolls and no client ever
+receives one", because `setu_msg_validate` rejects on the wire rather than at the call site.
+
 ## [0.8.7] - 2026-08-17 — toolchain pin to 6.5.27
 
 ### Changed — `cyrius = "6.5.20"` -> **6.5.27**
