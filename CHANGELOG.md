@@ -6,6 +6,19 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.9] - 2026-09-11
+
+### Changed
+
+- **Toolchain `6.5.27` → `6.6.2`.** No source change. setu builds no `Result`
+  surface — it deleted its TCP arm at 0.8.5–0.8.8 and speaks AF_UNIX/SOCK_SEQPACKET,
+  so it has no socket call whose `Result` could be compared against a negative, and
+  no `is_err_result` / `?` site anywhere. Zero compiler rejections, zero fail-open
+  sites, zero collisions; the four `callptr` sites reach no pair-returning target.
+
+  All four RUN suites pass: `client_test`, `codec_test`, `reach_test`,
+  `unix_transport_test`.
+
 ## [0.8.8] - 2026-08-27 — `SETU_INPUT_PTR_SCROLL`: the wheel reaches clients
 
 ### Added
