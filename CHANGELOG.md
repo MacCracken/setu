@@ -90,13 +90,53 @@ recv errors as idle (0), where `setu_poll_input` returns -6 for EOF. The old com
 "EOF-as-idle" and also claimed the two functions matched.
 
 Left alone: `setu_client_present`'s header and inline-fallback comments. That path sends ATTACH with
-`buf_id = 0` and then has its pixel write refused by the 64-byte rule. It is a behaviour bug, left to
-its own fix.
+`buf_id = 0` and then has its pixel write refused by the 64-byte rule. It is a behaviour bug, fixed
+in its own entry below.
 
 **No code change** — comments and the regenerated bundle only. All six programs build byte-identical
 before and after on Linux and `--agnos` (12 binaries compared). Lint reports 0 warnings; fmt, vet and
 the no-TCP gate are clean; all four RUN suites pass; `cyrius distlib --check` reports `dist/` current,
 and `dist/setu.deps` is unchanged.
+
+### Fixed — `setu_client_present` sent an ATTACH whose pixels could never follow
+
+When no shared buffer could be created or written, `setu_client_present` fell back to inline pixels:
+`ATTACH` with `buf_id = 0` ("pixels follow this frame"), then the pixels through `setu_write_all`.
+Since 0.8.0 (agnos) and 0.8.4 (Linux) that function refuses any write over 64 bytes, because one send
+is one record. So for any surface over 16 pixels the ATTACH went out and the pixels did not: present
+returned -43 and left the compositor holding an ATTACH that promised pixels. At 16 pixels or fewer
+the write fit, and present returned 0 while the pixels arrived as a separate record that nothing reads
+as pixels. Both reproduced over a real `SOCK_SEQPACKET` pair.
+
+There was nothing to fall back to anyway: aethersafha refuses the inline form on both of its handlers
+(the placed-client handshake returns -12, and the accept path gets -6 from `setu_read_exact`). On
+agnos each stray ATTACH counted as a handshake failure, and 200 in a row retired the client with
+"attach refused". The path is reachable: agnos has 16 shm slots system-wide, a `#71` slot holds at
+most 2 MB and QEMU has no other kind, and a `/dev/shm` write can fail on Linux.
+
+- **The inline fallback is gone, and the buffer comes first.** present makes and fills the shared
+  buffer before it sends anything, including the first present's `CREATE_SURFACE`, so a failed
+  present leaves the wire as it was. With no buffer it returns **-45** (the create failed) or **-46**
+  (the write failed), and presenting again is a clean retry. A failed write still drops the cached
+  id, so the retry makes a fresh buffer. -43 is no longer returned.
+- ⚠ **Why before `CREATE_SURFACE` too:** otherwise a failed first present still creates the surface,
+  and aethersafha mints a window that gets no pixels (agnos) or blocks in its accept-path read waiting
+  for the ATTACH (Linux).
+- Wire format and API are unchanged, and `setu_attach` stays in the codec. No consumer matches -43
+  (checked puka, dhancha, cyrius-doom, crab and aethersafha). README and
+  `docs/development/overview.md` now call the inline form retired.
+
+RUN-tested in `unix_transport_test`, which now checks what a present puts on the wire when no buffer is
+available. A directory at the next `/dev/shm/setu-buf-<id>` path makes the create fail, and one in
+place of the cached buffer's file makes the write fail. Each must return its code with nothing sent,
+and the next present must recover: `CREATE_SURFACE`, ATTACH by id and COMMIT the first time, ATTACH
+with a fresh id the second, with the buffer holding the frame. **Negative controls:** against the old
+code the test fails 6 assertions (rc -43, `ATTACH` with `buf_id = 0` on the wire); with the handshake
+moved back ahead of the buffer, it fails on the `CREATE_SURFACE` that reaches the wire.
+
+Every program builds for Linux and `--agnos`. Lint reports 0 warnings; fmt, vet and the no-TCP gate
+are clean; all four RUN suites pass; `cyrius distlib --check` reports `dist/` current, and
+`dist/setu.deps` is unchanged.
 
 ## [0.8.10] - 2026-09-26
 
