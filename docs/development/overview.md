@@ -1,9 +1,10 @@
 # setu — development overview
 
 > setu (सेतु — *bridge*) is the AGNOS **native display-protocol contract
-> lib** — the wire between the `dhancha` client and the `aethersafha`
-> compositor. It carries **only** pixel / input / surface-lifecycle message
-> **types** plus a pure wire **codec**. It is **agent-free by design**.
+> lib** — the wire between GUI clients and the `aethersafha` compositor. Its
+> messages are **only** pixel / input / surface-lifecycle **types**; alongside
+> them it ships a pure wire **codec**, the shared-buffer present path and the
+> one transport every client shares. It is **agent-free by design**.
 
 ## Why setu exists
 
@@ -69,18 +70,23 @@ negated `SetuErr`, never a partial message.
 | `SETU_CREATE_SURFACE` (2) | C→S | w, h, flags |
 | `SETU_SURFACE_CREATED` (3) | S→C | id |
 | `SETU_CONFIGURE` (4) | S→C | id, w, h, state |
-| `SETU_ATTACH` (5) | C→S | id, w, h, stride, fmt |
+| `SETU_ATTACH` (5) | C→S | id, w, h, stride, fmt, buf_id |
 | `SETU_COMMIT` (6) | C→S | id |
 | `SETU_CLOSE` (7) | C↔S | id |
 | `SETU_INPUT_KEY` (8) | S→C | id, keysym, mods |
 | `SETU_INPUT_PTR_MOVE` (9) | S→C | id, x, y |
 | `SETU_INPUT_PTR_BTN` (10) | S→C | id, button, state |
 | `SETU_INPUT_FOCUS` (11) | S→C | id, focused |
+| `SETU_INPUT_PTR_SCROLL` (12) | S→C | id, delta (signed; + = wheel-up) |
 
-**`SETU_ATTACH` fd is out-of-band.** The memfd/shm fd backing the pixel
-buffer is passed via `SCM_RIGHTS` over the transport socket — *not* in the
-setu payload. `ATTACH` carries only buffer metadata. The lib never touches
-an fd.
+**`SETU_ATTACH` names a shared buffer; no fd is passed.** The present path
+keeps pixels off the wire, and there is no `SCM_RIGHTS`. `buf_id` (arg5,
+`setu_attach_buf`) is the integer id of a kernel/OS-owned buffer from
+`src/buf.cyr` — agnos kernel shm (`sys_shm_*`), `/dev/shm/setu-buf-<id>` on
+Linux — that the client writes and the compositor reads by id; a plain
+integer crosses both transports unchanged. `buf_id = 0` is the legacy inline
+form (`setu_attach`): pixels follow the frame. The connection fd belongs to
+`client.cyr`.
 
 ## What setu is NOT
 
@@ -151,18 +157,18 @@ it: little-endian marshalling uses the `load8` / `store8` builtins.
 
 ## Roadmap
 
-- **v0.1.0 — scaffold (current).** Full message ABI + pure codec +
-  RUN test.
-- **v0.2+ — co-designed with the display slice.** setu grows only if the
-  *contract* needs a new field (e.g. a format/keysym-space note). The
-  aethersafha `accept` + surface registry and dhancha's real
-  `dh_surface_present` / transport-fd `dh_run` land on *their* sides,
-  consuming this contract. Transport stays out of the lib. GPU present and
-  pointer-on-agnos are later cuts behind the same `ATTACH`.
+- **Current.** Full message ABI (12 kinds) + pure codec + RUN tests, the
+  shared-buffer present path, and the reference transport on both targets:
+  the `#97` channel band on agnos, AF_UNIX `SOCK_SEQPACKET` on Linux. How it
+  got here is in `CHANGELOG.md`.
+- **Next — contract-driven.** setu grows only if the *contract* needs a new
+  field or kind (e.g. a format/keysym-space note), appended without
+  renumbering, as `SETU_INPUT_PTR_SCROLL` was in 0.8.8.
 
 ## Relationship to other repos
 
-- **dhancha** (client) and **aethersafha** (compositor) both link setu — the
+- **aethersafha** (compositor) and its clients — **dhancha** (widget toolkit),
+  **puka** (terminal) and **crab** (file manager) — all link setu, so the
   wire has exactly one definition.
 - Design rationale: `agnosticos/docs/development/planning/native-display-protocol.md`
   (§2 = setu scope, §5 = lib intent); `dhancha/docs/development/sovereign-desktop.md`;
