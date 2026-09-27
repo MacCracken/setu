@@ -1255,7 +1255,8 @@ enum SetuClientOff {
     SETU_C_SID   = 8;    # compositor-assigned surface id (0 until first present)
     SETU_C_FLAGS = 16;   # CREATE_SURFACE flags to request (e.g. SETU_SURF_FULL_KEYS)
     SETU_C_BUFID = 24;   # cached shared-buffer id (0 = none) — ONE per client, reused
-    # across presents, recreated on resize, freed at close.
+    # across presents, replaced on resize (a second one exists only inside that present),
+    # freed at close.
     # ⛔ Never create one per present: that exhausts agnos's 16
     # kernel shm slots in under a second at 35 Hz.
     SETU_C_BUFSZ = 32;   # size in bytes of the cached shared buffer
@@ -1314,14 +1315,27 @@ fn setu_client_request_premultiplied(c): i64 {
     return 0;
 }
 
+# The first present's handshake: send CREATE_SURFACE and wait for SURFACE_CREATED. Stores and
+# returns the surface id, or returns -41 (send failed), -6 (no reply) or -8 (a reply of another kind).
+fn setu__client_create_surface(c, fd, w, h): i64 {
+    if (setu_send(fd, setu_create_surface(w, h, load64(c + SETU_C_FLAGS))) < 0) { return 0 - 41; }
+    var reply = setu_msg_new();
+    if (setu_read_msg(fd, reply) < 0) { return 0 - 6; }
+    if (setu_msg_kind(reply) != SETU_SURFACE_CREATED) { return 0 - 8; }
+    var id = setu_msg_arg(reply, 0);
+    store64(c + SETU_C_SID, id);
+    return id;
+}
+
 # Present an already-rendered w*h BGRA pixel buffer `pix`: copy it into the client's shared
 # buffer (buf.cyr — made on the first present, rewritten in place after that since the
-# compositor re-reads the id it holds, remade on a resize, freed by setu_client_close), then
+# compositor re-reads the id it holds, replaced on a resize, freed by setu_client_close), then
 # send ATTACH naming that buffer by id, then COMMIT. The first present also creates the surface
 # (CREATE_SURFACE -> SURFACE_CREATED), once the buffer is ready.
 # Returns 0 or a negative code: -45 no shared buffer could be made, -46 writing it failed (for
-# both NOTHING was sent, so presenting again is a clean retry), -41 create send, -6 recv,
-# -8 unexpected reply, -42 attach send, -44 commit send. -43 was the retired inline pixel write.
+# both NOTHING was sent, so presenting again is a clean retry, and a resize keeps the old buffer),
+# -41 create send, -6 recv, -8 unexpected reply, -42 attach send, -44 commit send.
+# -43 was the retired inline pixel write.
 fn setu_client_present(c, pix, w, h): i64 {
     var fd = setu_client_fd(c);
     var stride = w * 4;
@@ -1334,38 +1348,58 @@ fn setu_client_present(c, pix, w, h): i64 {
     # CREATE_SURFACE, so a present that fails here leaves the wire exactly as it found it.
     # ⚠ Reachable: agnos has 16 shm slots system-wide and a #71 slot holds at most 2 MB (QEMU has no
     # other kind); a /dev/shm write can fail on Linux.
-    var buf_id = load64(c + SETU_C_BUFID);
-    if (buf_id > 0) {
-        if (load64(c + SETU_C_BUFSZ) != nbytes) {          # resize -> recreate
-            setu_buf_close(buf_id);
-            buf_id = 0;
-            store64(c + SETU_C_BUFID, 0);
-            store64(c + SETU_C_BUFSZ, 0);
-        }
+    #
+    # ⛔ A RESIZE MAKES THE NEW BUFFER BEFORE IT FREES THE OLD ONE. The compositor re-reads the id it
+    # was last attached, every frame. Freeing that buffer first meant a failed create (any grow past
+    # 2 MB under QEMU) left the client nothing to present from and the compositor reading a freed
+    # slot id, which agnos gives to the next client that asks. So a replacement is only a local until
+    # an ATTACH naming it is out. If anything fails before that it is freed, and the held buffer stays
+    # as it was, still showing the last good frame.
+    # ⚠ The cost is a second slot for the length of one present. With all 16 in use, a resize now
+    # fails (-45) where freeing first would have made room, and the window keeps its old size until a
+    # slot frees.
+    var held = load64(c + SETU_C_BUFID);
+    var buf_id = held;
+    if (held > 0) {
+        if (load64(c + SETU_C_BUFSZ) != nbytes) { buf_id = 0; }    # resize: needs a replacement
     }
     if (buf_id <= 0) {
         buf_id = setu_buf_create(nbytes);
         if (buf_id <= 0) { return 0 - 45; }
+        if (held <= 0) {                                           # nothing to replace: cache it now
+            held = buf_id;
+            store64(c + SETU_C_BUFID, buf_id);
+            store64(c + SETU_C_BUFSZ, nbytes);
+        }
+    }
+    if (setu_buf_write(buf_id, pix, nbytes) != 0) {
+        setu_buf_close(buf_id);
+        if (buf_id == held) {
+            # The held buffer is dead: drop it rather than retry it every frame; the next present
+            # makes a fresh one. A failed replacement leaves the held buffer as it was.
+            store64(c + SETU_C_BUFID, 0);
+            store64(c + SETU_C_BUFSZ, 0);
+        }
+        return 0 - 46;
+    }
+    var rc = 0;
+    var id = setu_client_sid(c);
+    if (id == 0) {
+        id = setu__client_create_surface(c, fd, w, h);
+        if (id < 0) { rc = id; }
+    }
+    if (rc == 0) {
+        if (setu_send(fd, setu_attach_buf(id, w, h, stride, 1, buf_id)) < 0) { rc = 0 - 42; }
+    }
+    if (rc < 0) {
+        if (buf_id != held) { setu_buf_close(buf_id); }            # never attached: the held one stands
+        return rc;
+    }
+    if (buf_id != held) {                                          # the compositor now reads `buf_id`
+        setu_buf_close(held);
         store64(c + SETU_C_BUFID, buf_id);
         store64(c + SETU_C_BUFSZ, nbytes);
     }
-    if (setu_buf_write(buf_id, pix, nbytes) != 0) {
-        # Drop the dead id rather than retry it every frame; the next present makes a fresh one.
-        setu_buf_close(buf_id);
-        store64(c + SETU_C_BUFID, 0);
-        store64(c + SETU_C_BUFSZ, 0);
-        return 0 - 46;
-    }
-    var id = setu_client_sid(c);
-    if (id == 0) {
-        if (setu_send(fd, setu_create_surface(w, h, load64(c + SETU_C_FLAGS))) < 0) { return 0 - 41; }
-        var reply = setu_msg_new();
-        if (setu_read_msg(fd, reply) < 0) { return 0 - 6; }
-        if (setu_msg_kind(reply) != SETU_SURFACE_CREATED) { return 0 - 8; }
-        id = setu_msg_arg(reply, 0);
-        store64(c + SETU_C_SID, id);
-    }
-    if (setu_send(fd, setu_attach_buf(id, w, h, stride, 1, buf_id)) < 0) { return 0 - 42; }
     if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }
     return 0;
 }

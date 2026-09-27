@@ -138,6 +138,41 @@ Every program builds for Linux and `--agnos`. Lint reports 0 warnings; fmt, vet 
 are clean; all four RUN suites pass; `cyrius distlib --check` reports `dist/` current, and
 `dist/setu.deps` is unchanged.
 
+### Fixed — a resize freed the buffer the compositor reads before its replacement existed
+
+`setu_client_present` handled a resize by freeing the cached shared buffer, then creating one at the
+new size. aethersafha re-reads the buffer id it was last attached every frame, so when that create
+failed, the client had nothing to present from and the compositor kept reading a freed slot id. agnos
+hands out the lowest free slot and `shm_read` #73 reads any valid slot, so the next client to create a
+buffer could be given that id and have its pixels shown in this window. Under QEMU that is what
+growing a window past 2 MB does: there is no GPU carveout for `#86`, and a `#71` slot holds at most
+2 MB. crab met the same failure in its own present path and already creates before it closes.
+
+- **A resize now makes and fills the new buffer first**, and frees the old one only after an ATTACH
+  naming the new one has gone out. If the create, the write or the first present's handshake fails,
+  the replacement is freed and the old buffer stays cached and intact, still showing the last good
+  frame; present returns its code with nothing sent, as before. A client can keep presenting at the
+  size it has.
+- ⚠ **Trade-off, chosen deliberately:** for the length of one present the client holds two slots.
+  With all 16 agnos slots in use, a resize now fails (-45) where freeing first would have made room,
+  and the window keeps its old size until a slot frees. Freeing first destroyed the working buffer
+  whenever the create failed for any other reason, and setu cannot tell the two apart: both return -1.
+- The old slot is now freed right after the ATTACH instead of before the create, so the compositor
+  can read a freed slot for less time: until it processes that ATTACH. Closing the gap entirely needs
+  a buffer-release message in the protocol.
+
+RUN-tested in `unix_transport_test`, steps 5-9 of the present section: a grow whose create fails (a
+directory at the next `/dev/shm` path), a grow that succeeds, a grow whose replacement cannot be
+written (a symlink to `/dev/full` lets the create succeed and the write get ENOSPC), a present at the
+held size afterwards, and a retry at a new size after a first-present handshake failure (a reply of
+the wrong kind, -8). **Negative controls:** close-then-create fails 9 assertions. Four mutants of the
+fix each fail at least one: freeing the held buffer as soon as the replacement exists, never freeing
+the old one, keeping a replacement whose write failed, and keeping one after a failed handshake.
+
+Every program builds for Linux and `--agnos`. Lint reports 0 warnings; fmt, vet and the no-TCP gate
+are clean; all four RUN suites pass; `cyrius distlib --check` reports `dist/` current, and
+`dist/setu.deps` is unchanged.
+
 ## [0.8.10] - 2026-09-26
 
 ### Changed

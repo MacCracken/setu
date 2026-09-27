@@ -44,10 +44,29 @@ fn next_rec(fd, m) {
     return r;
 }
 
+# Read shared buffer `id` into a freshly zeroed copy and count the bytes that differ from `want`:
+# 0 = it holds exactly that frame, -1 = it cannot be read (freed, or never made).
+fn buf_holds(id, want, n) {
+    var got = alloc(n);
+    var i = 0;
+    while (i < n) { store8(got + i, 0); i = i + 1; }
+    if (setu_buf_read(id, got, n) != 0) { return 0 - 1; }
+    var miss = 0;
+    i = 0;
+    while (i < n) {
+        if (load8(got + i) != load8(want + i)) { miss = miss + 1; }
+        i = i + 1;
+    }
+    return miss;
+}
+
 # ⭐ A PRESENT WITH NO SHARED BUFFER SENDS NOTHING. The inline fallback this replaces sent
 # ATTACH(buf_id = 0) and then had its pixel write refused by the one-record rule, so the peer held an
 # ATTACH whose pixels never came. Now the buffer is made and filled before anything is sent, so a
 # failed present leaves the wire as it found it, including the CREATE_SURFACE of a first present.
+# ⭐ AND A RESIZE THAT CANNOT GET ITS NEW BUFFER KEEPS THE OLD ONE (steps 5-9). The compositor re-reads
+# the id it holds every frame, so freeing that buffer before its replacement exists leaves the client
+# nothing to present from and the compositor a freed slot id.
 fn present_all_or_nothing(sfd, path) {
     var c = setu_client_connect(path);
     ck("present: client connect", c != 0, 1);
@@ -92,15 +111,7 @@ fn present_all_or_nothing(sfd, path) {
     next_rec(pfd, m);
     ck("present: rec 3 kind", setu_msg_kind(m), SETU_COMMIT);
     ck("present: nothing after commit", next_rec(pfd, m), 0 - 1);
-    var back = alloc(nbytes);
-    ck("present: buffer read by id", setu_buf_read(bid, back, nbytes), 0);
-    var miss = 0;
-    i = 0;
-    while (i < nbytes) {
-        if (load8(back + i) != load8(pix + i)) { miss = miss + 1; }
-        i = i + 1;
-    }
-    ck("present: buffer holds the frame", miss, 0);
+    ck("present: buffer holds the frame", buf_holds(bid, pix, nbytes), 0);
 
     # --- 3. The cached buffer stops taking writes: fail before ATTACH and drop the dead id.
     setu_buf_path(bid, p);
@@ -115,14 +126,90 @@ fn present_all_or_nothing(sfd, path) {
     ck("present: after write failure, rc", setu_client_present(c, pix, w, h), 0);
     next_rec(pfd, m);
     ck("present: rec 4 kind", setu_msg_kind(m), SETU_ATTACH);
-    ck("present: rec 4 fresh buffer", setu_msg_arg(m, 5) != bid, 1);
-    ck("present: rec 4 buffer id", setu_msg_arg(m, 5) > 0, 1);
+    var held = setu_msg_arg(m, 5);                 # the buffer the compositor now reads
+    ck("present: rec 4 fresh buffer", held != bid, 1);
+    ck("present: rec 4 buffer id", held > 0, 1);
     next_rec(pfd, m);
     ck("present: rec 5 kind", setu_msg_kind(m), SETU_COMMIT);
     ck("present: nothing after rec 5", next_rec(pfd, m), 0 - 1);
 
+    # --- 5. A grow whose create fails. Nothing is sent, and the held buffer is untouched.
+    var w2 = 48;
+    var nbytes2 = w2 * h * 4;
+    var pix2 = alloc(nbytes2);
+    i = 0;
+    while (i < nbytes2) { store8(pix2 + i, (i * 5 + 1) & 255); i = i + 1; }
+    setu_buf_path(sys_getpid() * 100000 + _setu_buf_counter + 1, p);
+    ck("present: occupy next buffer path again", sys_mkdirat(AT_FDCWD, p, 448), 0);
+    ck("present: grow, create fails, rc", setu_client_present(c, pix2, w2, h), 0 - 45);
+    ck("present: grow, create fails, wire empty", next_rec(pfd, m), 0 - 1);
+    ck("present: grow, create fails, still held", load64(c + SETU_C_BUFID), held);
+    ck("present: grow, create fails, size kept", load64(c + SETU_C_BUFSZ), nbytes);
+    ck("present: grow, create fails, last frame kept", buf_holds(held, pix, nbytes), 0);
+    sys_unlinkat(AT_FDCWD, p, AT_REMOVEDIR);
+
+    # --- 6. The grow succeeds: ATTACH names a new buffer at the new size, and the old one is freed.
+    ck("present: grow, rc", setu_client_present(c, pix2, w2, h), 0);
+    next_rec(pfd, m);
+    ck("present: grow, rec kind", setu_msg_kind(m), SETU_ATTACH);
+    ck("present: grow, rec w", setu_msg_arg(m, 1), w2);
+    var grown = setu_msg_arg(m, 5);
+    ck("present: grow, new buffer", grown != held, 1);
+    next_rec(pfd, m);
+    ck("present: grow, then commit", setu_msg_kind(m), SETU_COMMIT);
+    ck("present: grow, nothing after", next_rec(pfd, m), 0 - 1);
+    ck("present: grow, new buffer held", load64(c + SETU_C_BUFID), grown);
+    ck("present: grow, new buffer holds the frame", buf_holds(grown, pix2, nbytes2), 0);
+    ck("present: grow, old buffer freed", buf_holds(held, pix, nbytes), 0 - 1);
+
+    # --- 7. A grow whose replacement cannot be written. A symlink to /dev/full at the next buffer path
+    # lets the create open it, and the write then gets ENOSPC. The replacement is freed (unlinking the
+    # link) and the held buffer stays exactly as it was.
+    var w3 = 64;
+    var nbytes3 = w3 * h * 4;
+    var pix3 = alloc(nbytes3);
+    setu_buf_path(sys_getpid() * 100000 + _setu_buf_counter + 1, p);
+    ck("present: link next buffer path to /dev/full", sys_symlink("/dev/full", p), 0);
+    ck("present: grow, write fails, rc", setu_client_present(c, pix3, w3, h), 0 - 46);
+    ck("present: grow, write fails, wire empty", next_rec(pfd, m), 0 - 1);
+    ck("present: grow, write fails, still held", load64(c + SETU_C_BUFID), grown);
+    ck("present: grow, write fails, last frame kept", buf_holds(grown, pix2, nbytes2), 0);
+    ck("present: grow, write fails, replacement freed", sys_unlinkat(AT_FDCWD, p, 0), 0 - 2);   # ENOENT
+
+    # --- 8. The held buffer still works: a present at its size re-attaches it, and makes nothing new.
+    ck("present: at held size, rc", setu_client_present(c, pix2, w2, h), 0);
+    next_rec(pfd, m);
+    ck("present: at held size, rec kind", setu_msg_kind(m), SETU_ATTACH);
+    ck("present: at held size, same buffer", setu_msg_arg(m, 5), grown);
+    next_rec(pfd, m);
+    ck("present: at held size, then commit", setu_msg_kind(m), SETU_COMMIT);
+    ck("present: at held size, nothing after", next_rec(pfd, m), 0 - 1);
+
     setu_client_close(c);                          # frees the cached buffer
     sys_close(pfd);
+
+    # --- 9. A replacement made before a failed handshake is freed, and the held buffer kept. On a
+    # second client, a reply of the wrong kind fails the first present's handshake (-8), which leaves
+    # its buffer cached; a retry at a new size makes a replacement, fails the same way, and must free it.
+    var c2 = setu_client_connect(path);
+    ck("present: second client connect", c2 != 0, 1);
+    if (c2 == 0) { return 0; }
+    var pfd2 = setu_accept(sfd);
+    ck("present: second client accept", pfd2 >= 0, 1);
+    if (pfd2 < 0) { return 0; }
+    ck("present: queue a wrong reply", setu_send(pfd2, setu_input_focus(1, 1)) > 0, 1);
+    ck("present: wrong reply, rc", setu_client_present(c2, pix, w, h), 0 - 8);
+    var first = load64(c2 + SETU_C_BUFID);
+    ck("present: wrong reply, buffer cached", first > 0, 1);
+    ck("present: queue another wrong reply", setu_send(pfd2, setu_input_focus(1, 1)) > 0, 1);
+    ck("present: retry at new size, rc", setu_client_present(c2, pix2, w2, h), 0 - 8);
+    var repl = sys_getpid() * 100000 + _setu_buf_counter;   # the replacement that retry made
+    ck("present: retry at new size, made a replacement", repl != first, 1);
+    ck("present: retry at new size, replacement freed", buf_holds(repl, pix2, nbytes2), 0 - 1);
+    ck("present: retry at new size, still held", load64(c2 + SETU_C_BUFID), first);
+    ck("present: retry at new size, held intact", buf_holds(first, pix, nbytes), 0);
+    setu_client_close(c2);
+    sys_close(pfd2);
     return 0;
 }
 #endif
