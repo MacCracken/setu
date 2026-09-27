@@ -1,21 +1,21 @@
 # @public — stable API surface for the setu message model.
 # proto.cyr — the display-protocol MESSAGE TYPES + fixed field layouts.
 #
-# setu carries ONLY pixel / input / surface-lifecycle messages between the
-# dhancha client and the aethersafha compositor. It is AGENT-FREE by
+# setu carries ONLY pixel / input / surface-lifecycle messages between GUI
+# clients (dhancha, puka, crab) and the aethersafha compositor. It is AGENT-FREE by
 # construction: no agent / MCP concepts ride this plane (introspection +
 # drive-verbs ride a SEPARATE bote/t-ron/daimon endpoint, per the native
 # display-protocol design §0/§3). Keeping the display wire agent-free is
 # what keeps the desktop AI-OPTIONAL by construction.
 #
-# Message ABI (frozen for v0.1 — do NOT renumber or reorder args):
+# Message ABI (frozen for 0.x — do NOT renumber or reorder args):
 #
 #   kind                 dir    args (in order)
 #   SETU_HELLO           C<->S  version, role
 #   SETU_CREATE_SURFACE  C->S   w, h, flags
 #   SETU_SURFACE_CREATED S->C   id
 #   SETU_CONFIGURE       S->C   id, w, h, state
-#   SETU_ATTACH          C->S   id, w, h, stride, fmt   (see NOTE below)
+#   SETU_ATTACH          C->S   id, w, h, stride, fmt, buf_id   (see NOTE below)
 #   SETU_COMMIT          C->S   id
 #   SETU_CLOSE           C<->S  id
 #   SETU_INPUT_KEY       S->C   id, keysym, mods   (mods = press/release 1/0 on FULL_KEYS)
@@ -24,15 +24,16 @@
 #   SETU_INPUT_PTR_SCROLL S->C  id, delta (signed; + = up/away)
 #   SETU_INPUT_FOCUS     S->C   id, focused
 #
-# NOTE — SETU_ATTACH and out-of-band fds:
-#   The pixel buffer's memfd/shm file descriptor is passed OUT-OF-BAND over
-#   the transport socket via SCM_RIGHTS ancillary data — it is NOT part of
-#   the setu payload. setu's ATTACH message carries only the buffer METADATA
-#   (id, w, h, stride, fmt); the receiving side pairs the next SCM_RIGHTS fd
-#   with the ATTACH it accompanies. The lib never touches an fd — transport
-#   ownership (send/recv + SCM_RIGHTS marshalling) lives in each side, not in
-#   this contract lib. This is the one field that is deliberately absent from
-#   the wire args.
+# NOTE — SETU_ATTACH names a SHARED BUFFER; no fd is passed (there is no SCM_RIGHTS):
+#   On the present path the pixels do not ride the setu wire. The client copies them
+#   into a buffer owned by the kernel/OS and keyed by an integer id (buf.cyr — agnos
+#   kernel shm, a /dev/shm/setu-buf-<id> file on Linux), and ATTACH names it in arg5,
+#   `buf_id` (setu_attach_buf); the compositor reads the pixels by that id. The id is a
+#   plain integer, so it crosses both transports unchanged. `buf_id = 0` is the legacy
+#   INLINE form (setu_attach), in which the pixels follow the frame. ⚠ No real surface
+#   fits it: setu sends at most 64 B per record on both targets (setu_write_all).
+#   This module never touches an fd. The connection fd belongs to client.cyr, from
+#   connect (on agnos, from spawn) to close.
 
 # ================================================================
 # Message kinds — the wire discriminant.
@@ -45,7 +46,7 @@ enum SetuMsgKind {
     SETU_CREATE_SURFACE  = 2;   # C->S:  w, h, flags
     SETU_SURFACE_CREATED = 3;   # S->C:  id
     SETU_CONFIGURE       = 4;   # S->C:  id, w, h, state
-    SETU_ATTACH          = 5;   # C->S:  id, w, h, stride, fmt (memfd out-of-band)
+    SETU_ATTACH          = 5;   # C->S:  id, w, h, stride, fmt, buf_id (shared buffer; 0 = inline)
     SETU_COMMIT          = 6;   # C->S:  id
     SETU_CLOSE           = 7;   # C<->S: id
     SETU_INPUT_KEY       = 8;   # S->C:  id, keysym, mods (mods=press/release value 1/0 on
@@ -114,7 +115,7 @@ enum SetuSurfaceFlags {
 var SETU_MSG_KIND   = 0;    # offset of kind
 var SETU_MSG_ARGC   = 8;    # offset of argc
 var SETU_MSG_ARGS   = 16;   # offset of args[0]
-var SETU_MAX_ARGS   = 8;    # max args any kind carries (fits the widest, ATTACH=5)
+var SETU_MAX_ARGS   = 8;    # max args any kind carries (fits the widest, ATTACH=6)
 var SETU_MSG_SIZE   = 80;   # 2 words header + 8 arg words
 
 # Allocate a zeroed SetuMsg. Returns 0 on OOM.
@@ -260,8 +261,9 @@ fn setu_configure(id, w, h, state): i64 {
     return m;
 }
 
-# The memfd/shm fd is passed OUT-OF-BAND via SCM_RIGHTS — NOT here. This
-# carries only the buffer metadata.
+# The legacy INLINE ATTACH: buf_id (arg5) stays 0, so the pixels follow this frame on
+# the connection. No fd is passed with either form. A present with a shared buffer
+# uses setu_attach_buf; ⚠ see the NOTE at the top — no real surface fits inline.
 fn setu_attach(id, w, h, stride, fmt): i64 {
     var m = setu_msg_begin(SETU_ATTACH);
     if (m == 0) { return 0; }
@@ -275,9 +277,10 @@ fn setu_attach(id, w, h, stride, fmt): i64 {
 }
 
 # ATTACH referencing a SHARED BUFFER by id (arg5 > 0) — the pixels live in the
-# shared buffer (see buf.cyr), NOT streamed inline after this frame. This is the
-# sovereign present path that sidesteps the single-CPU two-proc TCP flow-control
-# deadlock on agnos. buf_id 0 would mean inline, so a real shared buffer is always > 0.
+# shared buffer (see buf.cyr), NOT streamed inline after this frame. This is THE
+# present path on both targets: a surface is hundreds of KB and setu sends at most
+# 64 B per record, so only the id rides the wire. buf_id 0 would mean inline, so a
+# real shared buffer is always > 0.
 fn setu_attach_buf(id, w, h, stride, fmt, buf_id): i64 {
     var m = setu_msg_begin(SETU_ATTACH);
     if (m == 0) { return 0; }

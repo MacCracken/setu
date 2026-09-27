@@ -1,9 +1,10 @@
 # programs/present_probe.cyr — a slim, dependency-light setu CLIENT.
 #
-# Connects to the compositor over the setu TCP transport (loopback:7700), establishes
-# ONE surface bound to a shared buffer, then LIVE-ANIMATES it: it keeps writing new
-# frames into that shared buffer (setu_buf_write) — the compositor re-reads the buffer
-# every frame (win_bufid), so the window updates with no per-frame socket traffic. It
+# Connects to the compositor over setu's transport (agnos: the `#97` channel it was spawned
+# holding; Linux: AF_UNIX / SOCK_SEQPACKET), establishes ONE surface bound to a shared
+# buffer, then LIVE-ANIMATES it: it keeps writing new frames into that shared buffer
+# (setu_buf_write) — the compositor re-reads the buffer every frame (win_bufid), so the
+# window updates without a single per-frame send on the connection. It
 # depends ONLY on setu (which builds `--agnos`), so it exercises the desktop path without
 # the puka terminal's GPU stack (mabda uses Linux `SYS_IOCTL`).
 #
@@ -20,13 +21,16 @@
 # carries any selftest hook. ⚠ Scope: QEMU at `-smp 1`; never shown on iron, `-smp 4`
 # fault-kills.
 #
-# ⛔ The TCP transport it dials is nonetheless RETIRED — as the WRONG PRIMITIVE, not as
-# broken — replaced by the agnos socket `anu`. See the banner at the top of setu
-# `src/client.cyr` and agnos `docs/development/planning/ipc.md` §9/§10.
+# ⛔ The TCP transport it dialled then is nonetheless RETIRED — as the WRONG PRIMITIVE, not
+# as broken — and gone from setu: agnos moved to the `#97` channel band at 0.8.0, Linux to
+# AF_UNIX at 0.8.4. See the banner at the top of setu `src/client.cyr` and agnos
+# `docs/development/planning/ipc.md` §9/§10.
 #
 # The compositor spawns `/bin/puka`; the (now-deleted) smoke seeded this binary there.
 #
-# Run: it needs a live compositor listening on setu loopback:7700 (pending anu).
+# Run: on agnos the compositor spawns it holding its channel (announced in `AGNOS_CHAN`); on
+# Linux it needs a compositor listening at `$SETU_SOCKET`, else /tmp/setu-display.sock, and it
+# presents once and exits (the animation loop is agnos-only).
 
 include "src/lib.cyr"
 
@@ -104,7 +108,8 @@ fn main(): i64 {
     if (c == 0) {
         # ⛔ SAY WHICH FAILURE AND WHAT THE KERNEL RETURNED. "setu connect failed" alone cost a
         # QEMU cycle: -2 (no socket) and -3 (connect refused) are different faults with different
-        # fixes, and the raw #47 return is where the reason actually is.
+        # fixes, and on Linux the raw sys_socket / sys_connect return is where the reason is. On
+        # agnos the stage is -8 (no chan band) or -9 (no AGNOS_CHAN), and setu_connect prints why.
         pp_say("present_probe: setu connect failed, stage then kernel rc:\n");
         pp_num(setu_connect_error());
         pp_num(setu_connect_rc());

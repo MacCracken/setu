@@ -3,21 +3,21 @@
 # Replaces inline-pixel streaming: the client writes its rendered pixels into a
 # buffer owned by the kernel/OS and keyed by an integer id; ATTACH carries the id
 # (setu_attach_buf, arg5 > 0), NOT the pixels; the compositor reads them back out.
-# This sidesteps the single-CPU two-proc TCP flow-control deadlock on agnos
-# (TCP_RX_RING = 2 KB, but a surface is hundreds of KB) with a single kernel/OS copy
-# each way — negligible vs a surface, and unnecessary once agnos is multi-core (the
-# inline path in client.cyr is the multi-core fallback). See
+# Pixels cannot ride the wire: setu sends one record of at most 64 B per send on both
+# targets (client.cyr), and a surface is hundreds of KB. This path moves them with a
+# single kernel/OS copy each way — negligible vs a surface. See
 # agnosticos/docs/development/planning/shared-buffer-present.md.
 #
 # COPY-based (not shared-page-mapped) on purpose: the buffer is OWNED by the kernel/OS,
 # never mapped into a process's own arena, so a client that exits right after present
 # can't free pages the compositor is still reading (agnos proc_free_address_space frees
-# every arena page on exit). The id is a small integer sent over setu's TCP wire — no
-# fd passing — so it rides the transport unchanged on both targets.
+# every arena page on exit). The id is a small integer carried in ATTACH's arg5 — no
+# fd is passed — so it crosses both transports unchanged.
 #   Linux — a tmpfs file /dev/shm/setu-buf-<id>: the client write()s it, the compositor
 #           read()s it. Pure userland; no kernel change.
-#   agnos — kernel shm syscalls (shm_create/shm_write/shm_read/shm_free). STUBBED here;
-#           landed in the agnos shm bite (planning doc bite 2).
+#   agnos — the kernel shm band: shm_create_gpu #86 (GPU-visible) first, falling back to
+#           shm_create #71 (system RAM — the QEMU path), then shm_write #72 / shm_read #73 /
+#           shm_free #74 on either kind of slot.
 
 var _setu_buf_counter = 0;
 

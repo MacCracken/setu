@@ -1,15 +1,16 @@
 # programs/client_test.cyr — RUN test for the setu client transport.
 #
-# The socket ops (connect/listen/accept/send/recv) need a live compositor peer.
-# ⛔ They were claimed here as "proven end-to-end by the puka <-> aethersafha integration
+# The socket ops (connect/listen/accept/send/recv) are not exercised here —
+# `unix_transport_test.cyr` runs them over a real AF_UNIX socket on Linux.
+# ⛔ They were once claimed here as "proven end-to-end by the puka <-> aethersafha integration
 # over TCP loopback (item 3b)". That integration was proven ON LINUX ONLY; the agnos-side
 # greens came from `AETHERSAFHA_SETU_SELFTEST`-rigged kernels and are FALSE GREENS. The TCP
-# transport is a RETIRED WRONG PREMISE (replaced by the agnos socket `anu`) — see the
-# banner at the top of `src/client.cyr`.
-# Here we assert the pure/linkable surface: the well-known
-# transport port + a framed round-trip through the codec the client sends/reads,
-# so the client module links and its framing is sound. Exit code = failed checks
-# (0 = PASS), matching the setu codec_test / sadish RUN-test convention.
+# transport was a RETIRED WRONG PREMISE, removed in 0.8.4 — see the banner at the top of
+# `src/client.cyr`.
+# Here we assert the pure/linkable surface: the `sockaddr_un` rendezvous (Linux), a
+# framed round-trip through the codec the client sends/reads, input reassembly, and the
+# shared-buffer lifecycle, so the client module links and its framing is sound. Exit
+# code = failed checks (0 = PASS), matching the setu codec_test / sadish RUN-test convention.
 
 include "src/lib.cyr"
 
@@ -52,8 +53,8 @@ fn main(): i64 {
 
     # --- 0.5.1: input STREAM REASSEMBLY (setu__inbuf_take, the pure core of
     # setu_client_poll_input). Two coalesced INPUT_KEY frames plus HALF of a third
-    # in one buffer — exactly what one TCP recv can deliver — must hand out frames
-    # 1 and 2, hold the partial, then complete frame 3 when its tail arrives.
+    # in one buffer — the take/partial logic is transport-agnostic — must hand out
+    # frames 1 and 2, hold the partial, then complete frame 3 when its tail arrives.
     var c = alloc(SETU_C_SZ);
     store64(c + SETU_C_FD, 0 - 1);              # no socket: pure-extract path only
     store64(c + SETU_C_SID, 0);

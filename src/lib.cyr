@@ -1,16 +1,21 @@
 # @public — setu library include chain.
 # setu (सेतु — bridge) — the AGNOS native display-protocol CONTRACT lib.
 #
-# The bridge between the dhancha CLIENT and the aethersafha COMPOSITOR:
-# it carries the pixel / input / surface-lifecycle message TYPES, a pure wire
-# CODEC (marshal/unmarshal as pure functions), AND the reference CLIENT
-# transport (client.cyr — the persistent AF_UNIX connection every app owns).
-# The codec stays pure/host-testable; the client is the ONE implementation
-# both consumers share (dhancha renders widgets -> pixels, puka renders a cell
-# grid -> pixels; both present raw buffers through setu_client_present) so the
-# transport has a single definition, not one per consumer. The compositor SIDE
-# (accept/serve) still lives in aethersafha. Consumed by aethersafha (server)
-# + dhancha (toolkit client) + puka (terminal client).
+# The bridge between GUI CLIENTS and the aethersafha COMPOSITOR: it carries the
+# pixel / input / surface-lifecycle message TYPES, a pure wire CODEC
+# (marshal/unmarshal as pure functions), the shared-buffer present path
+# (buf.cyr), AND the reference transport (client.cyr — the persistent
+# connection every app owns: the `#97` channel on agnos, AF_UNIX /
+# SOCK_SEQPACKET on Linux). The codec stays pure/host-testable; the client is
+# the ONE implementation every client shares (dhancha renders widgets -> pixels
+# and crab is built on it; puka renders a cell grid -> pixels; each presents raw
+# buffers through setu_client_present) so the transport has a single
+# definition, not one per consumer. The compositor side lives in aethersafha,
+# which frames its end with the same primitives; on Linux client.cyr also gives
+# it listen/accept, while on agnos nothing is accepted — the compositor mints
+# and endows each client's channel at spawn. Consumed by aethersafha (server)
+# + dhancha (toolkit client) + puka (terminal client) + crab (file-manager
+# client).
 #
 # AGENT-FREE by construction. No agent / MCP concepts ride this plane —
 # surface introspection and drive-verbs ride a SEPARATE bote/t-ron/daimon
@@ -41,7 +46,9 @@ include "lib/assert.cyr"
 # SetuMsg record + message kinds + per-kind argc table + constructors)
 # builds on it. codec.cyr (pure encode/decode of the LE i64 wire frame)
 # builds on both — it validates via proto's table and reports via error's
-# codes. Reordering breaks `cyrius distlib`; keep this order.
+# codes. buf.cyr (the shared-buffer present path) needs only the stdlib.
+# client.cyr (the transport + SetuClient) builds on proto, codec and buf.
+# Reordering breaks `cyrius distlib`; keep this order.
 # ================================================================
 include "src/error.cyr"
 include "src/proto.cyr"

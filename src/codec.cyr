@@ -2,10 +2,9 @@
 # codec.cyr — the PURE wire codec: SetuMsg <-> byte frame.
 #
 # NO I/O. NO allocation on the hot path (encode writes into a caller buffer;
-# decode fills a caller-provided SetuMsg). Transport (socket send/recv,
-# SCM_RIGHTS fd passing) lives in each side, NOT here — this file only
-# turns a message into bytes and untrusted bytes back into a validated
-# message.
+# decode fills a caller-provided SetuMsg). Transport (the connection and its
+# record send/recv) lives in client.cyr, NOT here — this file only turns a
+# message into bytes and untrusted bytes back into a validated message.
 #
 # ---- Frame format ----
 #

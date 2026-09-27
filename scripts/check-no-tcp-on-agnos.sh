@@ -9,8 +9,8 @@
 #
 # ⛔ A CLAIM IN A CHANGELOG IS NOT A PROPERTY OF THE CODE. This script makes it one.
 #
-# Method: strip every `#ifndef CYRIUS_TARGET_AGNOS ... #endif` block (Linux-only code, legitimately
-# allowed to speak TCP — a different target, not a fallback), then grep what remains.
+# Method: strip every `#ifndef CYRIUS_TARGET_AGNOS ... #endif` block (Linux-only code, outside this
+# gate's scope; it has spoken AF_UNIX, not TCP, since 0.8.4), then grep what remains.
 set -eu
 cd "$(dirname "$0")/.."
 

@@ -50,6 +50,54 @@ to [Semantic Versioning](https://semver.org/).
   because `src/lib.cyr` includes them and the include scan keeps them. `result`, `net` and `chrono`
   do drop out when undeclared. `docs/development/overview.md` now says so.
 
+### Fixed — comments that still described TCP and `SCM_RIGHTS` fd passing
+
+0.8.4 removed TCP from setu on both targets, and setu's code has never passed an fd: `ATTACH` sent
+inline pixels at 0.2.0 and has named a shared buffer by integer id (`buf_id`, arg5, argc 6) since
+0.3.1. Comments in `src/`, two programs and the no-TCP gate still described TCP-on-loopback, and an
+`SCM_RIGHTS` fd hand-off that setu never implemented. ⛔ Not cosmetic, for the reason 0.8.1 recorded:
+a comment that describes a deleted transport reads as a statement about the code in front of you. And
+`dist/setu.cyr` ships comments verbatim, so every consumer's materialized `lib/setu.cyr` carried them.
+
+- `src/proto.cyr` — the ABI table, the `SETU_ATTACH` enum comment and `SETU_MAX_ARGS`'s note give
+  ATTACH its six args. The ATTACH NOTE and both constructors describe the shared buffer: no fd is
+  passed, `buf_id = 0` is the legacy inline form that no real surface fits, and the connection fd
+  belongs to `client.cyr`. The ABI heading says frozen for 0.x (it said v0.1), and the header names
+  the GUI clients, not only dhancha.
+- `src/codec.cyr` — transport lives in `client.cyr`, not "in each side" with `SCM_RIGHTS`.
+- `src/lib.cyr` — the transport is the `#97` channel on agnos and AF_UNIX / `SOCK_SEQPACKET` on
+  Linux, not "the persistent AF_UNIX connection". `client.cyr` gives the compositor listen/accept on
+  Linux, and nothing is accepted on agnos. crab is listed, and the module-order note covers `buf.cyr`
+  and `client.cyr`.
+- `src/buf.cyr` — the buffer exists because setu sends at most 64 B per record and a surface is
+  hundreds of KB, not to dodge a `TCP_RX_RING` deadlock. The inline path is no longer "the
+  multi-core fallback", and the agnos arm is `#86` then `#71`, not "STUBBED".
+- `src/client.cyr` — the per-target semantics block, the `setu_conn_err` / `setu_conn_rc` notes, the
+  headers of `setu_listen`, `setu_write_all`, `setu_read_blk`, `setu_recv`, `setu_poll_input`,
+  `setu_read_exact`, `setu_read_msg`, `setu_client_connect` and `setu_client_recv`, and the idle
+  branch of `setu_client_poll_input`. They described `sock_recv #49` / `sock_send #48`,
+  `sys_sock_connect`, the 30 s `_agnos_sock_recv_block` stall, length-from-header stream reads, a
+  listener "kept only until §9.6 lands" and an `anu` migration still to come. They now describe the
+  `#97` band and `SOCK_SEQPACKET` as the code uses them. The band has no codename: agnos `ipc.md` §9
+  dropped `anu` on 2026-08-05.
+- `programs/present_probe.cyr`'s header no longer says it dials loopback:7700 "pending anu", and its
+  connect-failure note no longer points at the raw `#47` return. `programs/client_test.cyr` no longer
+  asserts "the well-known transport port". `scripts/check-no-tcp-on-agnos.sh` no longer calls Linux
+  code "legitimately allowed to speak TCP".
+
+⚠ One comment now states a behaviour it used to blur: on Linux `setu_client_poll_input` reads EOF and
+recv errors as idle (0), where `setu_poll_input` returns -6 for EOF. The old comment said
+"EOF-as-idle" and also claimed the two functions matched.
+
+Left alone: `setu_client_present`'s header and inline-fallback comments. That path sends ATTACH with
+`buf_id = 0` and then has its pixel write refused by the 64-byte rule. It is a behaviour bug, left to
+its own fix.
+
+**No code change** — comments and the regenerated bundle only. All six programs build byte-identical
+before and after on Linux and `--agnos` (12 binaries compared). Lint reports 0 warnings; fmt, vet and
+the no-TCP gate are clean; all four RUN suites pass; `cyrius distlib --check` reports `dist/` current,
+and `dist/setu.deps` is unchanged.
+
 ## [0.8.10] - 2026-09-26
 
 ### Changed
