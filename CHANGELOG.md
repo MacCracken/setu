@@ -6,6 +6,50 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Removed
+
+- **`scripts/sync-deps-sidecar.sh`.** It rewrote `dist/setu.deps` from `[deps] stdlib` because
+  `cyrius distlib` once emitted 8 of setu's 12 leaves. cyrius 6.5.10 fixed that upstream: the sidecar
+  is now the declared list unioned with an include scan. On 6.6.6, raw `distlib` output lists the
+  same 12 leaves as the script and differs only in its header comment and leaf order, so the script
+  had stopped correcting anything. All it still produced was churn: `e4c7bc3`, `562b335` and
+  `f05ee6f` each committed distlib's own sidecar, and `9c76252`, `3397603` and `83f558f` each
+  rewrote it back.
+
+### Changed
+
+- **`dist/setu.deps` is committed exactly as `cyrius distlib` writes it.** Consumers see the same 12
+  leaves. Only the header comment and the position of `io` change. `dist/setu.cyr` is unchanged.
+- **CI verifies all of `dist/` with `cyrius distlib --check`**, replacing both the "Verify dist bundle
+  is in sync with src/" step (`distlib`, then `git diff dist/setu.cyr`) and the script's sidecar
+  step. `--check` regenerates into a temp file beside `dist/` and byte-compares the bundle and the
+  sidecar, writing nothing. Plain `cyrius distlib` still runs after it, for the bundle self-compile
+  (see below).
+- **A separate CI step checks that the sidecar covers every declared leaf.** It compares the
+  non-comment lines of `dist/setu.deps` with the `[deps] stdlib` array and fails if a declared leaf
+  is missing. That is the property the script protected, now asserted directly in case a later
+  toolchain regresses the 6.5.10 fix. A superset passes, because the include scan can add a leaf the
+  declaration lacks.
+- `docs/development/overview.md` no longer tells anyone to run the script, and the distlib sidecar
+  issue doc records the retirement under Resolution.
+
+### Found while retiring it
+
+- ⚠ **The old sidecar gate never saw an uncommitted sidecar.** It ran `git diff dist/setu.deps`
+  after regenerating, and an untracked file has no diff, so a commit that dropped `dist/setu.deps`
+  passed. `--check` fails it (measured both ways).
+- ⛔ **`--check` skips distlib's bundle self-compile**, which is why plain `distlib` still runs after
+  it. Measured on 6.6.6: a module only the bundle includes, with a syntax error and committed as
+  distlib wrote it, reads `current` under `--check`. Plain `distlib` exits 1 on it ("the generated
+  bundle does not compile"), and no other CI step fails, because the programs build through
+  `src/lib.cyr`. The order matters: plain `distlib` rewrites `dist/`, so running it first would leave
+  `--check` nothing stale to find.
+- ⚠ **For the eventual prune:** `vec`, `str` and `assert` stay in the sidecar even when undeclared,
+  because `src/lib.cyr` includes them and the include scan keeps them. `result`, `net` and `chrono`
+  do drop out when undeclared. `docs/development/overview.md` now says so.
+
 ## [0.8.10] - 2026-09-26
 
 ### Changed

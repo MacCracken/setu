@@ -68,6 +68,8 @@ setu 0.8.2 ships `scripts/sync-deps-sidecar.sh`, which rewrites `dist/setu.deps`
 `dist/`, so setu states the truth there rather than waiting on a fix in another repo. Consumers of
 setu are therefore protected today — the machine check is back on for them.
 
+(Retired after 0.8.10, once the upstream fix had made it redundant. See [Resolution](#resolution).)
+
 ## Ask
 
 Either make `distlib` emit the declared `[deps] stdlib` verbatim (simplest, and matches what consumers
@@ -98,6 +100,13 @@ setu's own history agrees. Only the scaffold's sidecar (2026-07-08) had 8 leaves
 sidecar committed since 0.8.5 (`e4c7bc3`, `562b335`, `f05ee6f`) listed all 12, and each was then
 "repaired" back to the script's header and leaf order.
 
-`scripts/sync-deps-sidecar.sh` and its CI gate are still in place. Their output is byte-identical to
-the committed `dist/setu.deps` (it differs from raw `distlib` output only in header and leaf order),
-so they are now a redundant check rather than a correction.
+`scripts/sync-deps-sidecar.sh` was **retired after 0.8.10**. It had stopped correcting anything and
+was only producing the churn above. `dist/setu.deps` is now committed exactly as `cyrius distlib`
+writes it, and CI checks it two ways:
+
+- `cyrius distlib --check` fails if the committed bundle or sidecar differs from a fresh
+  regeneration. It also fails when the sidecar was never committed, a case the `git diff` gate it
+  replaced passed.
+- A set check fails if the sidecar omits any `[deps] stdlib` leaf. That is this issue's failure mode,
+  checked directly, so a toolchain that regressed the 6.5.10 fix would fail setu's CI rather than a
+  consumer's build.

@@ -101,7 +101,7 @@ cyrius build programs/smoke.cyr build/setu-smoke        # link-check
 cyrius build programs/codec_test.cyr build/codec_test   # a RUN test
 ./build/codec_test                                      # exit 0 = PASS
 cyrius distlib                                          # regenerate dist/setu.cyr + dist/setu.deps
-sh scripts/sync-deps-sidecar.sh                         # rewrite dist/setu.deps from [deps].stdlib
+cyrius distlib --check                                  # is the committed dist/ current? (writes nothing)
 ```
 
 setu is a library, so there is no CLI binary. `[build].entry` is
@@ -118,6 +118,11 @@ kind (encode→decode, assert kind + argc + args identical, incl. signed /
 large args) and asserts the parser rejects a truncated frame, a bad-argc
 frame, and an unknown kind. This is the proof the contract holds.
 
+Commit `dist/` exactly as `cyrius distlib` writes it. CI fails if either
+file differs from a fresh regeneration (`cyrius distlib --check`), if the
+bundle does not compile, or if `dist/setu.deps` omits a declared
+`[deps].stdlib` leaf.
+
 ### Toolchain
 
 The pin is `[package].cyrius` in `cyrius.cyml`; CI and the release workflow
@@ -129,7 +134,8 @@ compiler. `lib/` is vendored from the pinned toolchain's stdlib by
 ### Dependencies
 
 Cyrius stdlib only, no external libs. The declared set is `[deps].stdlib`
-in `cyrius.cyml`, and `dist/setu.deps` repeats it so consumers of
+in `cyrius.cyml`. `cyrius distlib` writes it into `dist/setu.deps`, together
+with any stdlib leaf `src/lib.cyr` includes, so consumers of
 `dist/setu.cyr` are told what to have in scope. The wire codec needs none of
 it: little-endian marshalling uses the `load8` / `store8` builtins.
 
@@ -141,7 +147,7 @@ it: little-endian marshalling uses the `load8` / `store8` builtins.
 | `io` | `getenv`: `$SETU_SOCKET` on Linux, `AGNOS_CHAN` on agnos. On agnos `io.cyr` delegates to `args_agnos.cyr`'s `_agnos_getenv` (agnos has no `/proc`), and since cyrius 6.6.6 includes that file itself. |
 | `syscalls` | AF_UNIX `sys_socket` / `sys_connect` / `sys_bind` / `sys_listen` / `sys_accept4` / `sys_recvfrom` / `sys_unlinkat` (Linux); the `sys_chan_*` channel band and `sys_shm_*` buffers (agnos); `SYS_WRITE` / `SYS_EXIT`. |
 | `args` | `argc()` / `args_init()` in `programs/reach_test.cyr` and `programs/unix_transport_test.cyr`. Before cyrius 6.6.6 it was also what put `_agnos_getenv` in scope for `io`'s `getenv` on agnos. |
-| `vec`, `str`, `assert`, `result`, `net`, `chrono` | ⚠ Not referenced by setu's own code, and every build is clean with them undeclared (measured at 0.8.10). `vec` and `result` are compiled in regardless, because `fmt` and `io` include them. `net` and `result` served the TCP transport removed in 0.8.4; `chrono` backed the agnos read-retry sleep removed in 0.8.2; `vec` / `str` / `assert` date from the scaffold. They stay declared (and so stay in `dist/setu.deps`) until a deliberate prune, because dropping one changes what consumers are told to declare. |
+| `vec`, `str`, `assert`, `result`, `net`, `chrono` | ⚠ Not referenced by setu's own code, and every build is clean with them undeclared (measured at 0.8.10). `vec` and `result` are compiled in regardless, because `fmt` and `io` include them. `net` and `result` served the TCP transport removed in 0.8.4; `chrono` backed the agnos read-retry sleep removed in 0.8.2; `vec` / `str` / `assert` date from the scaffold. They stay declared (and so stay in `dist/setu.deps`) until a deliberate prune, because dropping one changes what consumers are told to declare. For `vec` / `str` / `assert` that also means removing their `src/lib.cyr` includes: distlib's include scan keeps an included leaf in the sidecar even when it is undeclared (measured on 6.6.6). |
 
 ## Roadmap
 
