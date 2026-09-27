@@ -10,6 +10,9 @@
 # no coalescing and no splitting. That is the property the whole setu framing design rests on, and it
 # is the property that, when it was absent on the agnos arm, cost three consecutive releases.
 #
+# It also checks what `setu_client_present` puts on the wire when no shared buffer is available
+# (`present_all_or_nothing`): nothing. Only a wire test can see a message that should not be there.
+#
 # Single process: AF_UNIX `connect()` completes against a listening socket without the peer having
 # called `accept()` yet (the connection sits in the backlog), so no fork is needed to have both ends.
 
@@ -28,6 +31,101 @@ fn ck(what, got, want) {
     }
     return 0;
 }
+
+#ifndef CYRIUS_TARGET_AGNOS
+# The next record waiting on `fd`, decoded into `m`: its length, or -1 when nothing is waiting.
+# `kind` is cleared first, so a record that is not a setu frame reads back as kind 0.
+fn next_rec(fd, m) {
+    var buf = alloc(256);
+    setu_msg_set_kind(m, 0);
+    var r = sys_recvfrom(fd, buf, 256, SETU_MSG_DONTWAIT, 0, 0);
+    if (r < 0) { return 0 - 1; }
+    setu_decode(buf, r, m);
+    return r;
+}
+
+# ⭐ A PRESENT WITH NO SHARED BUFFER SENDS NOTHING. The inline fallback this replaces sent
+# ATTACH(buf_id = 0) and then had its pixel write refused by the one-record rule, so the peer held an
+# ATTACH whose pixels never came. Now the buffer is made and filled before anything is sent, so a
+# failed present leaves the wire as it found it, including the CREATE_SURFACE of a first present.
+fn present_all_or_nothing(sfd, path) {
+    var c = setu_client_connect(path);
+    ck("present: client connect", c != 0, 1);
+    if (c == 0) { return 0; }
+    var pfd = setu_accept(sfd);
+    ck("present: accept", pfd >= 0, 1);
+    if (pfd < 0) { return 0; }
+
+    var w = 32;
+    var h = 32;
+    var nbytes = w * h * 4;                        # 4 KB, far past one 64-byte record
+    var pix = alloc(nbytes);
+    var i = 0;
+    while (i < nbytes) { store8(pix + i, (i * 7 + 3) & 255); i = i + 1; }
+    var m = setu_msg_new();
+    var p = alloc(48);
+
+    # The client blocks reading SURFACE_CREATED and this test is one process, so the reply is queued
+    # up front. Step 1 must leave it unread; step 2's handshake consumes it.
+    ck("present: queue reply", setu_send(pfd, setu_surface_created(77)) > 0, 1);
+
+    # --- 1. No buffer can be created on the FIRST present. A directory at the path setu_buf_create
+    # picks next makes its open() fail EISDIR.
+    # ⚠ This predicts buf.cyr's naming (pid * 100000 + counter). If that changes the create succeeds,
+    # present returns 0, and the rc check fails, so it cannot pass vacuously.
+    setu_buf_path(sys_getpid() * 100000 + _setu_buf_counter + 1, p);
+    ck("present: occupy next buffer path", sys_mkdirat(AT_FDCWD, p, 448), 0);
+    ck("present: create fails, rc", setu_client_present(c, pix, w, h), 0 - 45);
+    ck("present: create fails, wire empty", next_rec(pfd, m), 0 - 1);
+    ck("present: create fails, no surface", setu_client_sid(c), 0);
+    sys_unlinkat(AT_FDCWD, p, AT_REMOVEDIR);
+
+    # --- 2. The next present recovers: CREATE_SURFACE, ATTACH by id, COMMIT.
+    ck("present: recovers, rc", setu_client_present(c, pix, w, h), 0);
+    next_rec(pfd, m);
+    ck("present: rec 1 kind", setu_msg_kind(m), SETU_CREATE_SURFACE);
+    next_rec(pfd, m);
+    ck("present: rec 2 kind", setu_msg_kind(m), SETU_ATTACH);
+    ck("present: rec 2 sid", setu_msg_arg(m, 0), 77);
+    var bid = setu_msg_arg(m, 5);
+    ck("present: rec 2 names a buffer", bid > 0, 1);
+    next_rec(pfd, m);
+    ck("present: rec 3 kind", setu_msg_kind(m), SETU_COMMIT);
+    ck("present: nothing after commit", next_rec(pfd, m), 0 - 1);
+    var back = alloc(nbytes);
+    ck("present: buffer read by id", setu_buf_read(bid, back, nbytes), 0);
+    var miss = 0;
+    i = 0;
+    while (i < nbytes) {
+        if (load8(back + i) != load8(pix + i)) { miss = miss + 1; }
+        i = i + 1;
+    }
+    ck("present: buffer holds the frame", miss, 0);
+
+    # --- 3. The cached buffer stops taking writes: fail before ATTACH and drop the dead id.
+    setu_buf_path(bid, p);
+    sys_unlinkat(AT_FDCWD, p, 0);
+    ck("present: occupy cached buffer path", sys_mkdirat(AT_FDCWD, p, 448), 0);
+    ck("present: write fails, rc", setu_client_present(c, pix, w, h), 0 - 46);
+    ck("present: write fails, wire empty", next_rec(pfd, m), 0 - 1);
+    ck("present: write fails, id dropped", load64(c + SETU_C_BUFID), 0);
+    sys_unlinkat(AT_FDCWD, p, AT_REMOVEDIR);
+
+    # --- 4. The next present makes a fresh buffer, and the surface is not created twice.
+    ck("present: after write failure, rc", setu_client_present(c, pix, w, h), 0);
+    next_rec(pfd, m);
+    ck("present: rec 4 kind", setu_msg_kind(m), SETU_ATTACH);
+    ck("present: rec 4 fresh buffer", setu_msg_arg(m, 5) != bid, 1);
+    ck("present: rec 4 buffer id", setu_msg_arg(m, 5) > 0, 1);
+    next_rec(pfd, m);
+    ck("present: rec 5 kind", setu_msg_kind(m), SETU_COMMIT);
+    ck("present: nothing after rec 5", next_rec(pfd, m), 0 - 1);
+
+    setu_client_close(c);                          # frees the cached buffer
+    sys_close(pfd);
+    return 0;
+}
+#endif
 
 fn main(): i64 {
     alloc_init();
@@ -85,6 +183,8 @@ fn main(): i64 {
     ck("rec1 byte0", load8(r1), 65);
     ck("rec2 byte0", load8(r2), 97);
 
+    present_all_or_nothing(sfd, path);
+
     sys_close(afd);
     sys_close(cfd);
     sys_close(sfd);
@@ -92,8 +192,10 @@ fn main(): i64 {
     if (fails != 0) { sys_write(1, "unix_transport_test: FAILED\n", 28); return 1; }
     var ok = "unix_transport_test: PASS (AF_UNIX SOCK_SEQPACKET: connect/accept,\n";
     sys_write(1, ok, strlen(ok));
-    var ok2 = "  both directions, RECORD boundaries preserved)\n";
+    var ok2 = "  both directions, RECORD boundaries preserved, and a present\n";
     sys_write(1, ok2, strlen(ok2));
+    var ok3 = "  with no shared buffer sends nothing)\n";
+    sys_write(1, ok3, strlen(ok3));
     return 0;
     #endif
 }

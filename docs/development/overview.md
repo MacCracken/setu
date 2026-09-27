@@ -85,7 +85,9 @@ keeps pixels off the wire, and there is no `SCM_RIGHTS`. `buf_id` (arg5,
 `src/buf.cyr` — agnos kernel shm (`sys_shm_*`), `/dev/shm/setu-buf-<id>` on
 Linux — that the client writes and the compositor reads by id; a plain
 integer crosses both transports unchanged. `buf_id = 0` is the legacy inline
-form (`setu_attach`): pixels follow the frame. The connection fd belongs to
+form (`setu_attach`): pixels follow the frame. It is retired, since setu sends
+at most 64 bytes per record on both targets and no real surface fits; the
+client never sends it and aethersafha refuses it. The connection fd belongs to
 `client.cyr`.
 
 ## What setu is NOT

@@ -92,21 +92,21 @@ fn setu_err_print_name(code): i64 {
 # @public — stable API surface for the setu message model.
 # proto.cyr — the display-protocol MESSAGE TYPES + fixed field layouts.
 #
-# setu carries ONLY pixel / input / surface-lifecycle messages between GUI
-# clients (dhancha, puka, crab) and the aethersafha compositor. It is AGENT-FREE by
+# setu carries ONLY pixel / input / surface-lifecycle messages between the
+# dhancha client and the aethersafha compositor. It is AGENT-FREE by
 # construction: no agent / MCP concepts ride this plane (introspection +
 # drive-verbs ride a SEPARATE bote/t-ron/daimon endpoint, per the native
 # display-protocol design §0/§3). Keeping the display wire agent-free is
 # what keeps the desktop AI-OPTIONAL by construction.
 #
-# Message ABI (frozen for 0.x — do NOT renumber or reorder args):
+# Message ABI (frozen for v0.1 — do NOT renumber or reorder args):
 #
 #   kind                 dir    args (in order)
 #   SETU_HELLO           C<->S  version, role
 #   SETU_CREATE_SURFACE  C->S   w, h, flags
 #   SETU_SURFACE_CREATED S->C   id
 #   SETU_CONFIGURE       S->C   id, w, h, state
-#   SETU_ATTACH          C->S   id, w, h, stride, fmt, buf_id   (see NOTE below)
+#   SETU_ATTACH          C->S   id, w, h, stride, fmt   (see NOTE below)
 #   SETU_COMMIT          C->S   id
 #   SETU_CLOSE           C<->S  id
 #   SETU_INPUT_KEY       S->C   id, keysym, mods   (mods = press/release 1/0 on FULL_KEYS)
@@ -115,16 +115,15 @@ fn setu_err_print_name(code): i64 {
 #   SETU_INPUT_PTR_SCROLL S->C  id, delta (signed; + = up/away)
 #   SETU_INPUT_FOCUS     S->C   id, focused
 #
-# NOTE — SETU_ATTACH names a SHARED BUFFER; no fd is passed (there is no SCM_RIGHTS):
-#   On the present path the pixels do not ride the setu wire. The client copies them
-#   into a buffer owned by the kernel/OS and keyed by an integer id (buf.cyr — agnos
-#   kernel shm, a /dev/shm/setu-buf-<id> file on Linux), and ATTACH names it in arg5,
-#   `buf_id` (setu_attach_buf); the compositor reads the pixels by that id. The id is a
-#   plain integer, so it crosses both transports unchanged. `buf_id = 0` is the legacy
-#   INLINE form (setu_attach), in which the pixels follow the frame. ⚠ No real surface
-#   fits it: setu sends at most 64 B per record on both targets (setu_write_all).
-#   This module never touches an fd. The connection fd belongs to client.cyr, from
-#   connect (on agnos, from spawn) to close.
+# NOTE — SETU_ATTACH and out-of-band fds:
+#   The pixel buffer's memfd/shm file descriptor is passed OUT-OF-BAND over
+#   the transport socket via SCM_RIGHTS ancillary data — it is NOT part of
+#   the setu payload. setu's ATTACH message carries only the buffer METADATA
+#   (id, w, h, stride, fmt); the receiving side pairs the next SCM_RIGHTS fd
+#   with the ATTACH it accompanies. The lib never touches an fd — transport
+#   ownership (send/recv + SCM_RIGHTS marshalling) lives in each side, not in
+#   this contract lib. This is the one field that is deliberately absent from
+#   the wire args.
 
 # ================================================================
 # Message kinds — the wire discriminant.
@@ -137,7 +136,7 @@ enum SetuMsgKind {
     SETU_CREATE_SURFACE  = 2;   # C->S:  w, h, flags
     SETU_SURFACE_CREATED = 3;   # S->C:  id
     SETU_CONFIGURE       = 4;   # S->C:  id, w, h, state
-    SETU_ATTACH          = 5;   # C->S:  id, w, h, stride, fmt, buf_id (shared buffer; 0 = inline)
+    SETU_ATTACH          = 5;   # C->S:  id, w, h, stride, fmt (memfd out-of-band)
     SETU_COMMIT          = 6;   # C->S:  id
     SETU_CLOSE           = 7;   # C<->S: id
     SETU_INPUT_KEY       = 8;   # S->C:  id, keysym, mods (mods=press/release value 1/0 on
@@ -206,7 +205,7 @@ enum SetuSurfaceFlags {
 var SETU_MSG_KIND   = 0;    # offset of kind
 var SETU_MSG_ARGC   = 8;    # offset of argc
 var SETU_MSG_ARGS   = 16;   # offset of args[0]
-var SETU_MAX_ARGS   = 8;    # max args any kind carries (fits the widest, ATTACH=6)
+var SETU_MAX_ARGS   = 8;    # max args any kind carries (fits the widest, ATTACH=5)
 var SETU_MSG_SIZE   = 80;   # 2 words header + 8 arg words
 
 # Allocate a zeroed SetuMsg. Returns 0 on OOM.
@@ -352,9 +351,8 @@ fn setu_configure(id, w, h, state): i64 {
     return m;
 }
 
-# The legacy INLINE ATTACH: buf_id (arg5) stays 0, so the pixels follow this frame on
-# the connection. No fd is passed with either form. A present with a shared buffer
-# uses setu_attach_buf; ⚠ see the NOTE at the top — no real surface fits inline.
+# The memfd/shm fd is passed OUT-OF-BAND via SCM_RIGHTS — NOT here. This
+# carries only the buffer metadata.
 fn setu_attach(id, w, h, stride, fmt): i64 {
     var m = setu_msg_begin(SETU_ATTACH);
     if (m == 0) { return 0; }
@@ -368,10 +366,9 @@ fn setu_attach(id, w, h, stride, fmt): i64 {
 }
 
 # ATTACH referencing a SHARED BUFFER by id (arg5 > 0) — the pixels live in the
-# shared buffer (see buf.cyr), NOT streamed inline after this frame. This is THE
-# present path on both targets: a surface is hundreds of KB and setu sends at most
-# 64 B per record, so only the id rides the wire. buf_id 0 would mean inline, so a
-# real shared buffer is always > 0.
+# shared buffer (see buf.cyr), NOT streamed inline after this frame. This is the
+# sovereign present path that sidesteps the single-CPU two-proc TCP flow-control
+# deadlock on agnos. buf_id 0 would mean inline, so a real shared buffer is always > 0.
 fn setu_attach_buf(id, w, h, stride, fmt, buf_id): i64 {
     var m = setu_msg_begin(SETU_ATTACH);
     if (m == 0) { return 0; }
@@ -470,9 +467,10 @@ fn setu_kind_name(kind): i64 {
 # codec.cyr — the PURE wire codec: SetuMsg <-> byte frame.
 #
 # NO I/O. NO allocation on the hot path (encode writes into a caller buffer;
-# decode fills a caller-provided SetuMsg). Transport (the connection and its
-# record send/recv) lives in client.cyr, NOT here — this file only turns a
-# message into bytes and untrusted bytes back into a validated message.
+# decode fills a caller-provided SetuMsg). Transport (socket send/recv,
+# SCM_RIGHTS fd passing) lives in each side, NOT here — this file only
+# turns a message into bytes and untrusted bytes back into a validated
+# message.
 #
 # ---- Frame format ----
 #
@@ -652,21 +650,21 @@ fn setu_encoded_len(msg): i64 {
 # Replaces inline-pixel streaming: the client writes its rendered pixels into a
 # buffer owned by the kernel/OS and keyed by an integer id; ATTACH carries the id
 # (setu_attach_buf, arg5 > 0), NOT the pixels; the compositor reads them back out.
-# Pixels cannot ride the wire: setu sends one record of at most 64 B per send on both
-# targets (client.cyr), and a surface is hundreds of KB. This path moves them with a
-# single kernel/OS copy each way — negligible vs a surface. See
+# This sidesteps the single-CPU two-proc TCP flow-control deadlock on agnos
+# (TCP_RX_RING = 2 KB, but a surface is hundreds of KB) with a single kernel/OS copy
+# each way — negligible vs a surface, and unnecessary once agnos is multi-core (the
+# inline path in client.cyr is the multi-core fallback). See
 # agnosticos/docs/development/planning/shared-buffer-present.md.
 #
 # COPY-based (not shared-page-mapped) on purpose: the buffer is OWNED by the kernel/OS,
 # never mapped into a process's own arena, so a client that exits right after present
 # can't free pages the compositor is still reading (agnos proc_free_address_space frees
-# every arena page on exit). The id is a small integer carried in ATTACH's arg5 — no
-# fd is passed — so it crosses both transports unchanged.
+# every arena page on exit). The id is a small integer sent over setu's TCP wire — no
+# fd passing — so it rides the transport unchanged on both targets.
 #   Linux — a tmpfs file /dev/shm/setu-buf-<id>: the client write()s it, the compositor
 #           read()s it. Pure userland; no kernel change.
-#   agnos — the kernel shm band: shm_create_gpu #86 (GPU-visible) first, falling back to
-#           shm_create #71 (system RAM — the QEMU path), then shm_write #72 / shm_read #73 /
-#           shm_free #74 on either kind of slot.
+#   agnos — kernel shm syscalls (shm_create/shm_write/shm_read/shm_free). STUBBED here;
+#           landed in the agnos shm bite (planning doc bite 2).
 
 var _setu_buf_counter = 0;
 
@@ -809,16 +807,12 @@ fn setu_buf_close(buf_id): i64 {
 # A harness that rigs the system under test is not evidence about the system.
 # ============================================================================
 #
-# Per-target semantics the framing absorbs (each arm #ifdef-guarded):
-#   - agnos: `chan_recv` answers AT ONCE and says which — a record's length, -CH_E_WOULDBLOCK
-#     (nothing yet) or -CH_E_PEERGONE (peer gone). `chan_send` delivers one record of <= 64 B or
-#     nothing.
-#   - Linux: reads block on the connected fd (0 = EOF); the frame-loop polls ask per call with
-#     MSG_DONTWAIT instead (EAGAIN = nothing yet). A SOCK_SEQPACKET write is one record.
-#   So no write loops on either target, and a frame over 64 B is refused on both.
+# Two agnos socket semantics the framing absorbs (both #ifdef-guarded, so Linux
+# behaviour is unchanged):
+#   - `sock_recv` #49 is NON-BLOCKING: 0 = would-block, -1 = EOF (inverted from Linux).
+#   - `sock_send` #48 may send < len, so writes loop.
 #
-# Model: connect once → create surface once → per present, pixels into the shared buffer
-# (buf.cyr), then ATTACH (by buf_id) + COMMIT on the wire.
+# Model: connect once → create surface once → ATTACH + pixels + COMMIT per present.
 
 # ⛔⛔ TCP IS GONE FROM setu ON BOTH TARGETS. The operator's ruling was that TCP-on-loopback is the
 # WRONG PRIMITIVE for LOCAL DISPLAY IPC — a property of the problem, not of the kernel. Scoping the
@@ -902,8 +896,10 @@ fn setu_un_path(path): i64 {
 # agnos: NO DIAL — returns the endowed fd named by `AGNOS_CHAN`. Returns the fd (>= 0), or -2
 # (socket) / -3 (connect) on Linux, -8 (no usable chan band) / -9 (no announcement) on agnos.
 # `setu_connect_error` / `setu_connect_rc` separate failures that otherwise collapse to one message.
-var setu_conn_err = 0;      # -2 / -3 (Linux), -8 / -9 (agnos). 0 = last one worked.
-var setu_conn_rc = 0;       # raw kernel return behind a Linux -2 (sys_socket) / -3 (sys_connect); 0 if none.
+# ⛔ This dials an IP address for a LOCAL channel, which is the wrong premise itself.
+# The anu replacement is handed a channel at spawn and dials nothing.
+var setu_conn_err = 0;      # -2 socket, -3 connect. 0 = last one worked.
+var setu_conn_rc = 0;       # raw sys_sock_connect return behind a -3.
 fn setu_connect_error(): i64 { return setu_conn_err; }
 fn setu_connect_rc(): i64 { return setu_conn_rc; }
 
@@ -1008,13 +1004,15 @@ fn setu_connect(path): i64 {
 
 # --- server transport (the compositor owns the listener) ---------------------
 
-# Bind + listen on the setu endpoint. Linux: AF_UNIX/SOCK_SEQPACKET at `path` (or the default
-# rendezvous). agnos: REFUSES with -2 — there is no listener on the channel band; clients are
-# placed, never accepted. Returns the listening fd (>= 0), or -2 (socket) / -3 (bad path or bind) /
-# -4 (listen). The fd is set non-blocking so setu_accept polls instead of stalling the frame loop.
-# ⛔ The agnos arm was once a network LISTENER on loopback:7700, costing a well-known port plus TWO
-# of the eight system-wide TCP conn slots per connection, so listener + 3 clients exhausted the
-# table the NETWORK is supposed to use (agnos `planning/ipc.md` §10.1). See the agnos arm below.
+# Bind + listen on the setu endpoint. Linux: AF_UNIX/SOCK_SEQPACKET at `path`. agnos: REFUSES —
+# there is no listener on the channel band; clients are placed, never accepted.
+# Returns the listening fd (>= 0), or -2 (socket) / -3 (bind) / -4 (listen). The
+# fd is set non-blocking so setu_accept polls (agnos #57 is already non-blocking).
+# ⛔ RETIRED WRONG PREMISE — see the banner at the top of this file. A compositor should
+# not be a network LISTENER: on agnos this costs a well-known port plus TWO of the eight
+# system-wide TCP conn slots per loopback connection, so listener + 3 clients exhausts the
+# table the NETWORK is supposed to use (agnos `planning/ipc.md` §10.1). The anu
+# replacement places a channel instead of accepting dials. Kept only until §9.6 lands.
 fn setu_listen(path): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     # ⛔ THERE IS NO LISTENER ON AGNOS. A compositor does not accept connections on the channel band —
@@ -1067,8 +1065,8 @@ fn setu_accept(sfd): i64 {
 
 # --- write --------------------------------------------------------------------
 
-# Write `n` bytes from `buf` to `fd` as ONE record — no loop, on either target. Returns `n`
-# (>= 0), or -7 if `n` > 64 or the send fails or comes up short.
+# Write EXACTLY `n` bytes from `buf` to `fd`, looping over partial sends (agnos
+# sock_send #48 may send < len). Returns `n` (>= 0) or -7 on a write error.
 fn setu_write_all(fd, buf, n): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     # ⭐ ONE RECORD, ALL-OR-NOTHING — there is no partial send to loop over. Framing is a property of
@@ -1103,11 +1101,26 @@ fn setu_send(fd, msg): i64 {
     return enc;
 }
 
-# Read ONE record into `buf` (cap `cap`), blocking until one arrives. Returns its length
-# (> 0), or -6 on EOF / peer gone / error / timeout.
-#   agnos — `chan_recv` answers at once; on WOULDBLOCK the loop busy-spins (preemptible) and
-#           retries until a wall-clock deadline ~8 s out, then returns -6.
-#   Linux — one blocking read on the connected fd; 0 (EOF) or an error returns -6.
+# Read at least 1 byte into `buf` (cap `cap`), blocking until data / EOF.
+# Returns bytes (> 0), or -6 on EOF / error / timeout.
+#
+# ⛔ THE agnos ARM'S RETRY BUDGET IS NOT WHAT IT LOOKS LIKE, and the old comment here
+# ("0 = would-block → yield + bounded retry", "~10s cap at 5000*2ms") was wrong about
+# BOTH halves. On agnos a TAGGED socket fd's `sys_read` does not reach the kernel
+# directly — the cyrius stdlib routes it to `_agnos_sock_recv_block`
+# (`syscalls_x86_64_agnos.cyr:1084`), which itself polls `sock_recv #49` under a
+# 30 s wall-clock deadline (`AGNOS_SOCK_RECV_TIMEOUT_S = 30`) plus a 6000-spin
+# backstop, and returns **0 for BOTH EOF and timeout**. So:
+#   - `r == 0` NEVER means "would-block, try again in 2 ms". It means the wrapper has
+#     already burned up to 30 seconds, or the peer is gone.
+#   - the loop below therefore multiplies a ~30 s call by up to 5001 iterations, and
+#     the sleep between them is noise against that.
+# ⚠ Left as-is deliberately: the working desktop path runs through here today and the
+# blocking semantics are a KERNEL/stdlib gap (ring 3 has no way to ask "is a byte
+# waiting?" and get an immediate answer), not a defect this function can honestly fix
+# on its own. Tracked as a 1.56.35 kernel item. Do not "tighten" the retry count
+# without measuring first — the budget that matters is the inner wrapper's, not this
+# loop's.
 fn setu_read_blk(fd, buf, cap): i64 {
     # ⛔ BOUND BY WALL CLOCK, NOT BY ITERATIONS. The retry budget has to be a DURATION, because what it
     # is waiting for is a peer being scheduled. The first cut replaced `sys_sleep_ms(2)` with a fixed
@@ -1133,8 +1146,8 @@ fn setu_read_blk(fd, buf, cap): i64 {
         # `sys_read` path routed a tagged socket fd through the stdlib's `_agnos_sock_recv_block`,
         # which polled under a **30 second** deadline and returned 0 for BOTH EOF and timeout, so
         # `r == 0` could never mean "would-block" and this loop multiplied a ~30 s call. `chan_recv`
-        # answers immediately and says WHICH: -8 nothing yet, -9 peer gone. The old note that ring 3
-        # has "no way to ask 'is a byte waiting?'" is obsolete on this path.
+        # answers immediately and says WHICH: -8 nothing yet, -9 peer gone. The comment above about
+        # ring 3 having "no way to ask 'is a byte waiting?'" is obsolete on this path.
         var r = sys_chan_recv(fd, buf, cap);
         if (r > 0) { return r; }
         if (r == 0 - CH_E_PEERGONE) { return 0 - 6; }
@@ -1163,9 +1176,9 @@ fn setu_read_blk(fd, buf, cap): i64 {
     return 0 - 6;                                    # would-block timeout (agnos)
 }
 
-# Read ONE setu frame (one record) from `fd` into `msg_out`. Returns the decoded
-# length (> 0), -6 on EOF / error / timeout, or a negated SetuErr. Now that both
-# transports are record transports this is the same read as setu_read_msg.
+# Read ONE setu frame from `fd` into `msg_out` via a single bulk read. Returns
+# the decoded length (> 0), -6 on EOF, or a negated SetuErr. Use setu_read_msg
+# (length-framed) when reading a continuous STREAM of frames.
 fn setu_recv(fd, msg_out): i64 {
     var cap = 256;
     var buf = alloc(cap);
@@ -1176,10 +1189,15 @@ fn setu_recv(fd, msg_out): i64 {
 
 # Poll for ONE inbound frame (the S->C input channel). Returns 1 and fills `msg_out`
 # when a frame arrived, 0 when nothing is pending, or -6 on EOF/error.
-# NON-BLOCKING on both targets: agnos `chan_recv` answers at once (-CH_E_WOULDBLOCK =
-# nothing yet); Linux asks per call with MSG_DONTWAIT (EAGAIN = nothing yet).
-# ⚠ Decodes only the FIRST frame of each record and drops any rest — harmless from a setu
-# peer, which sends one frame per record. setu_client_poll_input keeps the rest and reassembles.
+# ⛔ "NON-BLOCKING ... never stalls" was the claim here and it is FALSE ON agnos. The
+# single `sys_read` below routes a tagged socket fd through the stdlib's
+# `_agnos_sock_recv_block`, which polls under a 30 s deadline before returning 0. On a
+# frame with nothing pending this can stall the caller's loop. It has not been observed
+# to bite (the desktop measures ~10 ms/frame in QEMU, i.e. data is pending on the polls
+# that matter) but the contract as written is not the contract as implemented.
+# See setu_read_blk above; the fix belongs in the kernel/stdlib, not here.
+# ⚠ Decodes only the FIRST frame of each recv; coalesced or split frames are dropped.
+# Kept for API compat — stream consumers use setu_client_poll_input, which reassembles.
 fn setu_poll_input(fd, msg_out): i64 {
     var cap = 256;
     var buf = alloc(cap);
@@ -1209,8 +1227,8 @@ fn setu_poll_input(fd, msg_out): i64 {
     return 1;
 }
 
-# REFUSED: always returns -6 and reads nothing. The "read exactly `n` bytes" contract
-# this name promises belongs to a stream transport, which setu no longer has.
+# Read EXACTLY `n` bytes from `fd` into `buf`, looping over short/would-block
+# reads. Returns `n` (>= 0) or -6 on EOF/error.
 fn setu_read_exact(fd, buf, n): i64 {
     # ⛔ REFUSED ON BOTH TARGETS AS OF THE AF_UNIX CUTOVER. "Read exactly N bytes" is a STREAM idiom
     # and both arms are now record transports; emulating it would re-import, in userland, the
@@ -1219,9 +1237,10 @@ fn setu_read_exact(fd, buf, n): i64 {
     return 0 - 6;
 }
 
-# Read ONE full setu frame from `fd` into `msg_out`: one record, decoded. Returns the
-# frame length (> 0), -6 on EOF / error / timeout, or a negated SetuErr when the record
-# is not a valid frame.
+# Read ONE full setu frame from `fd` into `msg_out` using length-from-header
+# framing (kind + argc header -> (2+argc)*8 total bytes). Returns the frame
+# length (> 0), -6 on EOF / short read / bad argc, or a negated SetuErr. Use this
+# (not setu_recv) when reading a continuous stream of frames — the input path.
 fn setu_read_msg(fd, msg_out): i64 {
     # ⭐⭐ NO `#ifdef` HERE ANY MORE, AND THAT IS THE POINT OF THE AF_UNIX CUTOVER. agnos delivers a
     # record over the `#97` channel band; Linux delivers a record over AF_UNIX/SOCK_SEQPACKET. One
@@ -1268,13 +1287,14 @@ var SETU_C_INBUF_CAP = 512;   # ≥ 6 widest frames ((2+8)*8 = 80 B); input fram
 
 # Connect to the compositor's setu endpoint. Returns a *SetuClient, or 0 on
 # failure. The surface is created lazily on the first setu_client_present.
-# No retry loop, and on agnos nothing to retry: a placed channel is never dialled, so a
-# client either holds the end it was endowed at spawn or never will, and -8 / -9 are final.
-# On Linux a failed connect returns 0 at once; setu_connect_error / setu_connect_rc say why.
-# ⛔ The old TCP arm could not usefully retry either: agnos `sock_connect` #47 held preempt for
-# the whole attempt, so a retrying client starved the compositor it was waiting for (200
-# retries stretched a 30 s budget to 72 s with ZERO connections) — one of the six
-# accommodations that falsified TCP (agnos `planning/ipc.md` §10.0).
+# ⛔ No retry loop here: agnos `sock_connect` #47 holds preempt for the whole attempt,
+# so a retrying client starves the compositor it is waiting for. (200 retries stretched a
+# 30 s compositor budget to 72 s with ZERO connections; a `sched_yield` between attempts does
+# not help — the cost is INSIDE the blocking syscall.)
+# ⛔ Do not read this rule as tuning. It is one of the six accommodations that falsify the TCP
+# transport itself (agnos `planning/ipc.md` §10.0) — a transport whose connect primitive starves
+# the peer being dialled is the wrong primitive. The hazard CEASES TO EXIST with the anu
+# migration (§9.6), because a placed channel is never dialled. Until then the rule stands.
 fn setu_client_connect(path): i64 {
     var fd = setu_connect(path);
     if (fd < 0) { return 0; }
@@ -1372,8 +1392,8 @@ fn setu_client_present(c, pix, w, h): i64 {
     return 0;
 }
 
-# Read the next setu frame off the client's connection into `msg_out` (one
-# record, blocking). Returns the frame length (> 0), or -6 on EOF/error. The consumer
+# Read the next setu frame off the client's connection into `msg_out` (stream
+# framing). Returns the frame length (> 0), or -6 on EOF/error. The consumer
 # interprets the message (INPUT_KEY / CONFIGURE / CLOSE ...).
 fn setu_client_recv(c, msg_out): i64 {
     return setu_read_msg(setu_client_fd(c), msg_out);
@@ -1436,8 +1456,8 @@ fn setu_client_poll_input(c, msg_out): i64 {
         if (setu__inbuf_take(c, msg_out) == 1) { return 1; }
         return 0;                                # partial frame — completes next poll
     }
-    if (r == 0) { return 0; }                    # nothing pending (agnos WOULDBLOCK, Linux EAGAIN)
-    # ⚠ Linux EOF and recv errors land here too (EOF-as-idle), where setu_poll_input returns -6 for EOF.
+    if (r == 0) { return 0; }                    # agnos: EOF *or* the wrapper's 30 s timeout; Linux: EOF-as-idle
+    # (matches setu_poll_input's semantics — including its blocking caveat)
     if (len > 0) { return 0; }                   # error but bytes pending — drain first
     return 0 - 6;                                # EOF / error
 }

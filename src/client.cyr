@@ -538,28 +538,26 @@ fn setu_client_request_premultiplied(c): i64 {
     return 0;
 }
 
-# Present an already-rendered w*h BGRA pixel buffer `pix`. The first present creates
-# the surface (CREATE_SURFACE -> SURFACE_CREATED) and the shared buffer; each present
-# hands pixels over by buffer id (ATTACH-by-id), falling back to inline pixels when the
-# shared-buffer backend is unavailable. Returns 0 or a negative code (-41 create send,
-# -6 recv, -8 unexpected reply, -42 attach send, -43 pixel write, -44 commit send,
-# -45 buffer map).
+# Present an already-rendered w*h BGRA pixel buffer `pix`: copy it into the client's shared
+# buffer (buf.cyr — made on the first present, rewritten in place after that since the
+# compositor re-reads the id it holds, remade on a resize, freed by setu_client_close), then
+# send ATTACH naming that buffer by id, then COMMIT. The first present also creates the surface
+# (CREATE_SURFACE -> SURFACE_CREATED), once the buffer is ready.
+# Returns 0 or a negative code: -45 no shared buffer could be made, -46 writing it failed (for
+# both NOTHING was sent, so presenting again is a clean retry), -41 create send, -6 recv,
+# -8 unexpected reply, -42 attach send, -44 commit send. -43 was the retired inline pixel write.
 fn setu_client_present(c, pix, w, h): i64 {
     var fd = setu_client_fd(c);
-    var id = setu_client_sid(c);
-    if (id == 0) {
-        if (setu_send(fd, setu_create_surface(w, h, load64(c + SETU_C_FLAGS))) < 0) { return 0 - 41; }
-        var reply = setu_msg_new();
-        if (setu_read_msg(fd, reply) < 0) { return 0 - 6; }
-        if (setu_msg_kind(reply) != SETU_SURFACE_CREATED) { return 0 - 8; }
-        id = setu_msg_arg(reply, 0);
-        store64(c + SETU_C_SID, id);
-    }
     var stride = w * 4;
     var nbytes = h * stride;
-    # --- Shared-buffer present. Created once and rewritten in place every present (the
-    #     compositor re-reads the id it holds on each commit); a resize recreates it.
-    #     Freed in setu_client_close. ---
+    # ⛔ THE BUFFER FIRST, AND NO INLINE FALLBACK. An ATTACH with buf_id = 0 promises pixels on the
+    # connection, and they cannot follow: a send is one record of at most 64 B on both targets, so
+    # setu_write_all refuses them, and aethersafha refuses that form on both of its handlers anyway.
+    # The fallback that tried it left the compositor holding an ATTACH whose pixels never came. The
+    # buffer is therefore made and filled before anything is sent, including the first present's
+    # CREATE_SURFACE, so a present that fails here leaves the wire exactly as it found it.
+    # ⚠ Reachable: agnos has 16 shm slots system-wide and a #71 slot holds at most 2 MB (QEMU has no
+    # other kind); a /dev/shm write can fail on Linux.
     var buf_id = load64(c + SETU_C_BUFID);
     if (buf_id > 0) {
         if (load64(c + SETU_C_BUFSZ) != nbytes) {          # resize -> recreate
@@ -571,27 +569,27 @@ fn setu_client_present(c, pix, w, h): i64 {
     }
     if (buf_id <= 0) {
         buf_id = setu_buf_create(nbytes);
-        if (buf_id > 0) {
-            store64(c + SETU_C_BUFID, buf_id);
-            store64(c + SETU_C_BUFSZ, nbytes);
-        }
+        if (buf_id <= 0) { return 0 - 45; }
+        store64(c + SETU_C_BUFID, buf_id);
+        store64(c + SETU_C_BUFSZ, nbytes);
     }
-    if (buf_id > 0) {
-        if (setu_buf_write(buf_id, pix, nbytes) == 0) {
-            if (setu_send(fd, setu_attach_buf(id, w, h, stride, 1, buf_id)) < 0) { return 0 - 42; }
-            if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }
-            return 0;
-        }
-        # Write failed — drop the cached buffer (don't retry a dead id every frame)
-        # and fall through to the inline path for this present.
+    if (setu_buf_write(buf_id, pix, nbytes) != 0) {
+        # Drop the dead id rather than retry it every frame; the next present makes a fresh one.
         setu_buf_close(buf_id);
         store64(c + SETU_C_BUFID, 0);
         store64(c + SETU_C_BUFSZ, 0);
+        return 0 - 46;
     }
-    # --- Inline fallback: shared-buffer backend unavailable. ATTACH's arg5 (buf_id)
-    #     stays 0 → the server reads inline pixels. ---
-    if (setu_send(fd, setu_attach(id, w, h, stride, 1)) < 0) { return 0 - 42; }
-    if (setu_write_all(fd, pix, nbytes) < 0) { return 0 - 43; }
+    var id = setu_client_sid(c);
+    if (id == 0) {
+        if (setu_send(fd, setu_create_surface(w, h, load64(c + SETU_C_FLAGS))) < 0) { return 0 - 41; }
+        var reply = setu_msg_new();
+        if (setu_read_msg(fd, reply) < 0) { return 0 - 6; }
+        if (setu_msg_kind(reply) != SETU_SURFACE_CREATED) { return 0 - 8; }
+        id = setu_msg_arg(reply, 0);
+        store64(c + SETU_C_SID, id);
+    }
+    if (setu_send(fd, setu_attach_buf(id, w, h, stride, 1, buf_id)) < 0) { return 0 - 42; }
     if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }
     return 0;
 }

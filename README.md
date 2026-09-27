@@ -106,8 +106,12 @@ kernel/OS and keyed by an integer id — kernel shm (`sys_shm_*`) on agnos, a
 arg, `buf_id` (`setu_attach_buf`), and the compositor reads the pixels by that
 id. The id is a plain integer, so it crosses both transports unchanged.
 `buf_id = 0` is the legacy inline form (`setu_attach`), in which pixels follow
-the frame. The connection fd belongs to `client.cyr`, which holds it from
-connect (on agnos, from spawn) to close.
+the frame. It is retired: setu sends at most 64 bytes per record on both
+targets, which no real surface fits, so the client never sends it and
+aethersafha refuses it. When no shared buffer can be made or written,
+`setu_client_present` returns -45 or -46 and sends nothing. The connection fd
+belongs to `client.cyr`, which holds it from connect (on agnos, from spawn) to
+close.
 
 ## The wire
 
