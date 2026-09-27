@@ -6,7 +6,7 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [0.8.11] - 2026-09-26
 
 ### Removed
 
@@ -87,7 +87,8 @@ a comment that describes a deleted transport reads as a statement about the code
 
 ⚠ One comment now states a behaviour it used to blur: on Linux `setu_client_poll_input` reads EOF and
 recv errors as idle (0), where `setu_poll_input` returns -6 for EOF. The old comment said
-"EOF-as-idle" and also claimed the two functions matched.
+"EOF-as-idle" and also claimed the two functions matched. That behaviour is fixed in its own entry
+below.
 
 Left alone: `setu_client_present`'s header and inline-fallback comments. That path sends ATTACH with
 `buf_id = 0` and then has its pixel write refused by the 64-byte rule. It is a behaviour bug, fixed
@@ -168,6 +169,51 @@ held size afterwards, and a retry at a new size after a first-present handshake 
 the wrong kind, -8). **Negative controls:** close-then-create fails 9 assertions. Four mutants of the
 fix each fail at least one: freeing the held buffer as soon as the replacement exists, never freeing
 the old one, keeping a replacement whose write failed, and keeping one after a failed handshake.
+
+Every program builds for Linux and `--agnos`. Lint reports 0 warnings; fmt, vet and the no-TCP gate
+are clean; all four RUN suites pass; `cyrius distlib --check` reports `dist/` current, and
+`dist/setu.deps` is unchanged.
+
+### Fixed — on Linux, `setu_client_poll_input` never reported the compositor gone
+
+Its Linux arm turned every `recvfrom` return that was not a record into "nothing pending" (0): EAGAIN,
+but also EOF and every error. So on Linux it could never return -6, although its header has promised
+-6 on EOF/error since it was written. A client whose compositor closed or crashed without sending
+`SETU_CLOSE` polled an idle channel forever; 0.8.6 records what a client that outlives its window
+costs. crab exits on -6 ("crab: connection closed -- exiting", reached through dhancha's
+`dh_client_poll_event`), so on Linux that exit could never fire.
+
+⚠ **Not deliberate.** It dates from 0.5.1, when one `sys_read` served both targets and agnos TCP's 0
+meant would-block, so Linux's 0 (EOF) fell into the same idle branch. The comment named the side
+effect ("EOF-as-idle") and gave no reason. 0.8.1 mapped agnos `PEERGONE` onto the EOF return. When
+0.8.4 moved both Linux polls to `MSG_DONTWAIT`, it gave `setu_poll_input` an explicit `EOF → -6` but
+mapped every negative to idle here.
+
+- **EAGAIN is the only "nothing pending".** EOF and every other error now come back as -6 once
+  nothing is buffered, and frames already buffered are still handed out first. Measured over a real
+  `SOCK_SEQPACKET` pair: after a clean close every later `recvfrom` reads 0; a close that leaves one of
+  the client's records unread reads -ECONNRESET once, then 0; an fd that was never valid reads -EBADF.
+  The poll turned all three into 0, and now turns all three into -6.
+- The header says -6 holds on both targets, and says to drain *while* the poll returns 1 rather than
+  "until 0": -6 is final, and a loop waiting for 0 would spin on it. No consumer loops that way;
+  dhancha, cyrius-doom and puka all branch on the value.
+- agnos is untouched: all six programs build byte-identical for `--agnos` before and after.
+- ⚠ **Consumers.** crab gains its EOF exit on Linux at its next local build, since it builds setu from
+  `path = "../setu"`. puka treats any result but 1 as "no event", so it neither breaks nor gains the
+  exit until `win_poll_events` maps -6 to `WIN_EV_CLOSE`. **dhancha's `programs/poll_test.cyr` fails 3
+  checks against this** (measured): its clients use fd -1 and expect 0 once drained, which held only
+  because -EBADF read as idle. dhancha resolves setu's 0.8.9 tag, so the test breaks when it bumps that
+  tag or re-enables its dormant `path`.
+- ⚠ Not changed: `setu_poll_input`'s Linux arm still reads every negative as idle. It does report EOF,
+  so a clean close surfaces at once and a reset one poll later, but an fd error would idle forever.
+  aethersafha polls client fds through it, so changing it is a separate decision.
+
+RUN-tested in `unix_transport_test` (`poll_sees_peer_gone`): a live, silent peer must poll idle (the
+negative control for EAGAIN); after a clean close with two frames queued in one record, both frames
+come out and then -6, twice; a close with a client record unread gives -6; so does an fd of -1.
+**Negative controls:** against the old code the test fails 4 assertions, every -6 reading 0. Three
+mutants each fail: mapping EAGAIN before EOF (a live peer reads as gone), dropping the EOF mapping (the
+clean close reads idle), and keeping every error idle (the reset and the bad fd read idle).
 
 Every program builds for Linux and `--agnos`. Lint reports 0 warnings; fmt, vet and the no-TCP gate
 are clean; all four RUN suites pass; `cyrius distlib --check` reports `dist/` current, and

@@ -12,6 +12,8 @@
 #
 # It also checks what `setu_client_present` puts on the wire when no shared buffer is available
 # (`present_all_or_nothing`): nothing. Only a wire test can see a message that should not be there.
+# And it checks that `setu_client_poll_input` reports a compositor that went away
+# (`poll_sees_peer_gone`), which only a real peer closing its end can show.
 #
 # Single process: AF_UNIX `connect()` completes against a listening socket without the peer having
 # called `accept()` yet (the connection sits in the backlog), so no fork is needed to have both ends.
@@ -212,6 +214,56 @@ fn present_all_or_nothing(sfd, path) {
     sys_close(pfd2);
     return 0;
 }
+
+# ⭐ A POLL MUST SEE THE COMPOSITOR GO. `setu_client_poll_input` read EOF and every recv error as
+# "nothing pending" on Linux, so a client whose compositor closed or died without SETU_CLOSE polled
+# forever. A peer goes one of two ways: a clean close (its queued records, then EOF on every recv), or
+# a close with our records still unread (-ECONNRESET once, then EOF). Both must come back as -6, and
+# only after every frame already buffered has been handed out.
+fn poll_sees_peer_gone(sfd, path) {
+    var m = setu_msg_new();
+
+    # --- 1. A clean close, with two frames queued in ONE record before it.
+    var c = setu_client_connect(path);
+    ck("gone: client connect", c != 0, 1);
+    if (c == 0) { return 0; }
+    var pfd = setu_accept(sfd);
+    ck("gone: accept", pfd >= 0, 1);
+    if (pfd < 0) { return 0; }
+    ck("gone: live and silent is idle", setu_client_poll_input(c, m), 0);   # EAGAIN, the only idle
+    var two = alloc(128);
+    var e1 = setu_encode(setu_input_key(7, 26, 1), two, 128);
+    var e2 = setu_encode(setu_input_key(7, 26, 0), two + e1, 128 - e1);
+    ck("gone: two frames, one record", sys_write(pfd, two, e1 + e2), e1 + e2);
+    sys_close(pfd);
+    ck("gone: frame 1 first", setu_client_poll_input(c, m), 1);
+    ck("gone: frame 1 is the press", setu_msg_arg(m, 2), 1);
+    ck("gone: frame 2 next", setu_client_poll_input(c, m), 1);
+    ck("gone: frame 2 is the release", setu_msg_arg(m, 2), 0);
+    ck("gone: then EOF", setu_client_poll_input(c, m), 0 - 6);
+    ck("gone: and it stays gone", setu_client_poll_input(c, m), 0 - 6);
+    setu_client_close(c);
+
+    # --- 2. The compositor closes with a record of ours unread: -ECONNRESET, not EOF, comes first.
+    var c2 = setu_client_connect(path);
+    ck("reset: client connect", c2 != 0, 1);
+    if (c2 == 0) { return 0; }
+    var pfd2 = setu_accept(sfd);
+    ck("reset: accept", pfd2 >= 0, 1);
+    if (pfd2 < 0) { return 0; }
+    ck("reset: leave a record unread", setu_send(setu_client_fd(c2), setu_commit(1)) > 0, 1);
+    sys_close(pfd2);
+    ck("reset: reported", setu_client_poll_input(c2, m), 0 - 6);
+    setu_client_close(c2);
+
+    # --- 3. An fd that was never a connection is an error too, not an idle channel.
+    var c3 = alloc(SETU_C_SZ);
+    var i = 0;
+    while (i < SETU_C_SZ) { store8(c3 + i, 0); i = i + 1; }
+    store64(c3 + SETU_C_FD, 0 - 1);
+    ck("badfd: reported", setu_client_poll_input(c3, m), 0 - 6);
+    return 0;
+}
 #endif
 
 fn main(): i64 {
@@ -271,6 +323,7 @@ fn main(): i64 {
     ck("rec2 byte0", load8(r2), 97);
 
     present_all_or_nothing(sfd, path);
+    poll_sees_peer_gone(sfd, path);
 
     sys_close(afd);
     sys_close(cfd);
@@ -281,7 +334,7 @@ fn main(): i64 {
     sys_write(1, ok, strlen(ok));
     var ok2 = "  both directions, RECORD boundaries preserved, and a present\n";
     sys_write(1, ok2, strlen(ok2));
-    var ok3 = "  with no shared buffer sends nothing)\n";
+    var ok3 = "  with no shared buffer sends nothing; a poll sees the peer go)\n";
     sys_write(1, ok3, strlen(ok3));
     return 0;
     #endif

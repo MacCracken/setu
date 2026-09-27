@@ -662,7 +662,8 @@ fn setu__inbuf_take(c, msg_out): i64 {
 # bytes in the client and hands out one frame per call. Use this, not setu_poll_input —
 # a dropped coalesced tail loses key-RELEASE events, which sticks keys for FULL_KEYS
 # consumers. Returns 1 and fills `msg_out` when a frame is ready, 0 when nothing is
-# pending, or -6 on EOF/error with nothing buffered. Call in a loop until 0 to drain.
+# pending, or -6 on EOF/error with nothing buffered, on both targets. Call in a loop
+# while it returns 1 to drain; -6 is final, so stop on it.
 fn setu_client_poll_input(c, msg_out): i64 {
     var ib = load64(c + SETU_C_INBUF);
     if (ib == 0) {
@@ -683,9 +684,15 @@ fn setu_client_poll_input(c, msg_out): i64 {
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     # See setu_poll_input: MSG_DONTWAIT keeps the fd blocking for read_blk while this poll returns
-    # immediately. EAGAIN maps to the "idle" convention (0) this function already uses.
+    # immediately.
+    # ⛔ EAGAIN IS THE ONLY "NOTHING PENDING". This arm used to map every return <= 0 to idle, so a
+    # Linux client never saw -6: a compositor that closed or died without SETU_CLOSE left it polling
+    # forever, and crab's `-6 = connection closed` exit could never fire. EOF (0 on every recv once
+    # the peer is gone) and every other error (-ECONNRESET when the peer closed with our records
+    # unread, -EBADF) are terminal, as the agnos arm's PEERGONE has been since 0.8.1.
     var r = sys_recvfrom(load64(c + SETU_C_FD), ib + len, SETU_C_INBUF_CAP - len, SETU_MSG_DONTWAIT, 0, 0);
-    if (r < 0) { r = 0; }
+    if (r == 0) { r = 0 - 1; }                     # EOF — the compositor closed its end
+    if (r == 0 - EAGAIN) { r = 0; }                # nothing pending this frame (the common case)
     #endif
     if (r > 0) {
         store64(c + SETU_C_INLEN, len + r);
@@ -693,7 +700,6 @@ fn setu_client_poll_input(c, msg_out): i64 {
         return 0;                                # partial frame — completes next poll
     }
     if (r == 0) { return 0; }                    # nothing pending (agnos WOULDBLOCK, Linux EAGAIN)
-    # ⚠ Linux EOF and recv errors land here too (EOF-as-idle), where setu_poll_input returns -6 for EOF.
     if (len > 0) { return 0; }                   # error but bytes pending — drain first
     return 0 - 6;                                # EOF / error
 }
