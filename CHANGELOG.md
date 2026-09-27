@@ -6,6 +6,31 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Changed — both filed issues are closed and archived
+
+`docs/development/issues/` held two filings. Both were already marked fixed, and both now live in
+`issues/archived/`, the stack's convention (cyrius, dhancha, agnos). Each was re-checked against the
+tree at 0.8.11 before the move and gained a closing note.
+
+- `2026-08-06-read-msg-is-stream-shaped-on-a-record-transport.md` — fixed in 0.8.2, with its Linux
+  regression repaired in 0.8.3. Its two open items are now answered. On the compositor side,
+  aethersafha's `setu_srv_read_msg` and `setu_srv_read_exact` delegate to setu. Every frame read goes
+  through the one-record `setu_read_msg`, and the only `setu_srv_read_exact` call is the retired
+  inline-pixel branch, where it now always fails -6. The repin it waited for happened long ago: every
+  consumer pins 0.8.8 or later.
+- `2026-08-07-distlib-deps-sidecar-under-reports.md` — fixed upstream in cyrius 6.5.10, and setu's
+  workaround script was retired after 0.8.10. Its mirror path now points at cyrius's archived copy,
+  and its ask and interim rule are marked answered for base bundles. Profile bundles keep the pruned
+  inference by cyrius's design.
+
+References follow the move: the sidecar gate's comment in `.github/workflows/ci.yml` and the 0.8.10
+and 0.8.2 entries below. ⚠ Two pointers outside this repo still name the old paths: cyrius's archived
+mirror of the sidecar issue, and a line in agnos's CHANGELOG naming the read_msg filing.
+
+Docs only: nothing under `src/` changed, so `dist/` is unchanged.
+
 ## [0.8.11] - 2026-09-26
 
 ### Removed
@@ -254,7 +279,7 @@ are clean; all four RUN suites pass; `cyrius distlib --check` reports `dist/` cu
   `dist/setu.deps` tells consumers to declare.
 - Since 6.6.6, `io.cyr` includes `args_agnos.cyr` itself, so `getenv` on agnos no longer depends on
   a consumer declaring `args`.
-- The `distlib` sidecar issue (`docs/development/issues/2026-08-07-distlib-deps-sidecar-under-reports.md`)
+- The `distlib` sidecar issue (`docs/development/issues/archived/2026-08-07-distlib-deps-sidecar-under-reports.md`)
   was fixed upstream in cyrius 6.5.10 and is now marked resolved. Raw `distlib` emits all 12 leaves
   on 6.6.0 through 6.6.6; `scripts/sync-deps-sidecar.sh` stays as a redundant gate.
 
@@ -579,7 +604,7 @@ the sidecar, so the sync script must run **after** it — that ordering is why t
 one-time edit.
 
 Root defect filed against cyrius (both repos):
-[`2026-08-07-distlib-deps-sidecar-under-reports.md`](docs/development/issues/2026-08-07-distlib-deps-sidecar-under-reports.md).
+[`2026-08-07-distlib-deps-sidecar-under-reports.md`](docs/development/issues/archived/2026-08-07-distlib-deps-sidecar-under-reports.md).
 
 ## [0.8.1] — 2026-08-06 — the cutover missed both poll paths
 

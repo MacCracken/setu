@@ -98,7 +98,7 @@ jobs:
         # own repo. 6.5.10 made the sidecar [deps].stdlib unioned with an include scan; this asserts
         # that property here instead of trusting every future toolchain to keep it. A superset
         # passes, because the include scan may add a leaf the declaration lacks.
-        # Defect: docs/development/issues/2026-08-07-distlib-deps-sidecar-under-reports.md
+        # Defect: docs/development/issues/archived/2026-08-07-distlib-deps-sidecar-under-reports.md
         run: |
           declared=$(awk '
             /^\[deps\]/ { d = 1; next }

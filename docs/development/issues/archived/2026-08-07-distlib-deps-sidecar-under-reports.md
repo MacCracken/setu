@@ -1,9 +1,9 @@
 # `cyrius distlib`'s `dist/<lib>.deps` sidecar under-reports, and is neither declaration-driven nor a complete inference
 
 **Status:** ✅ **FIXED upstream in cyrius 6.5.10** — see [Resolution](#resolution). Filed from setu
-0.8.2 on 2026-08-07.
+0.8.2 on 2026-08-07. **Closed 2026-09-26** and moved to `issues/archived/` after 0.8.11.
 **Cross-repo:** cyrius (`cyrius distlib`) + setu (the lib that exposed it) + aethersafha / crab (the
-consumers it misled). Mirror of `cyrius/docs/development/issues/2026-08-07-distlib-deps-sidecar-under-reports.md`.
+consumers it misled). Mirror of `cyrius/docs/development/issues/archived/2026-08-07-distlib-deps-sidecar-under-reports.md`.
 **Severity:** Medium — it does not corrupt output, but it hands consumers a **wrong** dep list that
 looks authoritative, and the resulting failure lands in another repo on another target.
 
@@ -76,7 +76,15 @@ Either make `distlib` emit the declared `[deps] stdlib` verbatim (simplest, and 
 actually need), or make it a real transitive symbol closure that follows cross-module delegation like
 `io.getenv` → `args._agnos_getenv`. Until then the header comment overstates it.
 
+⭐ **Answered in cyrius 6.5.10** for base bundles: the sidecar is the declared list unioned with the
+include scan. See [Resolution](#resolution).
+
 ## Interim rule for OTHER libs' consumers
+
+⭐ **Superseded for base bundles by cyrius 6.5.10.** It still describes a profile bundle's sidecar:
+cyrius's own copy records that "profiles keep the pruned inference so a narrow bundle cannot
+over-report". And setu no longer corrects its own sidecar; since the script's retirement after 0.8.10,
+CI's set check guards it instead (see [Resolution](#resolution)).
 
 ⚠ **Treat `dist/*.deps` as a starting point, never a contract** — for every lib except setu, which now
 corrects its own. Take the lib's `[deps] stdlib` from its `cyrius.cyml`. ⛔ And do not read a clean
@@ -110,3 +118,7 @@ writes it, and CI checks it two ways:
 - A set check fails if the sidecar omits any `[deps] stdlib` leaf. That is this issue's failure mode,
   checked directly, so a toolchain that regressed the 6.5.10 fix would fail setu's CI rather than a
   consumer's build.
+
+Re-checked 2026-09-26 at setu 0.8.11 on cyrius 6.6.6: `cyrius distlib --check` reports the bundle and
+sidecar current, and the sidecar lists all 12 declared leaves. Nothing is left open, so the filing is
+closed.
