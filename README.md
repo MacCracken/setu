@@ -1,6 +1,6 @@
 # setu
 
-Version: 0.8.2
+Version: 0.8.10
 
 **setu** (सेतु — Sanskrit/Hindi: *bridge*) is the pure-Cyrius **native
 display-protocol** for AGNOS — the wire between GUI clients and the
@@ -168,11 +168,13 @@ Both link the **same** setu, so the wire has one definition.
 
 ## Dependencies
 
-- **Cyrius stdlib** — `string`, `fmt`, `alloc`, `io`, `vec`, `str`,
-  `syscalls`, `assert`. Resolved by `cyrius deps` into `lib/`. No external
-  library deps — setu is a pure-Cyrius leaf contract.
+- **Cyrius stdlib only** — the set declared in `cyrius.cyml` `[deps].stdlib`,
+  resolved by `cyrius deps` into `lib/`. No external library deps — setu is
+  a pure-Cyrius leaf contract. What each module is for:
+  [`docs/development/overview.md`](docs/development/overview.md#dependencies).
 
-The toolchain pin is `cyrius = "6.4.7"` (matched to the dhancha client).
+The toolchain pin is `[package].cyrius` in `cyrius.cyml`, kept matched to the
+dhancha client ([Toolchain](docs/development/overview.md#toolchain)).
 
 ## Quick Start
 

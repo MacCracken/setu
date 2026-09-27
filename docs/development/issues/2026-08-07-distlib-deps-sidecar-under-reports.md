@@ -1,6 +1,7 @@
 # `cyrius distlib`'s `dist/<lib>.deps` sidecar under-reports, and is neither declaration-driven nor a complete inference
 
-**Status:** 🔴 **OPEN — cyrius defect, filed from setu 0.8.2.** Filed 2026-08-07.
+**Status:** ✅ **FIXED upstream in cyrius 6.5.10** — see [Resolution](#resolution). Filed from setu
+0.8.2 on 2026-08-07.
 **Cross-repo:** cyrius (`cyrius distlib`) + setu (the lib that exposed it) + aethersafha / crab (the
 consumers it misled). Mirror of `cyrius/docs/development/issues/2026-08-07-distlib-deps-sidecar-under-reports.md`.
 **Severity:** Medium — it does not corrupt output, but it hands consumers a **wrong** dep list that
@@ -81,3 +82,22 @@ build as evidence the list is complete: the table above shows an under-declared 
 
 ⚠ Any lib that vendors a fold and is consumed on agnos has the same hole. The one-line check is
 `grep -vc '^#' dist/<lib>.deps` against the count in its `[deps] stdlib`.
+
+## Resolution
+
+Fixed in cyrius **6.5.10** (2026-08-07, the day it was filed): the sidecar is now the declared
+`[deps] stdlib` **unioned** with the include scan, so it can no longer under-report relative to
+either source. cyrius archived its copy of this issue.
+
+Re-measured at setu 0.8.10: raw `cyrius distlib` emits all **12** declared leaves on every installed
+toolchain from 6.6.0 through 6.6.6, and dropping `chrono` from the declaration drops it from the
+sidecar. `assert` stays even when undeclared, because `src/lib.cyr` includes it and the include scan
+still sees it.
+
+setu's own history agrees. Only the scaffold's sidecar (2026-07-08) had 8 leaves. Each raw `distlib`
+sidecar committed since 0.8.5 (`e4c7bc3`, `562b335`, `f05ee6f`) listed all 12, and each was then
+"repaired" back to the script's header and leaf order.
+
+`scripts/sync-deps-sidecar.sh` and its CI gate are still in place. Their output is byte-identical to
+the committed `dist/setu.deps` (it differs from raw `distlib` output only in header and leaf order),
+so they are now a redundant check rather than a correction.

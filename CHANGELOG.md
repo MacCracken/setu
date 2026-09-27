@@ -6,6 +6,45 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.10] - 2026-09-26
+
+### Changed
+
+- **Toolchain `6.6.2` → `6.6.6`**, back in step with dhancha, the consumer the pin tracks. No source
+  change. The vendored `lib/` is re-synced to the 6.6.6 stdlib (`cyrius lib sync --full`; the
+  installed snapshot is byte-identical to cyrius's `6.6.6` tag). The declared `[deps] stdlib` is
+  unchanged, so `dist/setu.deps` is unchanged and `dist/setu.cyr` differs only in its version line.
+
+  Every program builds for Linux and `--agnos`, lint reports 0 warnings, fmt, vet and the
+  no-TCP-on-agnos gate are clean, and all four RUN suites pass: `client_test`, `codec_test`,
+  `reach_test`, `unix_transport_test`. Unlike 0.8.7's bump, this one is not byte-identical (most
+  binaries are about 4 KB larger), so the RUN suites are what show behaviour held.
+
+- **`cyrius.cyml` is configuration only.** It had accumulated a per-module dependency ledger, the
+  toolchain-pin rationale, build and distlib notes, and a dated agnos cutover note. The durable parts
+  now live in `docs/development/overview.md` (Module order, Toolchain, Dependencies); the history was
+  already here (0.3.0 for `net` / `result` / `chrono`, 0.8.0 for `args`). The package description
+  no longer says "No I/O in the lib", which has been false since the 0.2.0 client transport.
+
+  ⚠ Comments inside `stdlib = [...]` were also a latent parse hazard. cyrius's
+  `_parse_toml_str_array` collects every `"…"` up to the first `]`, comments included, so a quote
+  or bracket in one of those comments would have silently changed the dep list.
+
+### Found while moving the ledger
+
+- ⚠ **Six declared stdlib leaves are not referenced by setu's code**: `vec`, `str`, `assert`,
+  `result`, `net`, `chrono`. All twelve builds (six programs, two targets) stay clean with them
+  undeclared, singly or together; `vec` and `result` are compiled in anyway, because `fmt` and `io`
+  include them. `args` is still load-bearing, via `argc()` / `args_init()` in two test programs. The
+  ledger's reasons for `net`, `result` and `chrono` described the TCP transport and a read-retry
+  sleep that 0.8.4 and 0.8.2 removed. They are **not** pruned here, because pruning changes what
+  `dist/setu.deps` tells consumers to declare.
+- Since 6.6.6, `io.cyr` includes `args_agnos.cyr` itself, so `getenv` on agnos no longer depends on
+  a consumer declaring `args`.
+- The `distlib` sidecar issue (`docs/development/issues/2026-08-07-distlib-deps-sidecar-under-reports.md`)
+  was fixed upstream in cyrius 6.5.10 and is now marked resolved. Raw `distlib` emits all 12 leaves
+  on 6.6.0 through 6.6.6; `scripts/sync-deps-sidecar.sh` stays as a redundant gate.
+
 ## [0.8.9] - 2026-09-11
 
 ### Changed
