@@ -37,7 +37,7 @@ shares, so the wire and its framing each have a single definition.
 | `src/proto.cyr` | `SetuMsgKind`, the `SetuMsg` record `{ kind, argc, args[8] }`, per-kind constructors, the expected-argc table, validation. |
 | `src/codec.cyr` | `setu_encode` / `setu_decode` / `setu_encoded_len` + the LE i64 byte marshalling. Pure, allocation-light, bounds-checked. |
 | `src/buf.cyr` | The shared-buffer present path: pixels travel out-of-band, keyed by an integer id (agnos kernel shm; a `/dev/shm` file on Linux). |
-| `src/client.cyr` | The reference transport every client uses: the `#97` channel band on agnos (the compositor endows the channel at spawn), AF_UNIX `SOCK_SEQPACKET` on Linux, where it also provides the listen / accept side. |
+| `src/client.cyr` | The reference transport every client uses: the `#97` channel band on agnos (the compositor endows the channel at spawn), AF_UNIX `SOCK_SEQPACKET` on Linux, where it also provides the listen / accept side. Every read that waits takes a deadline (`setu_read_blk_ms` / `setu_read_msg_ms`; the defaults are 8 s on agnos and none on Linux), and every socket it opens on Linux is close-on-exec. |
 
 ### Module order
 
@@ -125,6 +125,10 @@ runs the tests on Linux. The `codec_test` RUN suite round-trips every
 kind (encode→decode, assert kind + argc + args identical, incl. signed /
 large args) and asserts the parser rejects a truncated frame, a bad-argc
 frame, and an unknown kind. This is the proof the contract holds.
+`read_deadline_test` measures the read deadlines against forked peers and
+takes about 9 s, most of it one check that the Linux default is still waiting
+past the agnos default (8 s). It arms a 60 s watchdog, because a regression
+there is a hang rather than a wrong answer.
 
 Commit `dist/` exactly as `cyrius distlib` writes it. CI fails if either
 file differs from a fresh regeneration (`cyrius distlib --check`), if the
@@ -153,9 +157,10 @@ it: little-endian marshalling uses the `load8` / `store8` builtins.
 | `fmt` | `fmt_int_buf`: the `/dev/shm/setu-buf-<id>` path (`buf.cyr`, Linux). |
 | `alloc` | `alloc` / `alloc_init`: message records, frame buffers, client state. |
 | `io` | `getenv`: `$SETU_SOCKET` on Linux, `AGNOS_CHAN` on agnos. On agnos `io.cyr` delegates to `args_agnos.cyr`'s `_agnos_getenv` (agnos has no `/proc`), and since cyrius 6.6.6 includes that file itself. |
-| `syscalls` | AF_UNIX `sys_socket` / `sys_connect` / `sys_bind` / `sys_listen` / `sys_accept4` / `sys_recvfrom` / `sys_unlinkat` (Linux); the `sys_chan_*` channel band and `sys_shm_*` buffers (agnos); `SYS_WRITE` / `SYS_EXIT`. |
-| `args` | `argc()` / `args_init()` in `programs/reach_test.cyr` and `programs/unix_transport_test.cyr`. Before cyrius 6.6.6 it was also what put `_agnos_getenv` in scope for `io`'s `getenv` on agnos. |
-| `vec`, `str`, `assert`, `result`, `net`, `chrono` | ⚠ Not referenced by setu's own code, and every build is clean with them undeclared (measured at 0.8.10). `vec` and `result` are compiled in regardless, because `fmt` and `io` include them. `net` and `result` served the TCP transport removed in 0.8.4; `chrono` backed the agnos read-retry sleep removed in 0.8.2; `vec` / `str` / `assert` date from the scaffold. They stay declared (and so stay in `dist/setu.deps`) until a deliberate prune, because dropping one changes what consumers are told to declare. For `vec` / `str` / `assert` that also means removing their `src/lib.cyr` includes: distlib's include scan keeps an included leaf in the sidecar even when it is undeclared (measured on 6.6.6). |
+| `syscalls` | AF_UNIX `sys_socket` / `sys_connect` / `sys_bind` / `sys_listen` / `sys_accept4` / `sys_recvfrom` / `sys_unlinkat` and `EAGAIN` / `EINTR` (Linux); the `sys_chan_*` channel band, `sys_shm_*` buffers and the read-deadline clocks `sys_uptime_us` / `sys_uptime_ms` (agnos); `SYS_WRITE` / `SYS_EXIT`. poll(2) has no wrapper, so the Linux read spells it `syscall(7, …)` as the stdlib does; the aarch64 backend rewrites that to ppoll. |
+| `chrono` | `clock_now_ns`: the monotonic clock behind the Linux read deadline (0.8.12), included from `src/lib.cyr`. `read_deadline_test` also times the reads with `clock_now_ms` and paces its peers with `sleep_ms`. It backed the agnos read-retry sleep until 0.8.2 and was unreferenced from then until 0.8.12. |
+| `args` | `argc()` / `args_init()` in `programs/reach_test.cyr`, `programs/unix_transport_test.cyr` and `programs/read_deadline_test.cyr`. Before cyrius 6.6.6 it was also what put `_agnos_getenv` in scope for `io`'s `getenv` on agnos. |
+| `vec`, `str`, `assert`, `result`, `net` | ⚠ Not referenced by setu's own code, and every build is clean with them undeclared (measured at 0.8.10). `vec` and `result` are compiled in regardless, because `fmt` and `io` include them. `net` and `result` served the TCP transport removed in 0.8.4; `vec` / `str` / `assert` date from the scaffold. They stay declared (and so stay in `dist/setu.deps`) until a deliberate prune, because dropping one changes what consumers are told to declare. For `vec` / `str` / `assert` that also means removing their `src/lib.cyr` includes: distlib's include scan keeps an included leaf in the sidecar even when it is undeclared (measured on 6.6.6). |
 
 ## Roadmap
 

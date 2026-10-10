@@ -1,6 +1,6 @@
 # setu
 
-Version: 0.8.11
+Version: 0.8.12
 
 **setu** (सेतु — Sanskrit/Hindi: *bridge*) is the pure-Cyrius **native
 display-protocol** for AGNOS — the wire between GUI clients and the
@@ -130,6 +130,39 @@ bytes: every read is bounds-checked against `in_len`, the kind is range- +
 table-checked, and a short or malformed frame returns a negated `SetuErr`
 (never a partial message).
 
+## Reading: how long a read waits
+
+Since **0.8.12** every read that waits takes a deadline in milliseconds, on both
+targets:
+
+| Call | How long it waits |
+|---|---|
+| `setu_read_blk_ms(fd, buf, cap, ms)`, `setu_read_msg_ms(fd, msg, ms)` | `ms > 0`: at most `ms`. `0`: not at all (a record already queued, or a timeout). `ms < 0`: no deadline. |
+| `setu_read_blk`, `setu_read_msg`, `setu_recv`, `setu_client_recv`, and the `SURFACE_CREATED` wait in `setu_client_present` | the target's default, `SETU_READ_DEFAULT_MS`: 8000 ms on agnos, no deadline on Linux |
+| `setu_poll_input`, `setu_client_poll_input` | never: 0 means nothing is pending |
+
+A read returns the record's length, or -6 when no record came, and
+`setu_read_timed_out()` then says which: 1 when the deadline passed with the
+connection still open, 0 when the peer went or the read failed, which is final.
+The deadline runs on a monotonic clock, and a signal neither ends the wait nor
+restarts it. On Linux the wait is `poll(2)`, never a busy loop. On agnos
+`chan_recv` cannot block, so the read spins (preemptibly) until the deadline.
+
+⚠ **The Linux default stays unbounded on purpose.** A client blocked waiting
+for its next input event (dhancha's `dh_client_next_event`) treats -6 as the
+end of the session, so any finite default would disconnect an app that sat
+idle for longer than it. A caller that must not wait long, such as the
+compositor's frame loop, passes its own bound. Before 0.8.12 the Linux read
+was one blocking `read(2)` with no way to bound it at all.
+
+**Inheritance.** On Linux every socket setu opens (the listener, each accepted
+connection and the client's connection) is close-on-exec, so a process that the
+compositor or a client launches does not hold the display connection open.
+agnos has no close-on-exec: a child gets a copy of its parent's whole fd table,
+but the kernel checks a channel end's owner on every operation, so an inherited
+end is inert. A client holds its end only because the compositor endowed it
+(`AGNOS_CHAN`).
+
 ## Scope
 
 - **Current.** A buildable, RUN-tested pure-Cyrius contract plus the
@@ -150,7 +183,8 @@ table-checked, and a short or malformed frame returns a negated `SetuErr`
   - `src/buf.cyr` — the shared-buffer present path: `setu_buf_create` /
     `_write` / `_read` / `_close`.
   - `src/client.cyr` — the transport (`setu_connect`, plus `setu_listen` /
-    `setu_accept` on Linux) and the `SetuClient` handle
+    `setu_accept` on Linux), the reads (`setu_read_msg` and
+    `setu_read_msg_ms`, which takes a deadline) and the `SetuClient` handle
     (`setu_client_connect` → `setu_client_present` →
     `setu_client_poll_input` / `setu_client_recv` → `setu_client_close`).
   - `programs/smoke.cyr` — the link-check entry.
@@ -159,9 +193,11 @@ table-checked, and a short or malformed frame returns a negated `SetuErr`
     large args) and asserts the parser **rejects** a truncated frame, a
     bad-argc frame, and an unknown kind.
   - `programs/client_test.cyr` (`sockaddr_un`, input reassembly, buffer
-    lifecycle) and `programs/unix_transport_test.cyr` (a real AF_UNIX /
-    `SOCK_SEQPACKET` round-trip whose record boundaries must survive) —
-    further RUN tests. `programs/reach_test.cyr` makes every transport
+    lifecycle), `programs/unix_transport_test.cyr` (a real AF_UNIX /
+    `SOCK_SEQPACKET` round-trip whose record boundaries must survive, and
+    close-on-exec on every socket) and `programs/read_deadline_test.cyr` (the
+    read deadlines, measured against real peers) — further RUN tests.
+    `programs/reach_test.cyr` makes every transport
     entry point reachable, so an undefined symbol is a build error on
     either target rather than a warning DCE hides.
   - `programs/present_probe.cyr` — a slim reference client.

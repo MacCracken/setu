@@ -6,7 +6,162 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [0.8.12] - 2026-10-10
+
+### Fixed — on Linux a read had no deadline, so a peer that never sent held its reader forever
+
+`setu_read_blk`'s Linux arm was one blocking `read(2)`. Its contract promised -6 on "EOF / peer gone /
+error / timeout", and the agnos arm had an 8 s deadline, but Linux had none. A peer that connected and
+never sent held the caller forever. In aethersafha (its roadmap D12) that caller is the frame loop:
+`setu_srv_accept` → `setu_srv_serve_accepted_at` → `setu_srv_read_msg` → `setu_read_msg` →
+`setu_read_blk` on the fd it had just accepted. The compositor stopped drawing, and since aethersafha
+0.17.2 blocks SIGINT and reads it from a signalfd once per frame, Ctrl+C could not end it either.
+
+- **Added: a deadline on every read that waits, on both targets.** `setu_read_blk_ms(fd, buf, cap,
+  timeout_ms)` and `setu_read_msg_ms(fd, msg_out, timeout_ms)`. `timeout_ms > 0` waits at most that
+  many milliseconds on a monotonic clock; `0` does not wait (a record already queued, else a timeout);
+  `< 0` has no deadline. They return the record's (or frame's) length, or -6 when no record came, and
+  `setu_read_msg_ms` returns a negated `SetuErr` for a record that is not a valid frame, as
+  `setu_read_msg` does. A signal neither ends the wait nor restarts it.
+- **Added: `setu_read_timed_out()`** says why the last -6 happened: 1 when the deadline passed with the
+  connection still open, so a later read may still get a record; 0 for EOF, peer gone or an error,
+  which are final. A caller with a short bound has to tell "slow" from "gone", and the -6 alone cannot.
+- **`setu_read_blk` and `setu_read_msg` are now defined through them**, with `SETU_READ_DEFAULT_MS`:
+  8000 on agnos, -1 (no deadline) on Linux. `setu_recv`, `setu_client_recv` and the `SURFACE_CREATED`
+  wait in `setu_client_present` inherit it. The two targets and the timed and default reads cannot
+  drift apart.
+- ⚠ **Changed: a Linux read now needs a socket.** The arm calls `recv`, not `read(2)`, so an fd that is not
+  a socket (a pipe, a file) is ENOTSOCK and -6 at once, where 0.8.11 read it. Every consumer passes setu
+  sockets (aethersafha's tests use `socketpair(AF_UNIX, SOCK_SEQPACKET)`), so nothing breaks.
+- **Linux waits in poll(2), never in a busy loop.** A recv with `MSG_DONTWAIT` takes a record already
+  queued in one syscall. If there is none, poll(2) on the fd for what is left of the deadline (in
+  slices of one hour, since poll's timeout is a C int), then recv again. EINTR re-reads the clock and
+  waits out only the remainder; EAGAIN after a wakeup waits again; EOF and every other error
+  (ECONNRESET, EBADF, ENOTSOCK) are -6 at once. The recv comes first so that a bad fd fails at once:
+  poll ignores a negative fd and would sleep out the whole bound. The deadline is tested as
+  `deadline - now <= 0`, which stays right when an i64-max bound wraps `now + timeout_ms`. The fd's own
+  blocking mode no longer matters to a read. poll has no stdlib wrapper, so it is `syscall(7, …)`, the
+  stdlib's own spelling, which the aarch64 backend rewrites to ppoll. The clock is chrono's
+  `clock_now_ns` (CLOCK_MONOTONIC), so `src/lib.cyr` now includes `lib/chrono.cyr`.
+- **agnos keeps its wait shape.** `chan_recv` answers at once and the loop spins, preemptibly, between
+  attempts. Two things change. (1) The deadline is the caller's, and the 5000 extra spins the loop ran
+  after its deadline (≈0.1 s, machine-dependent) are gone: they would have dwarfed a frame-sized bound.
+  The 8 s default therefore ends ≈0.1 s sooner. (2) The clock is `uptime_us` #95, falling back to
+  `uptime_ms` #40 only when #95 answers -1 (TSC calibration refused). Before agnos 1.57.7 a foreground
+  `run` program, which is what the compositor is, ran with IF cleared and #40 frozen, so a deadline on
+  #40 never arrived in exactly the caller a short bound is for. #95 has existed since agnos 1.56.18,
+  before the `#97` band (1.56.40) that setu requires. ⚠ The agnos arm is built here for `--agnos`,
+  made reachable by `reach_test`, but not run: CI has no agnos host.
+
+⛔ **The Linux default stays unbounded. That is the compatibility verdict, not an oversight.** Every
+call of a blocking read in crab, dhancha and aethersafha was read (below). One relies on an indefinite
+wait: dhancha's `dh_setu_read_event`, the body of its public `dh_client_next_event`, which "BLOCKS until a
+frame arrives, which suits an app that only changes when input does" (`src/dh_client.cyr`). Its callers
+(`programs/setu_session_demo.cyr:72`, `programs/setu_input_client_probe.cyr:37`) end their event loop on
+any negative return, so any finite default would disconnect an app that sat idle for longer than it. A
+caller that cannot afford to wait names its bound with the `_ms` reads. So no consumer changes behaviour
+on Linux until it opts in, and the aethersafha wedge is fixed only when aethersafha switches.
+
+| Call | Waits for | Verdict |
+|---|---|---|
+| aethersafha `src/setu_dispatch.cyr:68`, `setu_srv_recv_committed` (via `setu_srv_read_msg`, `src/setu_server.cyr:37`) | `CREATE_SURFACE` from a client the Linux frame loop has just accepted (`src/main.cyr:1465`) | The wedge. Must NOT wait indefinitely; aethersafha has to opt in. |
+| aethersafha `src/setu_dispatch.cyr:101` and `:129`, `setu_srv_commit_from_create` | `ATTACH` and `COMMIT` after it replied `SURFACE_CREATED`, on the same path | Same: a client that sends `CREATE_SURFACE` and stops wedges it too. |
+| aethersafha `src/setu_dispatch.cyr:153` (`setu_srv_create_surface`) and `src/setu_server.cyr:55` (`setu_srv_accept_one`) | one frame, in single-shot probes | Request and reply in a probe. Unaffected. |
+| aethersafha `programs/focus_client.cyr:67`, `tests/setu_handshake.tcyr:219` | `SURFACE_CREATED` | Unaffected. |
+| aethersafha's agnos placed clients (`src/main.cyr:1377`) | nothing: `setu_srv_handshake_drain` polls with `setu_poll_input` | Never calls the blocking read. Unaffected. |
+| crab `src/main.cyr:319` | `SURFACE_CREATED` after its own `CREATE_SURFACE`; -6 exits with "no surface_created reply" | Request and reply; treats -6 as failure. Unaffected. Its input loop polls (`dh_client_poll_event`). |
+| dhancha `src/setu_client.cyr:58`, `dh_setu_create_surface` (via `setu_recv`) | `SURFACE_CREATED`, one-shot | Unaffected. |
+| dhancha `src/setu_client.cyr:34` and `:36` | forwarders to `setu_recv` / `setu_read_msg` | Take their callers' verdicts. |
+| dhancha `src/setu_input.cyr:90`, `dh_setu_read_event` → `dh_client_next_event` | the next input event, for as long as it takes; any negative ends the session | **Relies on an indefinite wait**, which is why the Linux default stays unbounded. |
+
+setu's own waits are request and reply too: `setu__client_create_surface` (the first
+`setu_client_present`) and `programs/present_probe.cyr:132`. puka calls no blocking read.
+
+⚠ On agnos the 8 s default already ends a `dh_client_next_event` loop: an idle one returns -6 after 8 s,
+which its callers read as the end of the session. That predates this release — EXCEPT for a foreground
+`run` program on agnos before 1.57.7: there #40 was frozen, so 0.8.11's deadline never arrived and such a
+loop waited forever by accident. On #95 it now ends after 8 s idle like every other agnos caller.
+dhancha can wait indefinitely on both targets with `setu_read_msg_ms(fd, m, -1)` (on agnos that spins)
+and tell a timeout from an EOF with `setu_read_timed_out()`.
+
+RUN-tested in the new `programs/read_deadline_test.cyr`, over real AF_UNIX / `SOCK_SEQPACKET`
+connections with forked peers, every duration measured on the clock the read uses. Measured here
+(Linux 7.2.8, x86_64): a silent peer gives up at 300 ms for `setu_read_blk_ms(300)`, 20 ms for 20,
+0 ms for 0, and 100 ms for `setu_read_msg_ms(100)`, each with `setu_read_timed_out()` = 1, and the
+connection then reads a queued frame normally; a record sent 250 ms late arrives at 250 ms (bound
+5000, and -1); one sent 1000 ms late arrives through the Linux default at 1001 ms; an i64-max bound is
+no deadline; EOF is -6 in 0 ms with a 5000 ms bound and with the default; so are a reset and a bad fd;
+a peer that exits after 250 ms is -6 at 250 ms, not at the bound; with a SIGUSR1 handler installed
+without SA_RESTART, a signal at 150 ms and a record at 300 ms return the record at 300 ms (bounded and
+default), and a signal at 400 ms with no record times out at 801 ms on an 800 ms bound, not at ~400 or
+~1200. And `setu_read_blk` on a silent peer is still waiting at 8.6 s, past the agnos default, then
+returns -6 within 1 ms of the peer closing, as EOF and not as a timeout. The suite takes about 9 s and
+arms a 60 s watchdog, because a regression here is a hang rather than a wrong answer. EINTR needs a
+handler, and the stdlib installs none, so on x86_64 the suite writes the 7-byte `rt_sigreturn` restorer
+itself.
+
+**Negative controls: 14 mutants, each killed.** The old one-blocking-`read(2)` arm hangs the suite,
+and its watchdog fails it at 60 s. EINTR taken as a failure fails 6 checks; EINTR restarting the whole
+bound times out at 1201 ms. A deadline branch that does not set the timed-out flag fails 4 checks.
+Reading every recv error as "nothing yet" makes a bad fd sleep out its 5000 ms bound, and so does
+polling before the first recv. A Linux default of 8000, a default of 500, and a `setu_read_blk` that
+hard-codes 8000 past the constant each fail, the last only on the 8.6 s check. Comparing
+`now >= deadline` fails the i64-max bound.
+
+Every consumer builds unchanged against 0.8.12. Each was built in a scratch copy through a `path` dep,
+first against 0.8.11 and then against 0.8.12, and their repos were not touched: aethersafha, crab, puka
+and dhancha's four setu programs, each for Linux and `--agnos`. aethersafha's `setu_handshake` (92
+checks) and `setu_focus` (19) pass on both. dhancha's `poll_test` prints the identical result on both:
+exit 3, the three idle checks the 0.8.11 entry recorded.
+
+### Fixed — no socket setu opened was close-on-exec
+
+`setu_listen` created the listener without `SOCK_CLOEXEC`, `setu_accept` called `accept4(sfd, 0, 0,
+0)`, and `setu_connect`'s socket had none either, so every process a compositor or a client exec'd
+inherited them. aethersafha launches clients by fork and execve (`ae_spawn_client`), so each one held
+the listener and every connection accepted before it. puka's PTY child (fork, dup2, execve) and
+everything run from that shell held puka's own connection. A copy keeps its socket alive. Measured with a
+scratch probe that accepts a client, launches `/bin/sleep` by fork and execve, then closes its end and
+its listener: on 0.8.11 the client's next recv reads EAGAIN, a live peer, and a new connect succeeds
+into a backlog nothing will accept; on 0.8.12 the client reads EOF at once and the connect is refused.
+
+- **All three are created close-on-exec, atomically** (`accept4` takes `SOCK_CLOEXEC`). Only the
+  listener is non-blocking; accepted and connected fds stay blocking, so a send waits for room.
+- **No consumer passes a setu fd to a child on purpose.** aethersafha announces the rendezvous path
+  (`SETU_SOCKET=<path>`, `src/main.cyr:605`) and the child connects itself. puka's PTY child inherited
+  puka's connection by accident. crab launches programs only on agnos, where an inherited end is inert
+  (below). dhancha launches nothing.
+- **agnos is unchanged and needs nothing.** It has no close-on-exec: `vfs_fd_inherit` gives every child
+  a byte copy of its creator's fd table, and `SPAWN_F_CLEANFD` (agnos 1.57.6) is an opt-in scrub. But
+  `chan_auth` checks an end's owner on every operation, so an inherited display-channel end is inert
+  (`CH_E_BADFD`). An end lives as long as its owner holds it: the owner's close or death releases it
+  (`chan_release_pid`), and an inert copy keeps nothing alive. A client holds its end only because the
+  compositor endowed it (`CH_ENDOW` moves ownership; aethersafha announces `AGNOS_CHAN=<fd>`). Only an
+  end endowed in PTY mode is usable by the owner's descendants (agnos 1.56.46), and setu's are not.
+
+RUN-tested in `unix_transport_test` (`fds_close_on_exec`): `F_GETFD` has `FD_CLOEXEC` on the listener, a
+connected fd and an accepted fd, and `F_GETFL` has `O_NONBLOCK` on the listener only. It reads the flag
+rather than exec a child, because the CI security scan refuses exec in `programs/`. **Negative
+controls:** dropping the flag from any one of the three fails it, and so does adding `SOCK_NONBLOCK` to
+the `accept4`.
+
+### Found while doing it
+
+- ⚠ **The write side has the read's shape.** A `SOCK_SEQPACKET` send blocks once the peer's queue is
+  full. Measured here over a pair: a peer that never reads takes 278 records of 40 bytes (`INPUT_KEY`),
+  then a send would block (`-EAGAIN` under `MSG_DONTWAIT`; `max_dgram_qlen` is 512, so the send buffer is
+  the limit). aethersafha's sends to a client (`setu_srv_forward_key`, `setu_srv_notify_focus`) block, so
+  a client that stops reading its input can stall the frame loop the same way. Not changed here.
+- ⚠ aethersafha's probe paths (`setu_srv_create_surface`, `setu_srv_serve_buffer`,
+  `setu_srv_serve_present`, `setu_srv_serve_session`) accept with a raw `syscall(SYS_ACCEPT, …)` rather
+  than `setu_accept`, so those fds are not close-on-exec. They are single-shot probes that launch
+  nothing. `setu_srv_serve_polled_at` has no caller.
+- `buf.cyr`'s `/dev/shm` files are not opened close-on-exec. Each is opened and closed inside one call,
+  so a single-threaded program never execs while one is open.
+
+Every program builds for Linux and `--agnos`. Lint reports 0 warnings; fmt, vet and the no-TCP gate are
+clean; all five RUN suites pass; `cyrius distlib --check` reports `dist/` current. `dist/setu.deps`
+lists the same 12 leaves; `chrono` moved up, because `src/lib.cyr` now includes it.
 
 ### Changed — both filed issues are closed and archived
 
@@ -29,7 +184,7 @@ References follow the move: the sidecar gate's comment in `.github/workflows/ci.
 and 0.8.2 entries below. ⚠ Two pointers outside this repo still name the old paths: cyrius's archived
 mirror of the sidecar issue, and a line in agnos's CHANGELOG naming the read_msg filing.
 
-Docs only: nothing under `src/` changed, so `dist/` is unchanged.
+Docs only: this entry changes nothing under `src/`.
 
 ## [0.8.11] - 2026-09-26
 

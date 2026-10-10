@@ -38,6 +38,7 @@ include "lib/vec.cyr"
 include "lib/str.cyr"
 include "lib/io.cyr"
 include "lib/syscalls.cyr"
+include "lib/chrono.cyr"     # clock_now_ns: the Linux read deadline's monotonic clock (client.cyr)
 include "lib/assert.cyr"
 
 # ================================================================

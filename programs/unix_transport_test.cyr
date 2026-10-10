@@ -14,6 +14,8 @@
 # (`present_all_or_nothing`): nothing. Only a wire test can see a message that should not be there.
 # And it checks that `setu_client_poll_input` reports a compositor that went away
 # (`poll_sees_peer_gone`), which only a real peer closing its end can show.
+# And that every socket setu opens is close-on-exec (`fds_close_on_exec`, 0.8.12).
+# The read deadline has its own suite, `read_deadline_test.cyr`.
 #
 # Single process: AF_UNIX `connect()` completes against a listening socket without the peer having
 # called `accept()` yet (the connection sits in the backlog), so no fork is needed to have both ends.
@@ -264,6 +266,38 @@ fn poll_sees_peer_gone(sfd, path) {
     ck("badfd: reported", setu_client_poll_input(c3, m), 0 - 6);
     return 0;
 }
+
+# fcntl(F_GETFD) & FD_CLOEXEC: 1 set, 0 clear, -1 not an open fd.
+fn fd_cloexec(fd) {
+    var f = syscall(SYS_FCNTL, fd, 1, 0);          # F_GETFD
+    if (f < 0) { return 0 - 1; }
+    return f & 1;                                  # FD_CLOEXEC
+}
+
+# fcntl(F_GETFL) & O_NONBLOCK: 1 set, 0 clear, -1 not an open fd.
+fn fd_nonblock(fd) {
+    var f = syscall(SYS_FCNTL, fd, 3, 0);          # F_GETFL
+    if (f < 0) { return 0 - 1; }
+    if ((f & O_NONBLOCK) != 0) { return 1; }
+    return 0;
+}
+
+# ⭐ EVERY SOCKET setu OPENS IS CLOSE-ON-EXEC (0.8.12). None was: a compositor that launched a client
+# handed it the listener and every connection accepted so far, and a client that launched a program
+# (puka's shell) handed it its own connection. Either copy kept a connection alive after its owner
+# had died. Checked through fcntl, the property itself: this suite cannot exec a child, because the
+# security gate refuses exec in `programs/`.
+# ⚠ It also pins which fd is NON-blocking, since the flags are set by the same calls: only the listener
+# (so accept polls); the accepted and connected fds stay blocking, so a send waits for room.
+fn fds_close_on_exec(sfd, cfd, afd) {
+    ck("cloexec: listener", fd_cloexec(sfd), 1);
+    ck("cloexec: connected", fd_cloexec(cfd), 1);
+    ck("cloexec: accepted", fd_cloexec(afd), 1);
+    ck("nonblock: listener", fd_nonblock(sfd), 1);
+    ck("nonblock: connected", fd_nonblock(cfd), 0);
+    ck("nonblock: accepted", fd_nonblock(afd), 0);
+    return 0;
+}
 #endif
 
 fn main(): i64 {
@@ -285,6 +319,8 @@ fn main(): i64 {
 
     var afd = setu_accept(sfd);
     if (afd < 0) { sys_write(1, "unix_transport_test: FAIL accept\n", 33); return 1; }
+
+    fds_close_on_exec(sfd, cfd, afd);
 
     # --- a real framed message, client -> server ---
     var sent = setu_send(cfd, setu_create_surface(320, 200, 0));
@@ -334,8 +370,10 @@ fn main(): i64 {
     sys_write(1, ok, strlen(ok));
     var ok2 = "  both directions, RECORD boundaries preserved, and a present\n";
     sys_write(1, ok2, strlen(ok2));
-    var ok3 = "  with no shared buffer sends nothing; a poll sees the peer go)\n";
+    var ok3 = "  with no shared buffer sends nothing; a poll sees the peer go;\n";
     sys_write(1, ok3, strlen(ok3));
+    var ok4 = "  every socket setu opens is close-on-exec)\n";
+    sys_write(1, ok4, strlen(ok4));
     return 0;
     #endif
 }

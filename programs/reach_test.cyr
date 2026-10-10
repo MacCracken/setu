@@ -42,8 +42,13 @@ fn touch_transport(): i64 {
     setu_write_all(fd, buf, 8);
     setu_send(fd, m);
     setu_read_blk(fd, buf, 256);
+    # ⚠ The timed reads carry the per-target clock (`setu__now_ms`: #95 / #40 on agnos, chrono on
+    # Linux), exactly the kind of target-only symbol this program exists to make reachable.
+    setu_read_blk_ms(fd, buf, 256, 16);
+    setu_read_timed_out();
     setu_read_exact(fd, buf, 16);
     setu_read_msg(fd, m);
+    setu_read_msg_ms(fd, m, 16);
     setu_recv(fd, m);
     setu_poll_input(fd, m);
 

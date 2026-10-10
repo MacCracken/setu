@@ -1,0 +1,496 @@
+# programs/read_deadline_test.cyr — the deadline on setu's reads, MEASURED over a real AF_UNIX /
+# SOCK_SEQPACKET connection on Linux (0.8.12).
+#
+# ⛔ WHY THIS EXISTS. Until 0.8.12 `setu_read_blk`'s Linux arm was ONE blocking read(2) with no
+# deadline, although its contract promised -6 on timeout. A peer that connected and never sent held
+# the caller forever, and in aethersafha that caller is the frame loop. No other suite could see it:
+# they all read records that are already queued, and a read that cannot time out passes those exactly
+# like one that can.
+#
+# What it pins, each duration measured on the same monotonic clock the read uses:
+#   - a silent peer: `setu_read_blk_ms` / `setu_read_msg_ms` give up AT the bound (300 ms, a
+#     frame-sized 20 ms, and 0 = no wait), and `setu_read_timed_out()` says it was the deadline;
+#   - a record that arrives late but within the bound is returned, and is not a timeout;
+#   - EOF, a reset, a bad fd and a peer that closes mid-wait are -6 AT ONCE, not at the bound;
+#   - the Linux DEFAULT keeps its unbounded wait: a late record still arrives through `setu_read_blk`,
+#     and on a silent peer it is still waiting past the agnos default (8 s), until EOF ends it;
+#   - a signal that lands in the wait (EINTR) neither ends the wait nor restarts it (x86_64).
+#
+# ⛔ A REGRESSION HERE IS A HANG, NOT A WRONG ANSWER, so the suite arms its own watchdog: a child that
+# SIGKILLs it after 60 s and says why. Without one, a read that never returns would hold CI until the
+# job's own time limit.
+#
+# One process plus forked peers. A peer forked after a connection exists holds copies of both of its
+# ends, so a test closes every copy that must not keep the connection alive, or EOF never arrives.
+
+include "src/lib.cyr"
+
+var fails = 0;
+
+fn ck(what, got, want) {
+    if (got != want) {
+        sys_write(1, "read_deadline_test: FAIL ", 25);
+        sys_write(1, what, strlen(what));
+        sys_write(1, " got=", 5); print_num(got);
+        sys_write(1, " want=", 6); print_num(want);
+        sys_write(1, "\n", 1);
+        fails = fails + 1;
+    }
+    return 0;
+}
+
+# `got` within [lo, hi], for measured durations, where no exact value is a property.
+fn ck_in(what, got, lo, hi) {
+    var ok = 1;
+    if (got < lo) { ok = 0; }
+    if (got > hi) { ok = 0; }
+    if (ok == 0) {
+        sys_write(1, "read_deadline_test: FAIL ", 25);
+        sys_write(1, what, strlen(what));
+        sys_write(1, " got=", 5); print_num(got);
+        sys_write(1, " want=", 6); print_num(lo);
+        sys_write(1, "..", 2); print_num(hi);
+        sys_write(1, "\n", 1);
+        fails = fails + 1;
+    }
+    return 0;
+}
+
+# Print one measurement, so a run states its numbers and not only that they were in range.
+fn said(what, ms) {
+    sys_write(1, "  measured: ", 12);
+    sys_write(1, what, strlen(what));
+    sys_write(1, " = ", 3); print_num(ms);
+    sys_write(1, " ms\n", 4);
+    return 0;
+}
+
+#ifndef CYRIUS_TARGET_AGNOS
+fn reap(pid) {
+    var st[8];
+    sys_waitpid(pid, &st, 0);
+    return 0;
+}
+
+# The watchdog: a child that SIGKILLs the suite after `ms`. Forked before any socket exists, so it
+# holds no copy of a connection end. PR_SET_PDEATHSIG makes it die with the suite, so it can never
+# outlive a finished run and kill a recycled pid.
+var wd_pid = 0;
+fn watchdog_arm(ms) {
+    var suite = sys_getpid();
+    var pid = sys_fork();
+    if (pid == 0) {
+        sys_prctl(1, SIGKILL, 0, 0, 0);            # PR_SET_PDEATHSIG
+        if (sys_getppid() != suite) { syscall(SYS_EXIT, 0); }
+        sleep_ms(ms);
+        var m = "read_deadline_test: FAIL watchdog: the suite hung; a read that must return did not\n";
+        sys_write(1, m, strlen(m));
+        sys_kill(suite, SIGKILL);
+        syscall(SYS_EXIT, 1);
+    }
+    wd_pid = pid;
+    return 0;
+}
+
+fn watchdog_disarm() {
+    if (wd_pid > 0) {
+        sys_kill(wd_pid, SIGKILL);
+        reap(wd_pid);
+    }
+    return 0;
+}
+
+# One connection: `g_cfd` is the client end (setu_connect), `g_afd` the compositor's (setu_accept).
+var g_cfd = 0 - 1;
+var g_afd = 0 - 1;
+fn pair(sfd, path) {
+    g_cfd = setu_connect(path);
+    g_afd = setu_accept(sfd);
+    ck("pair: connect", g_cfd >= 0, 1);
+    ck("pair: accept", g_afd >= 0, 1);
+    return 0;
+}
+
+fn unpair() {
+    if (g_cfd >= 0) { sys_close(g_cfd); }
+    if (g_afd >= 0) { sys_close(g_afd); }
+    g_cfd = 0 - 1;
+    g_afd = 0 - 1;
+    return 0;
+}
+
+# Fork a peer that waits `d1` ms, sends the suite SIGUSR1 if `sig`, waits `d2` ms, writes one COMMIT
+# record (24 bytes) on `fd` if `send`, and exits, which closes its copies of every fd.
+fn peer(fd, d1, sig, d2, send) {
+    var suite = sys_getpid();
+    var pid = sys_fork();
+    if (pid != 0) { return pid; }
+    if (d1 > 0) { sleep_ms(d1); }
+    if (sig != 0) { sys_kill(suite, SIGUSR1); }
+    if (d2 > 0) { sleep_ms(d2); }
+    if (send != 0) { setu_send(fd, setu_commit(7)); }
+    syscall(SYS_EXIT, 0);
+    return 0;
+}
+
+# --- 1. A silent peer: the bounded read gives up AT its bound, and says it was the deadline. --------
+fn t_silent(sfd, path) {
+    pair(sfd, path);
+    var buf = alloc(128);
+    var m = setu_msg_new();
+
+    var t0 = clock_now_ms();
+    var r = setu_read_blk_ms(g_afd, buf, 128, 300);
+    var el = clock_now_ms() - t0;
+    ck("silent, 300: -6", r, 0 - 6);
+    ck("silent, 300: timed out", setu_read_timed_out(), 1);
+    ck_in("silent, 300: gave up at the bound", el, 300, 700);
+    said("silent peer, setu_read_blk_ms(300)", el);
+
+    t0 = clock_now_ms();
+    r = setu_read_blk_ms(g_afd, buf, 128, 20);
+    el = clock_now_ms() - t0;
+    ck("silent, 20: -6", r, 0 - 6);
+    ck("silent, 20: timed out", setu_read_timed_out(), 1);
+    ck_in("silent, 20: gave up at the bound", el, 20, 250);
+    said("silent peer, setu_read_blk_ms(20)", el);
+
+    t0 = clock_now_ms();
+    r = setu_read_blk_ms(g_afd, buf, 128, 0);
+    el = clock_now_ms() - t0;
+    ck("silent, 0: -6", r, 0 - 6);
+    ck("silent, 0: timed out", setu_read_timed_out(), 1);
+    ck_in("silent, 0: did not wait", el, 0, 50);
+    said("silent peer, setu_read_blk_ms(0)", el);
+
+    t0 = clock_now_ms();
+    r = setu_read_msg_ms(g_afd, m, 100);
+    el = clock_now_ms() - t0;
+    ck("silent, msg 100: -6", r, 0 - 6);
+    ck("silent, msg 100: timed out", setu_read_timed_out(), 1);
+    ck_in("silent, msg 100: gave up at the bound", el, 100, 500);
+    said("silent peer, setu_read_msg_ms(100)", el);
+
+    # ⭐ A timeout leaves the connection usable, and a queued record needs no wait at all.
+    ck("after the timeouts: send", setu_send(g_cfd, setu_commit(9)) > 0, 1);
+    ck("after the timeouts: a queued frame, no wait", setu_read_msg_ms(g_afd, m, 0), 24);
+    ck("after the timeouts: its kind", setu_msg_kind(m), SETU_COMMIT);
+    ck("after the timeouts: not a timeout", setu_read_timed_out(), 0);
+    unpair();
+    return 0;
+}
+
+# --- 2. A record that arrives late but within the bound is returned when it arrives. ---------------
+fn t_late(sfd, path) {
+    pair(sfd, path);
+    var buf = alloc(128);
+    var pid = peer(g_cfd, 250, 0, 0, 1);
+    var t0 = clock_now_ms();
+    var r = setu_read_blk_ms(g_afd, buf, 128, 5000);
+    var el = clock_now_ms() - t0;
+    reap(pid);
+    ck("late: the record", r, 24);
+    ck("late: not a timeout", setu_read_timed_out(), 0);
+    ck_in("late: returned when it came", el, 240, 1500);
+    said("record at 250 ms, setu_read_blk_ms(5000)", el);
+    unpair();
+    return 0;
+}
+
+# --- 3. No deadline: a negative bound, and the Linux DEFAULT, still wait for a late record. ---------
+# ⛔ THE DEFAULT MUST STAY UNBOUNDED ON LINUX. dhancha's `dh_client_next_event` blocks in it for the
+# next input event and ends the session on any negative return, so a finite default would disconnect
+# every app that sat idle for longer than it. The exact guard is the constant; the reads below show
+# the default path still waits.
+fn t_unbounded(sfd, path) {
+    var unbounded = 0;
+    if (SETU_READ_DEFAULT_MS < 0) { unbounded = 1; }
+    ck("linux default: no deadline", unbounded, 1);
+
+    pair(sfd, path);
+    var buf = alloc(128);
+    var pid = peer(g_cfd, 250, 0, 0, 1);
+    var t0 = clock_now_ms();
+    var r = setu_read_blk_ms(g_afd, buf, 128, 0 - 1);
+    var el = clock_now_ms() - t0;
+    reap(pid);
+    ck("no deadline: the record", r, 24);
+    ck("no deadline: not a timeout", setu_read_timed_out(), 0);
+    ck_in("no deadline: returned when it came", el, 240, 1500);
+    said("record at 250 ms, setu_read_blk_ms(-1)", el);
+
+    pid = peer(g_cfd, 1000, 0, 0, 1);
+    t0 = clock_now_ms();
+    r = setu_read_blk(g_afd, buf, 128);
+    el = clock_now_ms() - t0;
+    reap(pid);
+    ck("default: the record", r, 24);
+    ck("default: not a timeout", setu_read_timed_out(), 0);
+    ck_in("default: waited for it", el, 990, 2500);
+    said("record at 1000 ms, setu_read_blk (the Linux default)", el);
+
+    # A bound past the end of the clock is no deadline, not an overflow into an instant timeout.
+    pid = peer(g_cfd, 200, 0, 0, 1);
+    r = setu_read_blk_ms(g_afd, buf, 128, 0x7FFFFFFFFFFFFFFF);
+    reap(pid);
+    ck("i64-max bound: the record", r, 24);
+    ck("i64-max bound: not a timeout", setu_read_timed_out(), 0);
+    unpair();
+    return 0;
+}
+
+# --- 3b. The Linux DEFAULT outlasts the agnos one (8 s), on a silent peer. -------------------------
+# ⭐ THE ONE CHECK THAT CAN TELL "UNBOUNDED" FROM "LONG". A wrapper that hard-codes a bound of a second
+# or more passes every other check in this file, and 8000 — the agnos default, and the obvious naive
+# fix for the Linux hang — is exactly that bound. So a child blocks in `setu_read_blk` on a silent
+# connection while the rest of the suite runs, and must still be waiting 8.6 s later; then the suite
+# closes the client end and the child's read must end at once, as EOF and not as a timeout.
+# ⚠ Run alongside the other tests, so the wait costs ~5 s of wall time rather than 8.6.
+var long_pid = 0;
+var long_cfd = 0 - 1;
+var long_t0 = 0;
+fn t_default_long_start(sfd, path) {
+    pair(sfd, path);
+    long_t0 = clock_now_ms();
+    var pid = sys_fork();
+    if (pid == 0) {
+        sys_close(g_cfd);                          # only the suite may hold the client end
+        var buf = alloc(128);
+        var r = setu_read_blk(g_afd, buf, 128);
+        var code = 10;                             # 10: a record, which a silent peer never sends
+        if (r == 0 - 6) {
+            code = 0;                              # 0: EOF, the expected end
+            if (setu_read_timed_out() == 1) { code = 11; }   # 11: the default timed out
+        }
+        syscall(SYS_EXIT, code);
+    }
+    long_pid = pid;
+    long_cfd = g_cfd;
+    sys_close(g_afd);                              # the child reads it; the suite needs no copy
+    g_cfd = 0 - 1;
+    g_afd = 0 - 1;
+    return 0;
+}
+
+fn t_default_long_finish() {
+    var st[8];
+    var target = long_t0 + 8600;
+    var now = clock_now_ms();
+    if (now < target) { sleep_ms(target - now); }
+    var still = sys_waitpid(long_pid, &st, WNOHANG);
+    var at = clock_now_ms() - long_t0;
+    ck("default, silent peer: still waiting past 8 s", still, 0);
+    said("setu_read_blk (the Linux default) on a silent peer, still waiting at", at);
+    var t1 = clock_now_ms();
+    sys_close(long_cfd);                           # the client end's last copy: EOF for the child
+    if (still == 0) { sys_waitpid(long_pid, &st, 0); }
+    var el = clock_now_ms() - t1;
+    var s = load32(&st);
+    ck("default, silent peer: the child exited", WIFEXITED(s), 1);
+    ck("default, silent peer: -6 on EOF, not a timeout", WEXITSTATUS(s), 0);
+    ck_in("default, silent peer: EOF ended it at once", el, 0, 500);
+    said("then the peer closed; the default read returned -6 after", el);
+    return 0;
+}
+
+# --- 4. The peer goes: EOF, a reset, a bad fd and a close mid-wait are -6 at once. ------------------
+fn t_gone(sfd, path) {
+    var buf = alloc(128);
+
+    # 4a. A clean close with nothing queued: EOF.
+    pair(sfd, path);
+    sys_close(g_cfd);
+    g_cfd = 0 - 1;
+    var t0 = clock_now_ms();
+    var r = setu_read_blk_ms(g_afd, buf, 128, 5000);
+    var el = clock_now_ms() - t0;
+    ck("eof: -6", r, 0 - 6);
+    ck("eof: not a timeout", setu_read_timed_out(), 0);
+    ck_in("eof: at once", el, 0, 200);
+    said("EOF, setu_read_blk_ms(5000)", el);
+    t0 = clock_now_ms();
+    r = setu_read_blk(g_afd, buf, 128);
+    el = clock_now_ms() - t0;
+    ck("eof, default: -6", r, 0 - 6);
+    ck("eof, default: not a timeout", setu_read_timed_out(), 0);
+    ck_in("eof, default: at once", el, 0, 200);
+    said("EOF, setu_read_blk (the Linux default)", el);
+    unpair();
+
+    # 4b. The peer closed with one of our records unread: -ECONNRESET comes before EOF.
+    pair(sfd, path);
+    ck("reset: leave a record unread", setu_send(g_cfd, setu_commit(1)) > 0, 1);
+    sys_close(g_afd);
+    g_afd = 0 - 1;
+    t0 = clock_now_ms();
+    r = setu_read_blk_ms(g_cfd, buf, 128, 5000);
+    el = clock_now_ms() - t0;
+    ck("reset: -6", r, 0 - 6);
+    ck("reset: not a timeout", setu_read_timed_out(), 0);
+    ck_in("reset: at once", el, 0, 200);
+    said("reset (our record unread), setu_read_blk_ms(5000)", el);
+    unpair();
+
+    # 4c. An fd that was never a connection. poll(2) ignores a negative fd, and would sleep out the
+    # whole bound instead of failing.
+    t0 = clock_now_ms();
+    r = setu_read_blk_ms(0 - 1, buf, 128, 5000);
+    el = clock_now_ms() - t0;
+    ck("bad fd: -6", r, 0 - 6);
+    ck("bad fd: not a timeout", setu_read_timed_out(), 0);
+    ck_in("bad fd: at once", el, 0, 200);
+    said("fd -1, setu_read_blk_ms(5000)", el);
+
+    # 4d. The peer goes while the read waits: -6 when it goes, not at the bound. The peer holds the
+    # only other copy of the client end once the suite closes its own.
+    pair(sfd, path);
+    var pid = peer(g_cfd, 250, 0, 0, 0);
+    sys_close(g_cfd);
+    g_cfd = 0 - 1;
+    t0 = clock_now_ms();
+    r = setu_read_blk_ms(g_afd, buf, 128, 5000);
+    el = clock_now_ms() - t0;
+    reap(pid);
+    ck("gone mid-wait: -6", r, 0 - 6);
+    ck("gone mid-wait: not a timeout", setu_read_timed_out(), 0);
+    ck_in("gone mid-wait: when it went", el, 240, 1500);
+    said("peer exits at 250 ms, setu_read_blk_ms(5000)", el);
+    unpair();
+    return 0;
+}
+
+# --- 5. A signal in the wait (EINTR) neither ends it nor restarts it. -----------------------------
+#ifdef CYRIUS_ARCH_X86
+# ⚠ EINTR needs a HANDLER: an ignored signal does not interrupt poll(2), and a default-action stop is
+# restarted by the kernel invisibly. The stdlib installs no handlers (only SIG_IGN / SIG_DFL), and
+# x86_64 needs SA_RESTORER plus a restorer that issues rt_sigreturn (15), so the suite writes that
+# 7-byte trampoline into an executable page itself. No SA_RESTART: the poll must come back -EINTR.
+var g_sigs = 0;
+fn on_sigusr1(): i64 {
+    g_sigs = g_sigs + 1;
+    return 0;
+}
+
+fn eintr_arm(): i64 {
+    var page = syscall(SYS_MMAP, 0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, 0 - 1, 0);
+    if (page <= 0) { return 0 - 1; }
+    store8(page + 0, 0xB8);                        # mov eax, 15
+    store8(page + 1, 0x0F);
+    store8(page + 2, 0);
+    store8(page + 3, 0);
+    store8(page + 4, 0);
+    store8(page + 5, 0x0F);                        # syscall
+    store8(page + 6, 0x05);
+    var act[32];
+    store64(&act, &on_sigusr1);                    # sa_handler
+    store64(&act + 8, 0x04000000);                 # sa_flags: SA_RESTORER only (no SA_RESTART)
+    store64(&act + 16, page);                      # sa_restorer
+    store64(&act + 24, 0);                         # sa_mask
+    return syscall(13, SIGUSR1, &act, 0, 8);       # rt_sigaction
+}
+#endif
+
+fn t_eintr(sfd, path) {
+    #ifdef CYRIUS_ARCH_X86
+    if (eintr_arm() != 0) {
+        var sk = "read_deadline_test: SKIP eintr (no SIGUSR1 handler: no executable page)\n";
+        sys_write(1, sk, strlen(sk));
+        return 0;
+    }
+    var buf = alloc(128);
+    pair(sfd, path);
+
+    # 5a. SIGUSR1 at 150 ms, the record at 300 ms, a 3 s bound: the record, at ~300 ms.
+    g_sigs = 0;
+    var pid = peer(g_cfd, 150, 1, 150, 1);
+    var t0 = clock_now_ms();
+    var r = setu_read_blk_ms(g_afd, buf, 128, 3000);
+    var el = clock_now_ms() - t0;
+    reap(pid);
+    ck("eintr: the signal landed", g_sigs, 1);
+    ck("eintr: the record", r, 24);
+    ck("eintr: not a timeout", setu_read_timed_out(), 0);
+    ck_in("eintr: returned when the record came", el, 290, 1500);
+    said("SIGUSR1 at 150 ms, record at 300 ms, setu_read_blk_ms(3000)", el);
+
+    # 5b. The same through the Linux default, which has no deadline to re-read.
+    g_sigs = 0;
+    pid = peer(g_cfd, 150, 1, 150, 1);
+    t0 = clock_now_ms();
+    r = setu_read_blk(g_afd, buf, 128);
+    el = clock_now_ms() - t0;
+    reap(pid);
+    ck("eintr, default: the signal landed", g_sigs, 1);
+    ck("eintr, default: the record", r, 24);
+    ck_in("eintr, default: returned when the record came", el, 290, 1500);
+    said("SIGUSR1 at 150 ms, record at 300 ms, setu_read_blk (the Linux default)", el);
+
+    # 5c. SIGUSR1 at 400 ms and no record, an 800 ms bound: -6 at ~800 ms. Not at ~400 (the signal
+    # ended the wait), and not at ~1200 (the signal restarted it with the whole bound). The suite
+    # still holds the client end, so the peer's exit is not EOF.
+    g_sigs = 0;
+    pid = peer(g_cfd, 400, 1, 0, 0);
+    t0 = clock_now_ms();
+    r = setu_read_blk_ms(g_afd, buf, 128, 800);
+    el = clock_now_ms() - t0;
+    reap(pid);
+    ck("eintr, no record: the signal landed", g_sigs, 1);
+    ck("eintr, no record: -6", r, 0 - 6);
+    ck("eintr, no record: timed out", setu_read_timed_out(), 1);
+    ck_in("eintr, no record: at the bound", el, 800, 1100);
+    said("SIGUSR1 at 400 ms, no record, setu_read_blk_ms(800)", el);
+    unpair();
+    signal_default(SIGUSR1);
+    #endif
+    #ifndef CYRIUS_ARCH_X86
+    var sk2 = "read_deadline_test: SKIP eintr (the SA_RESTORER trampoline is x86_64-only)\n";
+    sys_write(1, sk2, strlen(sk2));
+    #endif
+    return 0;
+}
+#endif
+
+fn main(): i64 {
+    alloc_init();
+    #ifdef CYRIUS_TARGET_AGNOS
+    # agnos has no AF_UNIX and no host to run on in CI. The agnos arm of `setu_read_blk_ms` is compiled
+    # here but unreachable; `reach_test` is what makes an undefined symbol in it a build error.
+    var sk = "read_deadline_test: SKIP (agnos has no AF_UNIX; clients are placed)\n";
+    sys_write(1, sk, strlen(sk));
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    watchdog_arm(60000);
+    var path = "/tmp/setu-read-deadline-test.sock";
+    var sfd = setu_listen(path);
+    if (sfd < 0) {
+        sys_write(1, "read_deadline_test: FAIL listen\n", 32);
+        watchdog_disarm();
+        return 1;
+    }
+    t_default_long_start(sfd, path);
+    t_silent(sfd, path);
+    t_late(sfd, path);
+    t_unbounded(sfd, path);
+    t_gone(sfd, path);
+    t_eintr(sfd, path);
+    t_default_long_finish();
+    sys_close(sfd);
+    sys_unlinkat(AT_FDCWD, path, 0);
+    watchdog_disarm();
+
+    if (fails != 0) { sys_write(1, "read_deadline_test: FAILED\n", 27); return 1; }
+    var ok = "read_deadline_test: PASS (a silent peer times out AT the bound; late records arrive;\n";
+    sys_write(1, ok, strlen(ok));
+    var ok2 = "  EOF, reset, bad fd and a mid-wait close are -6 at once; the Linux default waits\n";
+    sys_write(1, ok2, strlen(ok2));
+    var ok25 = "  past 8 s on a silent peer;\n";
+    sys_write(1, ok25, strlen(ok25));
+    var ok3 = "  EINTR neither ends nor restarts the wait)\n";
+    sys_write(1, ok3, strlen(ok3));
+    return 0;
+    #endif
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
