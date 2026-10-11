@@ -1,0 +1,612 @@
+# programs/buf_safety_test.cyr — what may sit at a shared buffer's name on Linux, and what setu does
+# about it (0.8.13).
+#
+# ⛔ WHY THIS EXISTS. /dev/shm is world-writable, a client's buffer ids are predictable
+# (pid * 100000 + counter), and a compositor opens whatever id an ATTACH names. Until 0.8.13 every open
+# in buf.cyr was a plain one: setu_buf_read on a FIFO waited in open(2) for a writer (forever, in the
+# compositor's frame loop), on a write-leased file it waited lease-break-time (45 s by default), and it
+# followed a symlink; setu_buf_create (O_CREAT | O_TRUNC) followed a planted symlink and truncated its
+# target. Every other suite reads and writes buffers setu made itself, so none of them could see it.
+#
+# What it pins, on Linux (agnos buffers are kernel slots addressed by id, with no name to plant on):
+#   read    a FIFO (with no writer, and holding the bytes asked for), a symlink (to a real buffer, and
+#           dangling), a directory, a write-leased file, a file shorter than asked and an empty name
+#           are -1 AT ONCE, and the destination is left as it was; a regular file reads back exactly;
+#   create  skips a planted symlink without touching it or its target, skips a stale file without
+#           truncating it, makes a 0600 regular file of the size asked, and gives up after
+#           SETU_BUF_CREATE_TRIES names that are all taken: no sooner, and no later;
+#   write   refuses a symlink, a directory, a write-leased file and a FIFO (with and without a reader)
+#           at a live buffer's name, at once, and writes nothing through any of them.
+#
+# ⛔ A REGRESSION HERE IS A HANG, NOT A WRONG ANSWER (an open that waits on a FIFO or a lease), so the
+# suite arms a watchdog, as read_deadline_test does: a child that removes what the suite planted and
+# SIGKILLs it after 30 s, which is inside the 45 s a lease would hold a blocking open.
+# ⚠ FIFOs are made with mknodat, which the pinned stdlib does not wrap. The suite issues the x86_64
+# number itself and SKIPs the FIFO checks on other arches (CI is x86_64).
+
+include "src/lib.cyr"
+
+var fails = 0;
+
+fn ck(what, got, want) {
+    if (got != want) {
+        sys_write(1, "buf_safety_test: FAIL ", 22);
+        sys_write(1, what, strlen(what));
+        sys_write(1, " got=", 5); print_num(got);
+        sys_write(1, " want=", 6); print_num(want);
+        sys_write(1, "\n", 1);
+        fails = fails + 1;
+    }
+    return 0;
+}
+
+# `got` within [lo, hi], for measured durations, where no exact value is a property.
+fn ck_in(what, got, lo, hi) {
+    var ok = 1;
+    if (got < lo) { ok = 0; }
+    if (got > hi) { ok = 0; }
+    if (ok == 0) {
+        sys_write(1, "buf_safety_test: FAIL ", 22);
+        sys_write(1, what, strlen(what));
+        sys_write(1, " got=", 5); print_num(got);
+        sys_write(1, " want=", 6); print_num(lo);
+        sys_write(1, "..", 2); print_num(hi);
+        sys_write(1, "\n", 1);
+        fails = fails + 1;
+    }
+    return 0;
+}
+
+# Print one measurement, so a run states its numbers and not only that they were in range.
+fn said(what, us) {
+    sys_write(1, "  measured: ", 12);
+    sys_write(1, what, strlen(what));
+    sys_write(1, " = ", 3); print_num(us);
+    sys_write(1, " us\n", 4);
+    return 0;
+}
+
+fn skip(what) {
+    sys_write(1, "buf_safety_test: SKIP ", 22);
+    sys_write(1, what, strlen(what));
+    sys_write(1, "\n", 1);
+    return 0;
+}
+
+#ifndef CYRIUS_TARGET_AGNOS
+var T_SIGIO = 29;                  # what a lease break sends the holder (asm-generic: x86_64, aarch64)
+var T_F_SETLEASE = 1024;
+var T_F_GETLEASE = 1025;
+var T_F_WRLCK = 1;
+var T_F_UNLCK = 2;
+var T_PROMPT_US = 250000;          # "at once": every refusal measures in microseconds; a wait is seconds
+var T_ID_OFF = 99000;              # the names the suite plants: pid * 100000 + 99001 .. 99020
+
+var suite_pid = 0;
+var target_buf = 0;
+
+fn now_us() { return clock_now_ns() / 1000; }
+
+# A name the suite plants things at, from the SUITE's pid, so the watchdog can find it too.
+fn tid(k) { return suite_pid * 100000 + T_ID_OFF + k; }
+
+# The path setu uses for buffer `id`, in fresh storage.
+fn name_of(id) {
+    var p = alloc(48);
+    setu_buf_path(id, p);
+    return p;
+}
+
+# A file outside /dev/shm that this process can write: what a planted symlink aims at.
+fn target_path() {
+    if (target_buf != 0) { return target_buf; }
+    target_buf = alloc(64);
+    var pre = "/tmp/setu-buf-safety-target-";
+    var n = strlen(pre);
+    var i = 0;
+    while (i < n) { store8(target_buf + i, load8(pre + i)); i = i + 1; }
+    var d = fmt_int_buf(suite_pid, target_buf + n);
+    store8(target_buf + n + d, 0);
+    return target_buf;
+}
+
+fn fill(p, n, v) {
+    var i = 0;
+    while (i < n) { store8(p + i, v); i = i + 1; }
+    return 0;
+}
+
+fn pattern(p, n, seed) {
+    var i = 0;
+    while (i < n) { store8(p + i, (i * 7 + seed) & 255); i = i + 1; }
+    return 0;
+}
+
+# How many of the `n` bytes at `p` are not `v`.
+fn count_not(p, n, v) {
+    var miss = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(p + i) != v) { miss = miss + 1; }
+        i = i + 1;
+    }
+    return miss;
+}
+
+# How many of the `n` bytes at `a` and `b` differ.
+fn differs(a, b, n) {
+    var miss = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(a + i) != load8(b + i)) { miss = miss + 1; }
+        i = i + 1;
+    }
+    return miss;
+}
+
+# A regular file at `path` holding `n` bytes of `v`, made the way another program or a crashed process
+# would leave one. 0, or the failing call's negative return.
+fn plant_file(path, n, v) {
+    var fd = sys_open(path, O_WRONLY | O_CREAT | O_EXCL, 384);
+    if (fd < 0) { return fd; }
+    var b = alloc(n + 8);
+    fill(b, n, v);
+    var w = sys_write(fd, b, n);
+    sys_close(fd);
+    if (w != n) { return 0 - 5; }
+    return 0;
+}
+
+# 0 when `path` is exactly what plant_file(path, n, v) left: `n` bytes, every one `v`. Otherwise the
+# count of wrong bytes, plus 1000000 when the size differs; -1 when it cannot be opened.
+fn file_is(path, n, v) {
+    var fd = sys_open(path, O_RDONLY, 0);
+    if (fd < 0) { return 0 - 1; }
+    var b = alloc(n + 64);
+    var got = 0;
+    while (got < n + 64) {
+        var r = sys_read(fd, b + got, n + 64 - got);
+        if (r <= 0) { break; }
+        got = got + r;
+    }
+    sys_close(fd);
+    var bad = 0;
+    if (got != n) { bad = 1000000; }
+    var m = got;
+    if (m > n) { m = n; }
+    return bad + count_not(b, m, v);
+}
+
+# 1 when the symlink at `lnk` still names `want`, byte for byte.
+fn link_names(lnk, want) {
+    var b = alloc(256);
+    var r = sys_readlink(lnk, b, 255);
+    if (r != strlen(want)) { return 0; }
+    if (differs(b, want, r) != 0) { return 0; }
+    return 1;
+}
+
+# A directory at each of the `k` names setu_buf_create tries after counter value `base`. Returns how
+# many it made.
+fn occupy(base, k) {
+    var made = 0;
+    var i = 1;
+    while (i <= k) {
+        if (sys_mkdirat(AT_FDCWD, name_of(suite_pid * 100000 + base + i), 448) == 0) { made = made + 1; }
+        i = i + 1;
+    }
+    return made;
+}
+
+fn vacate(base, k) {
+    var i = 1;
+    while (i <= k) {
+        sys_unlinkat(AT_FDCWD, name_of(suite_pid * 100000 + base + i), AT_REMOVEDIR);
+        i = i + 1;
+    }
+    return 0;
+}
+
+#ifdef CYRIUS_ARCH_X86
+# mknodat(AT_FDCWD, path, S_IFIFO | 0600, 0): a FIFO. ⚠ The x86_64 number (259): the pinned stdlib has
+# no wrapper, so the FIFO checks are x86_64-only.
+fn mkfifo_at(path) { return syscall(259, AT_FDCWD, path, 4096 | 384, 0); }
+#endif
+
+# Remove everything the suite may have planted: its own names, the counter names a create step uses,
+# and the symlink target. Run at the end, and by the watchdog before it kills a hung suite.
+fn cleanup_planted() {
+    var p = alloc(48);
+    var k = 1;
+    while (k <= 20) {
+        setu_buf_path(tid(k), p);
+        sys_unlinkat(AT_FDCWD, p, 0);
+        sys_unlinkat(AT_FDCWD, p, AT_REMOVEDIR);
+        k = k + 1;
+    }
+    k = 1;
+    while (k <= 200) {
+        setu_buf_path(suite_pid * 100000 + k, p);
+        sys_unlinkat(AT_FDCWD, p, 0);
+        sys_unlinkat(AT_FDCWD, p, AT_REMOVEDIR);
+        k = k + 1;
+    }
+    sys_unlinkat(AT_FDCWD, target_path(), 0);
+    return 0;
+}
+
+fn reap(pid) {
+    var st[8];
+    sys_waitpid(pid, &st, 0);
+    return 0;
+}
+
+# The watchdog: a child that, after `ms`, says why, removes what the suite planted and SIGKILLs it.
+# PR_SET_PDEATHSIG makes it die with the suite, so it can never outlive a finished run.
+var wd_pid = 0;
+fn watchdog_arm(ms) {
+    var pid = sys_fork();
+    if (pid == 0) {
+        sys_prctl(1, SIGKILL, 0, 0, 0);            # PR_SET_PDEATHSIG
+        if (sys_getppid() != suite_pid) { syscall(SYS_EXIT, 0); }
+        sleep_ms(ms);
+        var m = "buf_safety_test: FAIL watchdog: the suite hung; an open that must not wait did\n";
+        sys_write(1, m, strlen(m));
+        cleanup_planted();
+        sys_kill(suite_pid, SIGKILL);
+        syscall(SYS_EXIT, 1);
+    }
+    wd_pid = pid;
+    return 0;
+}
+
+fn watchdog_disarm() {
+    if (wd_pid > 0) {
+        sys_kill(wd_pid, SIGKILL);
+        reap(wd_pid);
+    }
+    return 0;
+}
+
+# --- 1. Read: what a hostile name holds is refused at once, and `dst` is left as it was. -------------
+fn t_read() {
+    var n = 64;
+    var dst = alloc(n);
+    var src = alloc(n);
+    pattern(src, n, 3);
+    var t0 = 0;
+    var r = 0;
+    var el = 0;
+
+    #ifdef CYRIUS_ARCH_X86
+    # 1a. A FIFO with no writer. A plain O_RDONLY open of one waits for a writer, which may never come.
+    var fifo = name_of(tid(1));
+    ck("read, fifo: planted", mkfifo_at(fifo), 0);
+    fill(dst, n, 0xA5);
+    t0 = now_us();
+    r = setu_buf_read(tid(1), dst, n);
+    el = now_us() - t0;
+    ck("read, fifo, no writer: -1", r, 0 - 1);
+    ck_in("read, fifo, no writer: at once", el, 0, T_PROMPT_US);
+    ck("read, fifo, no writer: dst untouched", count_not(dst, n, 0xA5), 0);
+    said("setu_buf_read, a FIFO with no writer, -1 after", el);
+
+    # 1b. The same FIFO holding exactly the bytes asked for. The non-blocking open alone would read
+    # them as pixels, and consume them; the regular-file check is what refuses.
+    var ffd = sys_open(fifo, O_RDWR | O_NONBLOCK, 0);   # both ends, so this open cannot wait either
+    ck("read, fifo: opened both ends", ffd >= 0, 1);
+    ck("read, fifo: filled", sys_write(ffd, src, n), n);
+    fill(dst, n, 0xA5);
+    t0 = now_us();
+    r = setu_buf_read(tid(1), dst, n);
+    el = now_us() - t0;
+    ck("read, fifo holding the bytes: -1", r, 0 - 1);
+    ck_in("read, fifo holding the bytes: at once", el, 0, T_PROMPT_US);
+    ck("read, fifo holding the bytes: dst untouched", count_not(dst, n, 0xA5), 0);
+    var back = alloc(n);
+    ck("read, fifo holding the bytes: none consumed", sys_read(ffd, back, n), n);
+    said("setu_buf_read, a FIFO holding the bytes, -1 after", el);
+    sys_close(ffd);
+    sys_unlinkat(AT_FDCWD, fifo, 0);
+    #endif
+    #ifndef CYRIUS_ARCH_X86
+    skip("read, fifo (mknodat is issued by its x86_64 number)");
+    #endif
+
+    # 1c. A symlink to a real buffer: refused, while the buffer it names reads.
+    var real = setu_buf_create(n);
+    ck("read, link: a real buffer", real > 0, 1);
+    ck("read, link: the buffer filled", setu_buf_write(real, src, n), 0);
+    var lnk = name_of(tid(2));
+    ck("read, link: planted", sys_symlink(name_of(real), lnk), 0);
+    fill(dst, n, 0xA5);
+    t0 = now_us();
+    r = setu_buf_read(tid(2), dst, n);
+    el = now_us() - t0;
+    ck("read, symlink to a buffer: -1", r, 0 - 1);
+    ck_in("read, symlink to a buffer: at once", el, 0, T_PROMPT_US);
+    ck("read, symlink to a buffer: dst untouched", count_not(dst, n, 0xA5), 0);
+    said("setu_buf_read, a symlink to a real buffer, -1 after", el);
+    ck("read, the buffer it names reads", setu_buf_read(real, dst, n), 0);
+    ck("read, the buffer it names holds the bytes", differs(dst, src, n), 0);
+    sys_unlinkat(AT_FDCWD, lnk, 0);
+
+    # 1d. A dangling symlink.
+    ck("read, dangling link: planted", sys_symlink("/dev/shm/setu-buf-safety-nowhere", lnk), 0);
+    fill(dst, n, 0xA5);
+    ck("read, dangling symlink: -1", setu_buf_read(tid(2), dst, n), 0 - 1);
+    ck("read, dangling symlink: dst untouched", count_not(dst, n, 0xA5), 0);
+    sys_unlinkat(AT_FDCWD, lnk, 0);
+
+    # 1e. A directory.
+    var dir = name_of(tid(3));
+    ck("read, directory: planted", sys_mkdirat(AT_FDCWD, dir, 448), 0);
+    fill(dst, n, 0xA5);
+    t0 = now_us();
+    r = setu_buf_read(tid(3), dst, n);
+    el = now_us() - t0;
+    ck("read, directory: -1", r, 0 - 1);
+    ck_in("read, directory: at once", el, 0, T_PROMPT_US);
+    ck("read, directory: dst untouched", count_not(dst, n, 0xA5), 0);
+    sys_unlinkat(AT_FDCWD, dir, AT_REMOVEDIR);
+
+    # 1f. A regular file shorter than asked. It was -1 before 0.8.13 too, but only at EOF, after the
+    # short file had been copied over the front of `dst`.
+    var shortf = name_of(tid(4));
+    ck("read, short file: planted", plant_file(shortf, n / 2, 0x5A), 0);
+    fill(dst, n, 0xA5);
+    ck("read, short file: -1", setu_buf_read(tid(4), dst, n), 0 - 1);
+    ck("read, short file: dst untouched", count_not(dst, n, 0xA5), 0);
+    ck("read, short file: its own size reads", setu_buf_read(tid(4), dst, n / 2), 0);
+    ck("read, short file: and is its bytes", count_not(dst, n / 2, 0x5A), 0);
+    # ⚠ The exact boundary: ONE byte more than the file holds is refused before anything is copied. An
+    # off-by-one in the size gate would copy the n/2 bytes over `dst` and only then return -1 at EOF —
+    # the torn frame this check exists to prevent.
+    fill(dst, n, 0xA5);
+    ck("read, one byte short: -1", setu_buf_read(tid(4), dst, n / 2 + 1), 0 - 1);
+    ck("read, one byte short: dst untouched", count_not(dst, n, 0xA5), 0);
+    sys_unlinkat(AT_FDCWD, shortf, 0);
+
+    # 1g. Nothing at the name.
+    fill(dst, n, 0xA5);
+    ck("read, no such name: -1", setu_buf_read(tid(5), dst, n), 0 - 1);
+    ck("read, no such name: dst untouched", count_not(dst, n, 0xA5), 0);
+
+    # 1h. A regular file reads back exactly. O_NONBLOCK does not change a regular file's read: the
+    # page cache answers it. 256 KiB, so the copy spans many pages, through create / write / read, and a
+    # plain file setu did not make.
+    var big = 256 * 256 * 4;
+    var bsrc = alloc(big);
+    var bdst = alloc(big);
+    pattern(bsrc, big, 11);
+    var bid = setu_buf_create(big);
+    ck("read, regular: a 256 KiB buffer", bid > 0, 1);
+    ck("read, regular: written", setu_buf_write(bid, bsrc, big), 0);
+    fill(bdst, big, 0);
+    ck("read, regular: read", setu_buf_read(bid, bdst, big), 0);
+    ck("read, regular: every byte", differs(bdst, bsrc, big), 0);
+    setu_buf_close(bid);
+    var plain = name_of(tid(7));
+    ck("read, regular, not setu's: planted", plant_file(plain, 4096, 0x3C), 0);
+    ck("read, regular, not setu's: read", setu_buf_read(tid(7), bdst, 4096), 0);
+    ck("read, regular, not setu's: every byte", count_not(bdst, 4096, 0x3C), 0);
+    sys_unlinkat(AT_FDCWD, plain, 0);
+    setu_buf_close(real);
+    return 0;
+}
+
+# --- 2. A file whose owner holds a write lease (F_SETLEASE). ---------------------------------------
+# The kernel makes an open of a leased file wait until the holder lets go or lease-break-time passes
+# (45 s by default), unless the open is O_NONBLOCK, which fails EWOULDBLOCK at once. Only a file's
+# owner can lease it, so the holder here is the suite itself, ignoring the SIGIO a break sends it.
+fn t_lease() {
+    var n = 64;
+    var id = tid(6);
+    var path = name_of(id);
+    ck("lease: a file", plant_file(path, n, 0x5A), 0);
+    var lfd = sys_open(path, O_RDONLY, 0);
+    ck("lease: opened", lfd >= 0, 1);
+    signal_ignore(T_SIGIO);
+    var rc = syscall(SYS_FCNTL, lfd, T_F_SETLEASE, T_F_WRLCK);
+    if (rc != 0) {
+        skip("lease (F_SETLEASE refused: leases disabled here?)");
+        sys_close(lfd);
+        signal_default(T_SIGIO);
+        sys_unlinkat(AT_FDCWD, path, 0);
+        return 0;
+    }
+    ck("lease: held", syscall(SYS_FCNTL, lfd, T_F_GETLEASE, 0), T_F_WRLCK);
+    var dst = alloc(n);
+    fill(dst, n, 0xA5);
+    var t0 = now_us();
+    var r = setu_buf_read(id, dst, n);
+    var el = now_us() - t0;
+    ck("lease: read -1", r, 0 - 1);
+    ck_in("lease: read at once", el, 0, T_PROMPT_US);
+    ck("lease: read, dst untouched", count_not(dst, n, 0xA5), 0);
+    said("setu_buf_read, a write-leased file, -1 after", el);
+    var src = alloc(n);
+    fill(src, n, 0x11);
+    t0 = now_us();
+    r = setu_buf_write(id, src, n);
+    el = now_us() - t0;
+    ck("lease: write -1", r, 0 - 1);
+    ck_in("lease: write at once", el, 0, T_PROMPT_US);
+    said("setu_buf_write, a write-leased file, -1 after", el);
+    ck("lease: released", syscall(SYS_FCNTL, lfd, T_F_SETLEASE, T_F_UNLCK), 0);
+    sys_close(lfd);
+    signal_default(T_SIGIO);
+    ck("lease: once released, it reads", setu_buf_read(id, dst, n), 0);
+    ck("lease: and the refused write wrote nothing", count_not(dst, n, 0x5A), 0);
+    sys_unlinkat(AT_FDCWD, path, 0);
+    return 0;
+}
+
+# --- 3. Create: a name that exists is skipped, never opened. -----------------------------------------
+fn t_create() {
+    var tgt = target_path();
+    var n = 4096;
+    var src = alloc(n);
+    pattern(src, n, 5);
+    var st = alloc(144);                           # struct stat (STAT_BUFSZ)
+
+    # 3a. A symlink at the next name, to a file this process can write (outside /dev/shm). Until 0.8.13
+    # the create followed it, truncated the target, and then sized it to the buffer.
+    ck("create, link: a target", plant_file(tgt, 100, 0x5A), 0);
+    var next = suite_pid * 100000 + _setu_buf_counter + 1;
+    var lnk = name_of(next);
+    ck("create, link: planted at the next name", sys_symlink(tgt, lnk), 0);
+    var id = setu_buf_create(n);
+    ck("create, link: skipped to the name after it", id, next + 1);
+    ck("create, link: its target untouched", file_is(tgt, 100, 0x5A), 0);
+    ck("create, link: the link itself untouched", link_names(lnk, tgt), 1);
+    ck("create, link: the new buffer takes a write", setu_buf_write(id, src, n), 0);
+    ck("create, link: the target is still untouched", file_is(tgt, 100, 0x5A), 0);
+    setu_buf_close(id);
+    sys_unlinkat(AT_FDCWD, lnk, 0);
+    sys_unlinkat(AT_FDCWD, tgt, 0);
+
+    # 3b. A stale file at the next name: what a crashed process that had our pid leaves behind.
+    next = suite_pid * 100000 + _setu_buf_counter + 1;
+    var stale = name_of(next);
+    ck("create, stale: planted at the next name", plant_file(stale, 64, 0x77), 0);
+    id = setu_buf_create(n);
+    ck("create, stale: skipped to the name after it", id, next + 1);
+    ck("create, stale: not truncated, resized or written", file_is(stale, 64, 0x77), 0);
+    setu_buf_close(id);
+    sys_unlinkat(AT_FDCWD, stale, 0);
+
+    # 3c. What it makes: a regular file, mode 0600, of the size asked.
+    id = setu_buf_create(n);
+    ck("create: made", id > 0, 1);
+    ck("create: lstat", sys_lstat(name_of(id), st), 0);
+    ck("create: a regular file", load32(st + STAT_MODE) & 0xF000, 0x8000);
+    ck("create: mode 0600", load32(st + STAT_MODE) & 511, 384);
+    ck("create: of the size asked", load64(st + STAT_SIZE), n);
+    setu_buf_close(id);
+
+    # 3d. Bounded. SETU_BUF_CREATE_TRIES - 1 taken names are skipped and the last name it may try is
+    # used; SETU_BUF_CREATE_TRIES taken names fail it, after one try each and none past them.
+    var base = _setu_buf_counter;
+    ck("create, bounded: occupy all but one", occupy(base, SETU_BUF_CREATE_TRIES - 1), SETU_BUF_CREATE_TRIES - 1);
+    id = setu_buf_create(64);
+    ck("create, bounded: the last name it may try", id, suite_pid * 100000 + base + SETU_BUF_CREATE_TRIES);
+    setu_buf_close(id);
+    vacate(base, SETU_BUF_CREATE_TRIES - 1);
+    base = _setu_buf_counter;
+    ck("create, bounded: occupy every one", occupy(base, SETU_BUF_CREATE_TRIES), SETU_BUF_CREATE_TRIES);
+    ck("create, bounded: every name taken: -1", setu_buf_create(64), 0 - 1);
+    ck("create, bounded: tried each name once", _setu_buf_counter - base, SETU_BUF_CREATE_TRIES);
+    var past = name_of(suite_pid * 100000 + base + SETU_BUF_CREATE_TRIES + 1);
+    ck("create, bounded: made nothing past them", sys_lstat(past, st) < 0, 1);
+    vacate(base, SETU_BUF_CREATE_TRIES);
+    return 0;
+}
+
+# --- 4. Write: something put at a live buffer's name. -----------------------------------------------
+# The client reopens its buffer by name on every present. If the name is removed and something is put
+# there, the write must not go through a symlink, and must not wait for a FIFO's reader.
+fn t_write() {
+    var n = 64;
+    var src = alloc(n);
+    pattern(src, n, 9);
+    var back = alloc(n);
+    var tgt = target_path();
+    var id = setu_buf_create(n);
+    ck("write: a live buffer", id > 0, 1);
+    ck("write: it takes a write", setu_buf_write(id, src, n), 0);
+    var path = name_of(id);
+    var t0 = 0;
+    var r = 0;
+    var el = 0;
+
+    # 4a. A symlink to a file this process can write.
+    sys_unlinkat(AT_FDCWD, path, 0);
+    ck("write, link: a target", plant_file(tgt, 100, 0x5A), 0);
+    ck("write, link: planted at the buffer's name", sys_symlink(tgt, path), 0);
+    t0 = now_us();
+    r = setu_buf_write(id, src, n);
+    el = now_us() - t0;
+    ck("write, symlink: -1", r, 0 - 1);
+    ck_in("write, symlink: at once", el, 0, T_PROMPT_US);
+    ck("write, symlink: nothing written through", file_is(tgt, 100, 0x5A), 0);
+    said("setu_buf_write, a symlink at the buffer's name, -1 after", el);
+    sys_unlinkat(AT_FDCWD, path, 0);
+    sys_unlinkat(AT_FDCWD, tgt, 0);
+
+    # 4b. A directory.
+    ck("write, directory: planted", sys_mkdirat(AT_FDCWD, path, 448), 0);
+    ck("write, directory: -1", setu_buf_write(id, src, n), 0 - 1);
+    sys_unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
+
+    #ifdef CYRIUS_ARCH_X86
+    # 4c. A FIFO with no reader. A plain O_WRONLY open of one waits for a reader, which may never come.
+    ck("write, fifo: planted", mkfifo_at(path), 0);
+    t0 = now_us();
+    r = setu_buf_write(id, src, n);
+    el = now_us() - t0;
+    ck("write, fifo, no reader: -1", r, 0 - 1);
+    ck_in("write, fifo, no reader: at once", el, 0, T_PROMPT_US);
+    said("setu_buf_write, a FIFO with no reader, -1 after", el);
+
+    # 4d. The same FIFO with a reader: the open succeeds, and only the regular-file check refuses it.
+    var ffd = sys_open(path, O_RDWR | O_NONBLOCK, 0);
+    ck("write, fifo: a reader", ffd >= 0, 1);
+    t0 = now_us();
+    r = setu_buf_write(id, src, n);
+    el = now_us() - t0;
+    ck("write, fifo with a reader: -1", r, 0 - 1);
+    ck_in("write, fifo with a reader: at once", el, 0, T_PROMPT_US);
+    ck("write, fifo with a reader: nothing written into it", sys_read(ffd, back, n), 0 - EAGAIN);
+    said("setu_buf_write, a FIFO with a reader, -1 after", el);
+    sys_close(ffd);
+    sys_unlinkat(AT_FDCWD, path, 0);
+    #endif
+    #ifndef CYRIUS_ARCH_X86
+    skip("write, fifo (mknodat is issued by its x86_64 number)");
+    #endif
+
+    # 4e. A regular file at the name again: it takes the write, and reads back.
+    ck("write, regular: a file again", plant_file(path, n, 0), 0);
+    ck("write, regular: written", setu_buf_write(id, src, n), 0);
+    ck("write, regular: read", setu_buf_read(id, back, n), 0);
+    ck("write, regular: every byte", differs(back, src, n), 0);
+    setu_buf_close(id);
+    return 0;
+}
+#endif
+
+fn main(): i64 {
+    alloc_init();
+    #ifdef CYRIUS_TARGET_AGNOS
+    # agnos buffers are kernel shm slots addressed by id (shm_* #71-#74, #86): there is no name to
+    # plant anything at. The agnos arms of buf.cyr are unchanged and are built here, not run.
+    var sk = "buf_safety_test: SKIP (agnos buffers are kernel slots; there is no path)\n";
+    sys_write(1, sk, strlen(sk));
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    suite_pid = sys_getpid();
+    watchdog_arm(30000);
+    t_read();
+    t_lease();
+    t_create();
+    t_write();
+    cleanup_planted();
+    watchdog_disarm();
+
+    if (fails != 0) { sys_write(1, "buf_safety_test: FAILED\n", 24); return 1; }
+    var ok = "buf_safety_test: PASS (a FIFO, a symlink, a directory, a leased file and a short file\n";
+    sys_write(1, ok, strlen(ok));
+    var ok2 = "  at a buffer's name are refused at once, dst untouched; a regular file reads exactly;\n";
+    sys_write(1, ok2, strlen(ok2));
+    var ok3 = "  the create skips a planted link or stale file without opening it, bounded; the write\n";
+    sys_write(1, ok3, strlen(ok3));
+    var ok4 = "  goes through no link and waits on no FIFO)\n";
+    sys_write(1, ok4, strlen(ok4));
+    return 0;
+    #endif
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

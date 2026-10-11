@@ -227,6 +227,22 @@ fn setu_msg_begin(kind): i64 {
     return m;
 }
 
+# Internal (0.8.13): what setu_msg_begin makes, written into storage the caller already owns (at least
+# SETU_MSG_SIZE bytes) — kind, the table's argc, every arg slot 0. Returns `m`. With the `_into`
+# helpers below it lets setu_client_present build its per-frame ATTACH and COMMIT in its own stack
+# frame: the constructors each allocate a fresh SetuMsg, which is their contract, and a present that
+# called them leaked 160 B a frame.
+fn setu__msg_init(m, kind): i64 {
+    setu_msg_set_kind(m, kind);
+    setu_msg_set_argc(m, setu_kind_argc(kind));
+    var i = 0;
+    while (i < SETU_MAX_ARGS) {
+        store64(m + SETU_MSG_ARGS + i * 8, 0);
+        i = i + 1;
+    }
+    return m;
+}
+
 fn setu_hello(version, role): i64 {
     var m = setu_msg_begin(SETU_HELLO);
     if (m == 0) { return 0; }
@@ -276,14 +292,10 @@ fn setu_attach(id, w, h, stride, fmt): i64 {
     return m;
 }
 
-# ATTACH referencing a SHARED BUFFER by id (arg5 > 0) — the pixels live in the
-# shared buffer (see buf.cyr), NOT streamed inline after this frame. This is THE
-# present path on both targets: a surface is hundreds of KB and setu sends at most
-# 64 B per record, so only the id rides the wire. buf_id 0 would mean inline, so a
-# real shared buffer is always > 0.
-fn setu_attach_buf(id, w, h, stride, fmt, buf_id): i64 {
-    var m = setu_msg_begin(SETU_ATTACH);
-    if (m == 0) { return 0; }
+# setu_attach_buf's message, written into caller-owned `m` (SETU_MSG_SIZE bytes). Returns `m`.
+# Internal (0.8.13) — the one definition of this message's arg order, which setu_attach_buf shares.
+fn setu__attach_buf_into(m, id, w, h, stride, fmt, buf_id): i64 {
+    setu__msg_init(m, SETU_ATTACH);
     setu_msg_set_arg(m, 0, id);
     setu_msg_set_arg(m, 1, w);
     setu_msg_set_arg(m, 2, h);
@@ -293,11 +305,28 @@ fn setu_attach_buf(id, w, h, stride, fmt, buf_id): i64 {
     return m;
 }
 
-fn setu_commit(id): i64 {
-    var m = setu_msg_begin(SETU_COMMIT);
+# ATTACH referencing a SHARED BUFFER by id (arg5 > 0) — the pixels live in the
+# shared buffer (see buf.cyr), NOT streamed inline after this frame. This is THE
+# present path on both targets: a surface is hundreds of KB and setu sends at most
+# 64 B per record, so only the id rides the wire. buf_id 0 would mean inline, so a
+# real shared buffer is always > 0.
+fn setu_attach_buf(id, w, h, stride, fmt, buf_id): i64 {
+    var m = setu_msg_new();
     if (m == 0) { return 0; }
+    return setu__attach_buf_into(m, id, w, h, stride, fmt, buf_id);
+}
+
+# setu_commit's message, written into caller-owned `m` (SETU_MSG_SIZE bytes). Returns `m`. Internal.
+fn setu__commit_into(m, id): i64 {
+    setu__msg_init(m, SETU_COMMIT);
     setu_msg_set_arg(m, 0, id);
     return m;
+}
+
+fn setu_commit(id): i64 {
+    var m = setu_msg_new();
+    if (m == 0) { return 0; }
+    return setu__commit_into(m, id);
 }
 
 fn setu_close(id): i64 {

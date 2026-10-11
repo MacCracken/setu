@@ -6,6 +6,209 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.13] - 2026-10-10
+
+### Fixed — on Linux a compositor opened whatever name a client's buffer id gave it, and could be held there
+
+A client chooses its buffer id and sends it in `ATTACH` (arg5), and on Linux `setu_buf_read` opened
+`/dev/shm/setu-buf-<id>` with a plain `O_RDONLY`. /dev/shm is world-writable, so any local process can
+put something at that name, and the caller is a compositor's frame loop:
+
+- a FIFO held the open until a writer came, which could be never;
+- a file whose owner held a write lease (`F_SETLEASE`) held it for lease-break-time, 45 s by default
+  (measured: 45,001,102 µs, then the read went ahead);
+- a symlink was followed to whatever it named.
+
+aethersafha 0.17.6 works around it with its own reader, `win_client_buf_read`, on its frame loop's
+paths. Its probe handshake (`setu_srv_commit_from_create`) still calls `setu_buf_read`.
+
+- **`setu_buf_read` opens with `O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC`**, then `fstat`s the
+  descriptor it opened and refuses anything that is not a regular file of at least `size` bytes.
+  `O_NONBLOCK` makes the open return at once: a FIFO opens (and the check refuses it), and a leased
+  file fails `EWOULDBLOCK`. `O_NOFOLLOW` refuses a symlink (`ELOOP`). The check is on the descriptor,
+  not the path, so a rename between a check and the open cannot slip a FIFO in.
+- **A regular file reads exactly as before.** `O_NONBLOCK` does not affect `read(2)` on a regular file:
+  the page cache answers it, and it never waits for a writer. Only a regular file reaches the read loop.
+- ⚠ **A file shorter than `size` is now refused before a byte is copied.** It was refused before too,
+  with -1 at EOF, but only after the short file had been copied over the front of `dst`, so a compositor
+  reading into its window cache kept a torn frame. `dst` is now left as it was. A file that shrinks
+  while it is being read still fails at EOF, after a partial copy.
+- Return codes are unchanged: 0, or -1 for every refusal.
+
+### Fixed — a client followed a symlink planted at its next buffer name and truncated what it named
+
+`setu_buf_create` made a predictable name (`pid * 100000 + counter`) with `O_WRONLY | O_CREAT | O_TRUNC`,
+without `O_EXCL` or `O_NOFOLLOW`. A symlink planted there was followed: its target was truncated and
+pre-sized, and the client's first present wrote pixels into it. That reached any file the client can
+write. `setu_buf_write` reopened the name with a plain `O_WRONLY` on every present.
+
+- **`setu_buf_create` creates with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC`**, mode 0600
+  as before. `O_EXCL` fails `EEXIST` on anything already at the name: a file, a directory, a FIFO, or a
+  symlink, dangling or not (under `O_EXCL` the kernel never follows a final symlink). On `EEXIST` it takes
+  the next counter value, for at most `SETU_BUF_CREATE_TRIES` (16) names, and then returns -1. A stale
+  file left by a crashed process that had our pid is skipped without being opened. Any other open error
+  fails at once, as before.
+- **`setu_buf_write` opens with `O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC`** and refuses anything
+  that is not a regular file. The name is the client's own, but the client reopens it on every present
+  for as long as it runs. If the name is removed and something else is put there, a symlink is refused
+  (`ELOOP`), and a FIFO cannot hold the client in open: with no reader the open fails `ENXIO`, and with
+  one the regular-file check refuses it. `O_NONBLOCK` does not affect `write(2)` on a regular file.
+- Signatures and return codes are unchanged. `setu_buf_close` is unchanged: `unlink` never follows a
+  symlink.
+- **agnos is unchanged.** Its buffers are kernel shm slots addressed by id (`#86`, `#71` to `#74`),
+  with no name to plant anything at. The four agnos arms of `buf.cyr` are the same source as in 0.8.12.
+
+⚠ The flags are the stdlib's `O_*` names, never numbers: `O_NOFOLLOW` is 0x20000 on x86_64 and 0x8000 on
+arm64. cyrius 6.6.4 added the names after a hardcoded x86 value reached arm64 as `O_LARGEFILE`. Building
+setu therefore needs cyrius 6.6.4 or later. setu pins 6.6.6, and every consumer pins 6.6.6 or later.
+
+RUN-tested in the new `programs/buf_safety_test.cyr`, which plants each case at a buffer name and
+times the call. Each of these is -1 at once, measured at 3 to 24 µs here: `setu_buf_read` on a FIFO with
+no writer, on a FIFO holding exactly the bytes asked for (none of them consumed), on a symlink to a real
+buffer (the buffer itself still reads), and on a write-leased file; `setu_buf_write` on the leased file,
+on a symlink, and on a FIFO with and without a reader. Once the lease is released the file reads.
+`setu_buf_read` on a dangling symlink, a directory, a file shorter than asked and an empty name is -1
+as well. Every refused read leaves `dst` as it was, including a read of exactly one byte more than the
+file holds (the size gate's boundary), and the short file still reads at its own size. A
+256 KiB buffer, and a plain file setu did not make, read back byte for byte.
+`setu_buf_create` skips a symlink at the next name to a file in /tmp, leaving the target and the link
+untouched. It skips a stale file without truncating it. It makes a 0600 regular file of the size
+asked. With 15 names taken it uses the 16th, and with 16 taken it fails after exactly 16 tries and makes
+nothing past them. `setu_buf_write` refuses a symlink (writing nothing through it), a directory, and a
+FIFO with no reader or with one (writing nothing into it).
+
+⛔ A regression here is a hang, not a wrong answer, so the suite arms a watchdog like
+`read_deadline_test`'s: a child that removes what the suite planted and SIGKILLs it after 30 s, which is
+inside the 45 s a lease would hold a blocking open. FIFOs come from `mknodat`, which the pinned stdlib
+does not wrap. The suite issues it by its x86_64 number and SKIPs the FIFO checks on other arches.
+The leased file is leased by the suite itself, because only a file's owner may lease it, and the suite
+ignores the SIGIO that a lease break sends.
+
+**Negative controls: 13 mutants, each killed.** Without `O_NONBLOCK` on the read or on the write, the
+FIFO open hangs and the watchdog fails the suite at 30 s. With `O_NONBLOCK` dropped from the read and
+only the lease group run, the read waits 45,001,102 µs and then reads. The 0.8.12 read (plain
+`O_RDONLY`, no check) also hangs. Without `O_NOFOLLOW` the read returns the linked buffer's bytes, and
+the write writes through the link. With no check on the descriptor, the read consumes the FIFO's bytes
+and copies a short file over `dst`. Without the regular-file test the write puts its bytes into the
+FIFO. Without the size test a short file is copied over `dst`. A create without `O_EXCL` returns -1 on
+the symlink (`ELOOP`), and opens the stale file and resizes it. The 0.8.12 create flags truncate the
+symlink's target and resize it. A create that does not skip on `EEXIST` fails on the first taken name.
+An unbounded create makes a 17th name, and `unix_transport_test` fails too.
+
+### Fixed — setu allocated on every message, poll and present, and never freed it
+
+cyrius's `alloc` is a bump allocator with no `free()`, so an allocation per call is a leak per call.
+These calls allocated each time they ran:
+
+| Call | 0.8.12, per call | 0.8.13 | Who runs it, and how often |
+|---|---|---|---|
+| `setu_send` | 128 B | 0 | every message: a compositor's key, pointer, scroll and focus forwards; every present |
+| `setu_recv` | 256 B | 0 | every frame read through it |
+| `setu_poll_input` | 256 B | 0 | every poll, **including the common one that finds nothing**: once a frame per client |
+| `setu_read_msg_ms` (and `setu_read_msg`, `setu_client_recv`) | 128 B | 0 | every frame read, and every read that times out |
+| `setu_client_present`, at a held buffer | 416 B | 0 | every frame a client presents: two constructors (80 B each) and two sends |
+
+A client presenting at 60 Hz grew by about 90 MB an hour, and a compositor grew by 256 B for every
+client on every frame it polled them.
+
+- **Each buffer is now function-local.** `var frame[128]` is 128 bytes of the call's own stack frame,
+  so it is reentrant and per-thread and is gone at return. Measured on cyrius 6.6.6, a 128-byte local in
+  a recursive fn gets distinct storage at each level and keeps its value across the inner calls, and the
+  heap does not move. The compiler warns when a local array is over the per-fn frame budget ("gets
+  STATIC storage: one buffer shared by all calls and all threads"). No setu build prints that warning.
+- **`setu_client_present` builds its ATTACH and then its COMMIT in one function-local `SetuMsg`**,
+  through two internal helpers, `setu__attach_buf_into` and `setu__commit_into`, over `setu__msg_init`.
+  `setu_attach_buf` and `setu_commit` now call the same helpers, so each message's arg order still has
+  one definition. The bytes on the wire are unchanged.
+- Signatures, return values and behaviour are unchanged on both targets.
+- ⚠ **On agnos the channel calls now get a stack buffer, where they used to get heap memory.** The
+  kernel accepts any mapped user range: `chan_queue` and `chan_deliver` check `is_user_range(ubuf, len)`
+  and then copy byte by byte. The ring-3 stack is a mapped 2 MB page at 0x3FC00000, inside that window,
+  and agnos's own ring-3 validator (`/bin/sysi`) passes a stack scratch buffer to `uname` #34. This is
+  built for `--agnos` here but not run, because CI has no agnos host.
+
+What still allocates, and why it stays:
+
+| Site | When | Why |
+|---|---|---|
+| `setu_msg_new` and every message constructor (`setu_hello` … `setu_input_focus`) | each call, 80 B | Each returns a fresh message by contract, and a caller may hold several at once. A caller that builds a message per event can fill function-local storage with the public setters instead (below). |
+| `setu_err_new` | each call, 16 B | Same contract. No setu path calls it; the codec returns negated codes. |
+| `setu_connect` / `setu_listen` (Linux `sockaddr_un`, 128 B); `setu_chan_floor_ok` (agnos caps block) | once per connect or listen | one-time |
+| `setu_client_connect` (the `SetuClient`, 56 B) | once per connection | it is the handle |
+| `setu_client_poll_input` (reassembly buffer, 512 B) | its first poll | one-time, kept in the handle |
+| `setu__client_create_surface` (`CREATE_SURFACE` and the reply, 160 B) | the first present, and each retried handshake | one-time; a retry also waits on a read |
+
+RUN-tested in the new `programs/zero_alloc_test.cyr`, whose oracle is the allocator's own count,
+`alloc_used()`, read before and after 10,000 calls of each function over a real AF_UNIX /
+`SOCK_SEQPACKET` connection. Every call does its real work, and the loop counts that it did. The same
+suite, built against the 0.8.12 sources, gives the "before" column:
+
+| 10,000 calls of | 0.8.12 | 0.8.13 |
+|---|---|---|
+| `setu_send` (an `INPUT_KEY`, then drained) | 1,280,000 B | 0 B |
+| `setu_recv` (a `COMMIT` queued) | 2,560,000 B | 0 B |
+| `setu_read_msg_ms` (a `COMMIT` queued, bound 1000 ms) | 1,280,000 B | 0 B |
+| `setu_read_msg_ms` (nothing queued, bound 0) | 1,280,000 B | 0 B |
+| `setu_read_msg` (a `COMMIT` queued) | 1,280,000 B | 0 B |
+| `setu_poll_input` (idle) | 2,560,000 B | 0 B |
+| `setu_poll_input` (a `COMMIT` queued) | 2,560,000 B | 0 B |
+| `setu_client_poll_input` (idle; with an `INPUT_KEY` queued) | 0 B; 0 B | 0 B; 0 B |
+| `setu_client_present` (8x8, held buffer: `ATTACH` + `COMMIT` on the wire) | 4,160,000 B | 0 B |
+| `setu_buf_write` + `setu_buf_read` (256 B) | 0 B | 0 B |
+
+aethersafha's own `setu_clients` suite counts the same thing from the compositor's side. 200 served
+records allocate 51,200 B against 0.8.12 ("setu's 256 B per record") and 0 B against 0.8.13.
+
+**Negative controls: 5 mutants, each killed.** Restoring 0.8.12's `alloc` in `setu_send`,
+`setu_recv`, `setu_poll_input` or `setu_read_msg_ms` fails the matching rows, at exactly 128, 256, 256
+and 128 B a call; the first also fails the present row at 256 B. Restoring the two constructors in
+`setu_client_present` fails it at 160 B a present.
+
+### Changed — `unix_transport_test`'s present steps no longer rely on the create following a symlink
+
+Steps 1 and 5 make a buffer impossible to create. They used to put one directory at the next name, and
+the create now skips it, so they occupy all 16 names it may try. Step 7 needs a replacement buffer
+whose write fails. It used to put a symlink to `/dev/full` at the next name and rely on the create
+following it, which is the defect fixed above. Its pixels are now a `PROT_NONE` page, so the create
+succeeds and `write(2)` fails `EFAULT`. Each step checks what it checked before.
+
+### Consumers
+
+Every call of a changed function in aethersafha, crab, dhancha and puka was read. Each consumer was
+built in a scratch copy through a live absolute `path` dep, first against 0.8.12 and then against
+0.8.13, on its own pinned toolchain, for Linux and `--agnos`. Their repos were not touched.
+
+| Consumer | Calls | Built, tested | Verdict |
+|---|---|---|---|
+| aethersafha (cyrius 6.6.11) | `setu_buf_read` on agnos (`window.cyr:288`) and in the probe handshake (`setu_dispatch.cyr:122`); its Linux reader `win_client_buf_read` builds the path with `setu_buf_path`. `setu_send` for every forward (`main.cyr:364-380`, `setu_dispatch.cyr:802-825`, `window.cyr:262`, `compositor.cyr:503/544`, `setu_clients.cyr:393`). `setu_poll_input` (`setu_dispatch.cyr:503/754`), `setu_recv` and `setu_read_msg` (`setu_server.cyr:37/55`). Tests use `setu_buf_create` / `write` / `close` and `setu_read_msg_ms`. | `src/main.cyr` for Linux (4,288,568 B, sha256 `7b299baea60c`; 0.8.12 same size, `1537c997d1e2`) and agnos (4,238,264 B, `0c9badd556f9`; 0.8.12 4,238,248 B, `2bf60950bf40`). 22 of 26 builds succeed at both versions (`src/main.cyr` and 12 programs, each for both targets); the same 4 fail at 0.8.12, for reasons outside setu. `cyrius test`: 33 of 33 files pass on both. | Compatible, no change needed. Its serve path drops from 256 B a record to 0, and the probe path's `setu_buf_read` can no longer be held. |
+| crab (6.6.6) | `setu_buf_create` once and on resize (`main.cyr:181/512`), `setu_buf_write` every frame (`:316`, `:2331` …), `setu_buf_close` (`:522`), `setu_send` / `setu_read_msg` for the handshake and re-attach (`:317-327`, `:2341-2345`). | `CYRIUS_DCE=1` Linux 612,184 B (`eb64f6b7bc35`; 0.8.12 608,088 B, `c7a8d1cd077a`), agnos 878,392 B (`86d17f6c3e5d`; same size at 0.8.12, `543e7f80123c`). `cyrius test` 2,543 of 2,543 checks and `render_test` 55 of 55 on both. | Compatible. Each frame's write now makes one more syscall (the `fstat`). crab builds setu from a live `path = "../setu"`, so it picks this up at its next local build. |
+| dhancha (6.6.6) | forwarders `dh_setu_send` / `recv` / `read_msg` (`src/setu_client.cyr:33-36`), `setu_send` and `setu_recv` (`:44-58`), `setu_client_present` (`:83/94`, `dh_client.cyr:29`), `setu_client_poll_input` (`setu_input.cyr:120`); `programs/setu_widget_client.cyr` uses `setu_buf_create` / `write`, `setu_send`, `setu_read_msg` and `setu_poll_input`. | All 28 programs on both targets, at both versions (e.g. `setu_widget_client` 761,032 B, `f62baaddc61b`; 0.8.12 756,920 B, `1def15049836`). The 20 RUN suites give identical results; `poll_test` exits 3 on both, the three checks the 0.8.11 entry recorded. `distlib` leaves `dist/dhancha.cyr` unchanged. | Compatible, no change needed. |
+| puka (6.6.6) | `setu_client_present` (`window_setu.cyr:124`), `setu_client_poll_input` (`:206`); its tests call `setu_send`. | `CYRIUS_DCE=1` Linux 1,505,552 B (`4371054e0daa`; same size at 0.8.12, `ca2bfdbf53f2`), agnos 1,946,424 B (`b9e35a7d6b5a`; 0.8.12 1,946,408 B), `src/test.cyr --agnos`. `cyrius test` 16 of 16 files on both. | Compatible. Its per-frame present drops from 416 B to 0. |
+
+No consumer predicts setu's buffer ids, re-creates a name it expects to truncate, or reaches a buffer
+through a link. aethersafha's tests plant their FIFO and symlink at `pid * 100000 + 99001`, far from the
+ids `setu_buf_create` makes.
+
+### Found while doing it
+
+- ⚠ **aethersafha's input forwards still allocate 80 B an event**, in the constructor
+  (`setu_send(cfd, setu_input_key(…))`); `setu_send`'s own 128 B is gone. A forward can allocate nothing
+  by building the message in a function-local `var m[80]` with the public setters
+  (`setu_msg_set_kind`, `setu_msg_set_argc(m, setu_kind_argc(kind))`, `setu_msg_set_arg`).
+- ⚠ **A client chooses its own id, so it can name another client's buffer.** The ids are predictable,
+  and a compositor that can open the file (the files are 0600, so it runs as that client's user, as on a
+  normal desktop) would show those pixels in the asker's window. Not changed here: tying a buffer to its
+  connection needs the peer's credentials (`SO_PEERCRED`), which only the compositor has.
+  `setu_buf_read` takes an id, not a connection.
+- `O_CLOEXEC` on the /dev/shm opens has no test. Each descriptor is closed before its call returns, so
+  only a concurrent exec could observe the flag.
+
+Every program builds for Linux and `--agnos`. Lint reports 0 warnings, and the three "raw sys_open w/
+literal flags" notes on `buf.cyr` are gone. fmt, vet and the no-TCP gate are clean, all seven RUN
+suites pass, and `cyrius distlib --check` reports `dist/` current. `dist/setu.deps` is unchanged: the
+same 12 leaves. The DCE smoke binary goes from 16,336 B (sha256 `8cba229012d0`) to 16,344 B
+(`56d7e4e78d30`).
+
 ## [0.8.12] - 2026-10-10
 
 ### Fixed — on Linux a read had no deadline, so a peer that never sent held its reader forever

@@ -1,6 +1,6 @@
 # setu
 
-Version: 0.8.12
+Version: 0.8.13
 
 **setu** (सेतु — Sanskrit/Hindi: *bridge*) is the pure-Cyrius **native
 display-protocol** for AGNOS — the wire between GUI clients and the
@@ -163,6 +163,34 @@ but the kernel checks a channel end's owner on every operation, so an inherited
 end is inert. A client holds its end only because the compositor endowed it
 (`AGNOS_CHAN`).
 
+## The shared buffer's name on Linux
+
+On Linux a buffer is the file `/dev/shm/setu-buf-<id>`. The directory is
+world-writable, ids are predictable, and the compositor opens whichever id a
+client's `ATTACH` names, so setu treats whatever sits at a name as untrusted
+(since **0.8.13**):
+
+| Call | Opens with | Then |
+|---|---|---|
+| `setu_buf_create` | `O_CREAT \| O_EXCL \| O_NOFOLLOW \| O_CLOEXEC`, mode 0600 | A name that already exists (a file, a FIFO, a symlink) is skipped, never opened, and the next id is tried, up to `SETU_BUF_CREATE_TRIES` (16). |
+| `setu_buf_write` | `O_NONBLOCK \| O_NOFOLLOW \| O_CLOEXEC` | Anything but a regular file is refused. |
+| `setu_buf_read` | `O_NONBLOCK \| O_NOFOLLOW \| O_CLOEXEC` | Anything but a regular file of at least `size` bytes is refused, before a byte is copied. |
+
+Each refusal is -1 and returns at once. A FIFO cannot hold the open, a leased
+file fails instead of waiting out the kernel's lease-break-time (45 s by
+default), and a symlink is never followed. A regular file reads and writes as
+it always did. On agnos a buffer is a kernel shm slot addressed by id, with no
+name to plant anything at.
+
+**No allocation per call.** cyrius's `alloc` never frees, so setu's per-message
+and per-frame calls use function-local buffers: `setu_send`, `setu_recv`,
+`setu_read_msg` / `setu_read_msg_ms`, `setu_poll_input`,
+`setu_client_poll_input` and a `setu_client_present` that reuses its buffer
+allocate nothing (measured over 10,000 calls each). What still allocates does
+so once, at connect, listen, the first poll or the first present, or by
+contract: each message constructor (`setu_input_key` …) returns a fresh
+80-byte message.
+
 ## Scope
 
 - **Current.** A buildable, RUN-tested pure-Cyrius contract plus the
@@ -195,8 +223,12 @@ end is inert. A client holds its end only because the compositor endowed it
   - `programs/client_test.cyr` (`sockaddr_un`, input reassembly, buffer
     lifecycle), `programs/unix_transport_test.cyr` (a real AF_UNIX /
     `SOCK_SEQPACKET` round-trip whose record boundaries must survive, and
-    close-on-exec on every socket) and `programs/read_deadline_test.cyr` (the
-    read deadlines, measured against real peers) — further RUN tests.
+    close-on-exec on every socket), `programs/read_deadline_test.cyr` (the
+    read deadlines, measured against real peers),
+    `programs/buf_safety_test.cyr` (a FIFO, a symlink, a leased file and a
+    stale file at a buffer's name) and `programs/zero_alloc_test.cyr` (the
+    allocator's own count over 10,000 calls of each per-frame function) —
+    further RUN tests.
     `programs/reach_test.cyr` makes every transport
     entry point reachable, so an undefined symbol is a build error on
     either target rather than a warning DCE hides.

@@ -42,8 +42,9 @@
 #   So no write loops on either target, and a frame over 64 B is refused on both.
 #   A read that waits takes a deadline in ms on both targets (`setu_read_blk_ms`). The default is 8 s
 #   on agnos and none on Linux; SETU_READ_DEFAULT_MS says why they differ.
-#   Every socket setu opens on Linux is close-on-exec (buf.cyr's /dev/shm files are open only inside one
-#   call). agnos has no such flag and needs none: a channel end a child inherits is inert there.
+#   Every socket setu opens on Linux is close-on-exec, and since 0.8.13 so is every buf.cyr /dev/shm
+#   file (each is open only inside one call, but a threaded consumer can exec meanwhile). agnos has no
+#   such flag and needs none: a channel end a child inherits is inert there.
 #
 # Model: connect once → create surface once → per present, pixels into the shared buffer
 # (buf.cyr), then ATTACH (by buf_id) + COMMIT on the wire.
@@ -343,12 +344,17 @@ fn setu_write_all(fd, buf, n): i64 {
 
 # Encode `msg` and write the whole frame to `fd`. Returns bytes written (> 0), a
 # negated SetuErr on encode failure, or -7 on a write error. Widest frame ≤ 128 B.
+# Allocates nothing.
 fn setu_send(fd, msg): i64 {
-    var cap = 128;
-    var buf = alloc(cap);
-    var enc = setu_encode(msg, buf, cap);
+    # ⛔ THIS WAS `alloc(128)` PER CALL UNTIL 0.8.13, and the bump allocator never frees. Every message
+    # a compositor forwards (each key, pointer move, button, scroll and focus change) and every frame a
+    # client presents went through here, so the heap grew 128 B a message for the life of the process.
+    # ⭐ A function-local `var frame[128]` is 128 BYTES of this call's own stack frame: reentrant, per
+    # thread, and gone at return. The same holds for the read buffers below.
+    var frame[128];
+    var enc = setu_encode(msg, &frame, 128);
     if (enc < 0) { return enc; }
-    if (setu_write_all(fd, buf, enc) < 0) { return 0 - 7; }
+    if (setu_write_all(fd, &frame, enc) < 0) { return 0 - 7; }
     return enc;
 }
 
@@ -512,12 +518,12 @@ fn setu_read_blk(fd, buf, cap): i64 {
 # Read ONE setu frame (one record) from `fd` into `msg_out`. Returns the decoded
 # length (> 0), -6 on EOF / error / timeout, or a negated SetuErr. Now that both
 # transports are record transports this is the same read as setu_read_msg.
+# Allocates nothing (until 0.8.13, 256 B a call; see setu_send).
 fn setu_recv(fd, msg_out): i64 {
-    var cap = 256;
-    var buf = alloc(cap);
-    var n = setu_read_blk(fd, buf, cap);
+    var rec[256];
+    var n = setu_read_blk(fd, &rec, 256);
     if (n <= 0) { return 0 - 6; }
-    return setu_decode(buf, n, msg_out);
+    return setu_decode(&rec, n, msg_out);
 }
 
 # Poll for ONE inbound frame (the S->C input channel). Returns 1 and fills `msg_out`
@@ -526,16 +532,18 @@ fn setu_recv(fd, msg_out): i64 {
 # nothing yet); Linux asks per call with MSG_DONTWAIT (EAGAIN = nothing yet).
 # ⚠ Decodes only the FIRST frame of each record and drops any rest — harmless from a setu
 # peer, which sends one frame per record. setu_client_poll_input keeps the rest and reassembles.
+# Allocates nothing, idle or not.
 fn setu_poll_input(fd, msg_out): i64 {
-    var cap = 256;
-    var buf = alloc(cap);
+    # ⛔ THIS WAS `alloc(256)` ON EVERY CALL UNTIL 0.8.13 — including the common one, where nothing is
+    # pending — so a client or a compositor that polled once a frame leaked 256 B a frame, forever.
+    var rec[256];
     #ifdef CYRIUS_TARGET_AGNOS
     # ⛔ MISSED BY THE 0.8.0 CUTOVER. This still called `sys_read`, whose comment claimed "agnos:
     # non-blocking (0 = would-block)" — true of the old TCP fd's stdlib wrapper, and MEANINGLESS for a
     # channel fd, which does not route through `sys_read` at all. Every client's per-frame input poll
     # was therefore reading nothing on agnos. The record/stream halves were cut over and the POLL half
     # was not, which is what makes a partial cutover worse than none: the working paths hide it.
-    var r = sys_chan_recv(fd, buf, cap);
+    var r = sys_chan_recv(fd, &rec, 256);
     if (r == 0 - CH_E_WOULDBLOCK) { return 0; }    # nothing this frame — the common case
     # ⛔ SAY WHICH. Collapsing every negative into -6 hid the actual cause for several cycles: the
     # caller could not tell "peer gone" from "bad fd" from "record did not fit", which are three
@@ -547,11 +555,11 @@ fn setu_poll_input(fd, msg_out): i64 {
     # for room; every read asks per call instead (`setu_read_blk_ms` then waits in poll(2)).
     # ⛔ `sys_read` here was a real bug in the old arm too: it BLOCKS on a blocking fd, so a poll that
     # promised "never stalls" stalled the whole frame loop whenever no input was pending.
-    var r = sys_recvfrom(fd, buf, cap, SETU_MSG_DONTWAIT, 0, 0);
+    var r = sys_recvfrom(fd, &rec, 256, SETU_MSG_DONTWAIT, 0, 0);
     if (r < 0)  { return 0; }              # EAGAIN — nothing this frame (the common case)
     if (r == 0) { return 0 - 6; }          # EOF — peer gone
     #endif
-    if (setu_decode(buf, r, msg_out) < 0) { return 0; }   # partial/garbled → skip
+    if (setu_decode(&rec, r, msg_out) < 0) { return 0; }   # partial/garbled → skip
     return 1;
 }
 
@@ -590,10 +598,11 @@ fn setu_read_msg_ms(fd, msg_out, timeout_ms): i64 {
     # so the record shape and the blocking shape compose rather than conflict.
     # ⚠ The same applies to a caller's own bound: `timeout_ms` 0 is that non-retrying read. A handshake
     # read needs a bound long enough for the peer to be scheduled and answer.
-    var buf = alloc(128);
-    var r = setu_read_blk_ms(fd, buf, 128, timeout_ms);
+    # ⭐ No allocation (0.8.13; it was `alloc(128)` a call — every frame a compositor reads came here).
+    var rec[128];
+    var r = setu_read_blk_ms(fd, &rec, 128, timeout_ms);
     if (r <= 0) { return 0 - 6; }
-    return setu_decode(buf, r, msg_out);
+    return setu_decode(&rec, r, msg_out);
 }
 
 # Read ONE full setu frame with the target's default wait (SETU_READ_DEFAULT_MS: 8 s on agnos, no
@@ -693,7 +702,13 @@ fn setu__client_create_surface(c, fd, w, h): i64 {
 # both NOTHING was sent, so presenting again is a clean retry, and a resize keeps the old buffer),
 # -41 create send, -6 recv, -8 unexpected reply, -42 attach send, -44 commit send.
 # -43 was the retired inline pixel write.
+# A present that reuses the held buffer allocates nothing; making a buffer or a surface is one-time.
 fn setu_client_present(c, pix, w, h): i64 {
+    # ⛔ EVERY PRESENT USED TO ALLOCATE 416 B, NEVER FREED (until 0.8.13): ATTACH and COMMIT were built
+    # with setu_attach_buf / setu_commit (80 B each — a fresh SetuMsg is those constructors' contract),
+    # and each went through setu_send's 128 B frame. A client presenting at 60 Hz grew ~90 MB an hour.
+    # Both messages are now built, one after the other, in this frame's own `msg`.
+    var msg[80];                                   # one SetuMsg (SETU_MSG_SIZE)
     var fd = setu_client_fd(c);
     var stride = w * 4;
     var nbytes = h * stride;
@@ -746,7 +761,7 @@ fn setu_client_present(c, pix, w, h): i64 {
         if (id < 0) { rc = id; }
     }
     if (rc == 0) {
-        if (setu_send(fd, setu_attach_buf(id, w, h, stride, 1, buf_id)) < 0) { rc = 0 - 42; }
+        if (setu_send(fd, setu__attach_buf_into(&msg, id, w, h, stride, 1, buf_id)) < 0) { rc = 0 - 42; }
     }
     if (rc < 0) {
         if (buf_id != held) { setu_buf_close(buf_id); }            # never attached: the held one stands
@@ -757,7 +772,7 @@ fn setu_client_present(c, pix, w, h): i64 {
         store64(c + SETU_C_BUFID, buf_id);
         store64(c + SETU_C_BUFSZ, nbytes);
     }
-    if (setu_send(fd, setu_commit(id)) < 0) { return 0 - 44; }
+    if (setu_send(fd, setu__commit_into(&msg, id)) < 0) { return 0 - 44; }
     return 0;
 }
 

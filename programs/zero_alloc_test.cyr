@@ -1,0 +1,302 @@
+# programs/zero_alloc_test.cyr — setu's per-message and per-frame calls allocate nothing (0.8.13).
+#
+# ⛔ WHY THIS EXISTS. cyrius's `alloc` is a bump allocator with no free(), so an allocation per call is a
+# leak per call. Until 0.8.13 setu_send took 128 B a message, setu_recv 256 a frame, setu_poll_input 256
+# a poll (idle or not), setu_read_msg_ms 128 a read and setu_client_present 416 a frame. A compositor
+# forwarding input and polling its clients, and a client presenting at 60 Hz, grew for as long as they
+# ran. No other suite reads the heap, so none of them could see it.
+#
+# ⭐ THE ORACLE IS THE ALLOCATOR'S OWN COUNT. `alloc_used()` is read before and after 10,000 calls of
+# each function over a real AF_UNIX / SOCK_SEQPACKET connection, so every call does its real work: a
+# record sent, read and decoded, a shared buffer written and read, an ATTACH and a COMMIT put on the
+# wire. Everything a loop needs for itself (the message, the drain buffer) is allocated before the
+# count is first read, and every loop also counts that each call did its work.
+# ⚠ What still allocates, by design, is not measured here: a message constructor (setu_input_key …
+# setu_commit) returns a fresh SetuMsg by contract, and connect, listen, the first present (buffer and
+# surface) and the first setu_client_poll_input (its reassembly buffer) allocate once.
+
+include "src/lib.cyr"
+
+var fails = 0;
+
+fn ck(what, got, want) {
+    if (got != want) {
+        sys_write(1, "zero_alloc_test: FAIL ", 22);
+        sys_write(1, what, strlen(what));
+        sys_write(1, " got=", 5); print_num(got);
+        sys_write(1, " want=", 6); print_num(want);
+        sys_write(1, "\n", 1);
+        fails = fails + 1;
+    }
+    return 0;
+}
+
+# Print one measurement: the bytes `n` calls of `what` allocated.
+fn said(what, n, bytes) {
+    sys_write(1, "  measured: ", 12);
+    sys_write(1, what, strlen(what));
+    sys_write(1, " x", 2); print_num(n);
+    sys_write(1, " = ", 3); print_num(bytes);
+    sys_write(1, " B\n", 3);
+    return 0;
+}
+
+#ifndef CYRIUS_TARGET_AGNOS
+var N = 10000;
+
+# Receive up to `k` records waiting on `fd` into `buf` without waiting. Returns how many came.
+fn drain(fd, buf, k) {
+    var got = 0;
+    while (got < k) {
+        if (sys_recvfrom(fd, buf, 256, SETU_MSG_DONTWAIT, 0, 0) <= 0) { return got; }
+        got = got + 1;
+    }
+    return got;
+}
+
+# One measured loop per function. `cfd` is the client end, `afd` the compositor's.
+fn t_send(cfd, afd, rbuf) {
+    var msg = setu_input_key(7, 26, 1);            # built once: the constructor allocates by contract
+    var ok = 0;
+    var u0 = alloc_used();
+    var i = 0;
+    while (i < N) {
+        if (setu_send(afd, msg) == 40) {
+            if (drain(cfd, rbuf, 1) == 1) { ok = ok + 1; }
+        }
+        i = i + 1;
+    }
+    var used = alloc_used() - u0;
+    ck("setu_send: every message sent and received", ok, N);
+    ck("setu_send: bytes allocated", used, 0);
+    said("setu_send (INPUT_KEY, then drained)", N, used);
+    return 0;
+}
+
+fn t_recv(cfd, afd, frame, flen) {
+    var m = setu_msg_new();
+    var ok = 0;
+    var u0 = alloc_used();
+    var i = 0;
+    while (i < N) {
+        sys_write(cfd, frame, flen);
+        if (setu_recv(afd, m) == flen) {
+            if (setu_msg_kind(m) == SETU_COMMIT) { ok = ok + 1; }
+        }
+        i = i + 1;
+    }
+    var used = alloc_used() - u0;
+    ck("setu_recv: every frame read and decoded", ok, N);
+    ck("setu_recv: bytes allocated", used, 0);
+    said("setu_recv (a COMMIT queued)", N, used);
+    return 0;
+}
+
+fn t_read_msg(cfd, afd, frame, flen) {
+    var m = setu_msg_new();
+    var ok = 0;
+    var u0 = alloc_used();
+    var i = 0;
+    while (i < N) {
+        sys_write(cfd, frame, flen);
+        if (setu_read_msg_ms(afd, m, 1000) == flen) { ok = ok + 1; }
+        i = i + 1;
+    }
+    var used = alloc_used() - u0;
+    ck("setu_read_msg_ms: every frame read", ok, N);
+    ck("setu_read_msg_ms: bytes allocated", used, 0);
+    said("setu_read_msg_ms (a COMMIT queued, bound 1000 ms)", N, used);
+
+    # The read that finds nothing: bound 0, a timeout every time.
+    ok = 0;
+    u0 = alloc_used();
+    i = 0;
+    while (i < N) {
+        if (setu_read_msg_ms(afd, m, 0) == 0 - 6) {
+            if (setu_read_timed_out() == 1) { ok = ok + 1; }
+        }
+        i = i + 1;
+    }
+    used = alloc_used() - u0;
+    ck("setu_read_msg_ms, nothing queued: every read timed out", ok, N);
+    ck("setu_read_msg_ms, nothing queued: bytes allocated", used, 0);
+    said("setu_read_msg_ms (nothing queued, bound 0)", N, used);
+
+    # The default read, which every consumer's handshake uses.
+    ok = 0;
+    u0 = alloc_used();
+    i = 0;
+    while (i < N) {
+        sys_write(cfd, frame, flen);
+        if (setu_read_msg(afd, m) == flen) { ok = ok + 1; }
+        i = i + 1;
+    }
+    used = alloc_used() - u0;
+    ck("setu_read_msg: every frame read", ok, N);
+    ck("setu_read_msg: bytes allocated", used, 0);
+    said("setu_read_msg (a COMMIT queued)", N, used);
+    return 0;
+}
+
+fn t_poll(cfd, afd, frame, flen) {
+    var m = setu_msg_new();
+    var ok = 0;
+    var u0 = alloc_used();
+    var i = 0;
+    while (i < N) {
+        if (setu_poll_input(afd, m) == 0) { ok = ok + 1; }
+        i = i + 1;
+    }
+    var used = alloc_used() - u0;
+    ck("setu_poll_input, idle: every poll found nothing", ok, N);
+    ck("setu_poll_input, idle: bytes allocated", used, 0);
+    said("setu_poll_input (idle)", N, used);
+
+    ok = 0;
+    u0 = alloc_used();
+    i = 0;
+    while (i < N) {
+        sys_write(cfd, frame, flen);
+        if (setu_poll_input(afd, m) == 1) { ok = ok + 1; }
+        i = i + 1;
+    }
+    used = alloc_used() - u0;
+    ck("setu_poll_input, a record: every poll took it", ok, N);
+    ck("setu_poll_input, a record: bytes allocated", used, 0);
+    said("setu_poll_input (a COMMIT queued)", N, used);
+    return 0;
+}
+
+# The client side: setu_client_poll_input and setu_client_present on a SetuClient.
+fn t_client(sfd, path, rbuf) {
+    var c = setu_client_connect(path);
+    ck("client: connect", c != 0, 1);
+    if (c == 0) { return 0; }
+    var pfd = setu_accept(sfd);
+    ck("client: accept", pfd >= 0, 1);
+    if (pfd < 0) { return 0; }
+    var m = setu_msg_new();
+    var key = alloc(64);
+    var klen = setu_encode(setu_input_key(7, 26, 1), key, 64);
+
+    # The first poll makes the reassembly buffer, once. Then: idle, and a record each time.
+    ck("client poll: first", setu_client_poll_input(c, m), 0);
+    var ok = 0;
+    var u0 = alloc_used();
+    var i = 0;
+    while (i < N) {
+        if (setu_client_poll_input(c, m) == 0) { ok = ok + 1; }
+        i = i + 1;
+    }
+    var used = alloc_used() - u0;
+    ck("setu_client_poll_input, idle: every poll found nothing", ok, N);
+    ck("setu_client_poll_input, idle: bytes allocated", used, 0);
+    said("setu_client_poll_input (idle)", N, used);
+    ok = 0;
+    u0 = alloc_used();
+    i = 0;
+    while (i < N) {
+        sys_write(pfd, key, klen);
+        if (setu_client_poll_input(c, m) == 1) { ok = ok + 1; }
+        i = i + 1;
+    }
+    used = alloc_used() - u0;
+    ck("setu_client_poll_input, a record: every poll took it", ok, N);
+    ck("setu_client_poll_input, a record: bytes allocated", used, 0);
+    said("setu_client_poll_input (an INPUT_KEY queued)", N, used);
+
+    # The first present makes the buffer and the surface (one-time). The reply is queued up front:
+    # this is one process. Then presents at the held size: ATTACH + COMMIT on the wire each time.
+    var w = 8;
+    var h = 8;
+    var pix = alloc(w * h * 4);
+    var j = 0;
+    while (j < w * h * 4) { store8(pix + j, j & 255); j = j + 1; }
+    ck("present: queue the reply", setu_send(pfd, setu_surface_created(77)) > 0, 1);
+    ck("present: first", setu_client_present(c, pix, w, h), 0);
+    ck("present: first, three records", drain(pfd, rbuf, 3), 3);
+    ok = 0;
+    u0 = alloc_used();
+    i = 0;
+    while (i < N) {
+        if (setu_client_present(c, pix, w, h) == 0) {
+            if (drain(pfd, rbuf, 2) == 2) { ok = ok + 1; }
+        }
+        i = i + 1;
+    }
+    used = alloc_used() - u0;
+    ck("setu_client_present: every present put ATTACH and COMMIT on the wire", ok, N);
+    ck("setu_client_present: bytes allocated", used, 0);
+    said("setu_client_present (held buffer, 8x8)", N, used);
+    ck("present: the last record is a COMMIT for the surface", setu_decode(rbuf, 24, m), 24);
+    ck("present: its kind", setu_msg_kind(m), SETU_COMMIT);
+    ck("present: its surface", setu_msg_arg(m, 0), 77);
+
+    # The shared buffer itself, as a compositor reads it every frame.
+    var bid = load64(c + SETU_C_BUFID);
+    var dst = alloc(w * h * 4);
+    ok = 0;
+    u0 = alloc_used();
+    i = 0;
+    while (i < N) {
+        if (setu_buf_write(bid, pix, w * h * 4) == 0) {
+            if (setu_buf_read(bid, dst, w * h * 4) == 0) { ok = ok + 1; }
+        }
+        i = i + 1;
+    }
+    used = alloc_used() - u0;
+    ck("setu_buf_write + setu_buf_read: every one", ok, N);
+    ck("setu_buf_write + setu_buf_read: bytes allocated", used, 0);
+    said("setu_buf_write + setu_buf_read (256 B)", N, used);
+
+    setu_client_close(c);
+    sys_close(pfd);
+    return 0;
+}
+#endif
+
+fn main(): i64 {
+    alloc_init();
+    #ifdef CYRIUS_TARGET_AGNOS
+    # The agnos arms take the same function-local buffers, but agnos has no AF_UNIX and CI no agnos host.
+    var sk = "zero_alloc_test: SKIP (agnos has no AF_UNIX; clients are placed)\n";
+    sys_write(1, sk, strlen(sk));
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var path = "/tmp/setu-zero-alloc-test.sock";
+    var sfd = setu_listen(path);
+    if (sfd < 0) { sys_write(1, "zero_alloc_test: FAIL listen\n", 29); return 1; }
+    var cfd = setu_connect(path);
+    var afd = setu_accept(sfd);
+    if (cfd < 0) { sys_write(1, "zero_alloc_test: FAIL connect\n", 30); return 1; }
+    if (afd < 0) { sys_write(1, "zero_alloc_test: FAIL accept\n", 29); return 1; }
+
+    var rbuf = alloc(256);
+    var frame = alloc(64);
+    var flen = setu_encode(setu_commit(9), frame, 64);
+
+    t_send(cfd, afd, rbuf);
+    t_recv(cfd, afd, frame, flen);
+    t_read_msg(cfd, afd, frame, flen);
+    t_poll(cfd, afd, frame, flen);
+    t_client(sfd, path, rbuf);
+
+    sys_close(afd);
+    sys_close(cfd);
+    sys_close(sfd);
+    sys_unlinkat(AT_FDCWD, path, 0);
+
+    if (fails != 0) { sys_write(1, "zero_alloc_test: FAILED\n", 24); return 1; }
+    var ok = "zero_alloc_test: PASS (10,000 calls each of setu_send, setu_recv, setu_read_msg_ms,\n";
+    sys_write(1, ok, strlen(ok));
+    var ok2 = "  setu_read_msg, setu_poll_input, setu_client_poll_input, setu_client_present and the\n";
+    sys_write(1, ok2, strlen(ok2));
+    var ok3 = "  buffer write/read allocate 0 B)\n";
+    sys_write(1, ok3, strlen(ok3));
+    return 0;
+    #endif
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

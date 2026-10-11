@@ -48,6 +48,33 @@ fn next_rec(fd, m) {
     return r;
 }
 
+# Put a directory at each of the SETU_BUF_CREATE_TRIES names setu_buf_create tries after counter value
+# `base`, so that a create has nowhere to go. Returns how many it made.
+# ⚠ One directory used to be enough. Since 0.8.13 the create skips a name that exists, never opening
+# it, and fails only when every name it may try is taken.
+fn occupy_next(base) {
+    var p = alloc(48);
+    var made = 0;
+    var i = 1;
+    while (i <= SETU_BUF_CREATE_TRIES) {
+        setu_buf_path(sys_getpid() * 100000 + base + i, p);
+        if (sys_mkdirat(AT_FDCWD, p, 448) == 0) { made = made + 1; }
+        i = i + 1;
+    }
+    return made;
+}
+
+fn vacate_next(base) {
+    var p = alloc(48);
+    var i = 1;
+    while (i <= SETU_BUF_CREATE_TRIES) {
+        setu_buf_path(sys_getpid() * 100000 + base + i, p);
+        sys_unlinkat(AT_FDCWD, p, AT_REMOVEDIR);
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Read shared buffer `id` into a freshly zeroed copy and count the bytes that differ from `want`:
 # 0 = it holds exactly that frame, -1 = it cannot be read (freed, or never made).
 fn buf_holds(id, want, n) {
@@ -92,16 +119,16 @@ fn present_all_or_nothing(sfd, path) {
     # up front. Step 1 must leave it unread; step 2's handshake consumes it.
     ck("present: queue reply", setu_send(pfd, setu_surface_created(77)) > 0, 1);
 
-    # --- 1. No buffer can be created on the FIRST present. A directory at the path setu_buf_create
-    # picks next makes its open() fail EISDIR.
+    # --- 1. No buffer can be created on the FIRST present: a directory at every name setu_buf_create
+    # may try next.
     # ⚠ This predicts buf.cyr's naming (pid * 100000 + counter). If that changes the create succeeds,
     # present returns 0, and the rc check fails, so it cannot pass vacuously.
-    setu_buf_path(sys_getpid() * 100000 + _setu_buf_counter + 1, p);
-    ck("present: occupy next buffer path", sys_mkdirat(AT_FDCWD, p, 448), 0);
+    var base = _setu_buf_counter;
+    ck("present: occupy every next buffer path", occupy_next(base), SETU_BUF_CREATE_TRIES);
     ck("present: create fails, rc", setu_client_present(c, pix, w, h), 0 - 45);
     ck("present: create fails, wire empty", next_rec(pfd, m), 0 - 1);
     ck("present: create fails, no surface", setu_client_sid(c), 0);
-    sys_unlinkat(AT_FDCWD, p, AT_REMOVEDIR);
+    vacate_next(base);
 
     # --- 2. The next present recovers: CREATE_SURFACE, ATTACH by id, COMMIT.
     ck("present: recovers, rc", setu_client_present(c, pix, w, h), 0);
@@ -143,14 +170,14 @@ fn present_all_or_nothing(sfd, path) {
     var pix2 = alloc(nbytes2);
     i = 0;
     while (i < nbytes2) { store8(pix2 + i, (i * 5 + 1) & 255); i = i + 1; }
-    setu_buf_path(sys_getpid() * 100000 + _setu_buf_counter + 1, p);
-    ck("present: occupy next buffer path again", sys_mkdirat(AT_FDCWD, p, 448), 0);
+    base = _setu_buf_counter;
+    ck("present: occupy every next buffer path again", occupy_next(base), SETU_BUF_CREATE_TRIES);
     ck("present: grow, create fails, rc", setu_client_present(c, pix2, w2, h), 0 - 45);
     ck("present: grow, create fails, wire empty", next_rec(pfd, m), 0 - 1);
     ck("present: grow, create fails, still held", load64(c + SETU_C_BUFID), held);
     ck("present: grow, create fails, size kept", load64(c + SETU_C_BUFSZ), nbytes);
     ck("present: grow, create fails, last frame kept", buf_holds(held, pix, nbytes), 0);
-    sys_unlinkat(AT_FDCWD, p, AT_REMOVEDIR);
+    vacate_next(base);
 
     # --- 6. The grow succeeds: ATTACH names a new buffer at the new size, and the old one is freed.
     ck("present: grow, rc", setu_client_present(c, pix2, w2, h), 0);
@@ -166,18 +193,22 @@ fn present_all_or_nothing(sfd, path) {
     ck("present: grow, new buffer holds the frame", buf_holds(grown, pix2, nbytes2), 0);
     ck("present: grow, old buffer freed", buf_holds(held, pix, nbytes), 0 - 1);
 
-    # --- 7. A grow whose replacement cannot be written. A symlink to /dev/full at the next buffer path
-    # lets the create open it, and the write then gets ENOSPC. The replacement is freed (unlinking the
-    # link) and the held buffer stays exactly as it was.
+    # --- 7. A grow whose replacement cannot be written. Its pixels are a PROT_NONE page, so the create
+    # succeeds and write(2) then fails EFAULT. The replacement is freed and the held buffer stays
+    # exactly as it was.
+    # ⚠ Until 0.8.13 this step put a symlink to /dev/full at the next name and relied on the create
+    # FOLLOWING it, which is the defect 0.8.13 removes; buf_safety_test now asserts the opposite.
     var w3 = 64;
     var nbytes3 = w3 * h * 4;
-    var pix3 = alloc(nbytes3);
-    setu_buf_path(sys_getpid() * 100000 + _setu_buf_counter + 1, p);
-    ck("present: link next buffer path to /dev/full", sys_symlink("/dev/full", p), 0);
-    ck("present: grow, write fails, rc", setu_client_present(c, pix3, w3, h), 0 - 46);
+    var nopix = syscall(SYS_MMAP, 0, nbytes3, 0, MAP_PRIVATE | MAP_ANONYMOUS, 0 - 1, 0);   # PROT_NONE
+    ck("present: map a page nothing may read", nopix > 0, 1);
+    ck("present: grow, write fails, rc", setu_client_present(c, nopix, w3, h), 0 - 46);
+    var repl3 = sys_getpid() * 100000 + _setu_buf_counter;    # the replacement that present made
+    ck("present: grow, write fails, made a replacement", repl3 != grown, 1);
     ck("present: grow, write fails, wire empty", next_rec(pfd, m), 0 - 1);
     ck("present: grow, write fails, still held", load64(c + SETU_C_BUFID), grown);
     ck("present: grow, write fails, last frame kept", buf_holds(grown, pix2, nbytes2), 0);
+    setu_buf_path(repl3, p);
     ck("present: grow, write fails, replacement freed", sys_unlinkat(AT_FDCWD, p, 0), 0 - 2);   # ENOENT
 
     # --- 8. The held buffer still works: a present at its size re-attaches it, and makes nothing new.

@@ -18,8 +18,22 @@
 #   agnos — the kernel shm band: shm_create_gpu #86 (GPU-visible) first, falling back to
 #           shm_create #71 (system RAM — the QEMU path), then shm_write #72 / shm_read #73 /
 #           shm_free #74 on either kind of slot.
+#
+# ⛔ ON LINUX THE NAME IS PUBLIC AND THE DIRECTORY IS NOT OURS (0.8.13). /dev/shm is world-writable,
+# the client's ids are predictable (pid * 100000 + counter), and the compositor opens whatever id an
+# ATTACH names. So any local process can put a FIFO, a symlink or its own file at a name before (or
+# after) setu opens it. Until 0.8.13 every open here was a plain one: a FIFO held the compositor in
+# open(2) (its frame loop) until a writer came, a write lease held it for lease-break-time (45 s by
+# default), and a symlink was followed — on the client side, through O_TRUNC, into any file the client
+# could write. Every Linux open is now O_NOFOLLOW | O_CLOEXEC; the reopens are O_NONBLOCK and accept
+# only a regular file, judged on the descriptor they opened; the create is O_EXCL.
+# ⚠ agnos is untouched: its buffers are kernel slots addressed by id, with no path to plant on.
 
 var _setu_buf_counter = 0;
+
+# How many ids setu_buf_create tries on Linux before it gives up. Each try is the next counter value;
+# a name that already exists costs one try and is never opened.
+var SETU_BUF_CREATE_TRIES = 16;
 
 # Build "/dev/shm/setu-buf-<buf_id>\0" into `out` (caller supplies >= 48 bytes).
 fn setu_buf_path(buf_id, out): i64 {
@@ -32,8 +46,22 @@ fn setu_buf_path(buf_id, out): i64 {
     return 0;
 }
 
+#ifndef CYRIUS_TARGET_AGNOS
+# 1 when `fd` is open on a REGULAR file of at least `min` bytes, else 0 (Linux).
+# ⛔ ON THE DESCRIPTOR, NEVER THE PATH. An lstat of the name before the open proves nothing: a rename
+# can swap a FIFO in between, and the compositor re-reads a live window's buffer every frame.
+fn setu__buf_fd_ok(fd, min): i64 {
+    var st[144];                                   # struct stat (STAT_BUFSZ, both arches)
+    if (sys_fstat(fd, &st) != 0) { return 0; }
+    if ((load32(&st + STAT_MODE) & 0xF000) != 0x8000) { return 0; }   # S_IFMT != S_IFREG
+    if (load64(&st + STAT_SIZE) < min) { return 0; }
+    return 1;
+}
+#endif
+
 # Client: reserve a fresh shared buffer of `size` bytes. Returns a buffer id (> 0) or
-# -1. On Linux this creates + sizes the tmpfs file; fill it with setu_buf_write next.
+# -1. On Linux this creates + sizes the tmpfs file; fill it with setu_buf_write next. It never opens
+# a name that already exists: it skips to the next id, up to SETU_BUF_CREATE_TRIES of them.
 fn setu_buf_create(size): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     # ⚠ GPU-VISIBLE FIRST, and this is THE line that gates hardware compositing for the whole desktop.
@@ -56,29 +84,49 @@ fn setu_buf_create(size): i64 {
     return sys_shm_create(size);           # shm_create#71 -> system-RAM id (>=1) / -1 (QEMU / no GPU)
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
+    # ⛔ O_EXCL, NOT O_TRUNC (0.8.13). The name is predictable, so it can be taken before we get to it.
+    # With O_CREAT|O_TRUNC a symlink planted there was followed and the file it named — anything this
+    # client can write — was truncated, then overwritten by the first present. O_EXCL creates the file
+    # or fails EEXIST on ANYTHING already at the name: a file, a directory, a FIFO, a symlink (dangling
+    # or not — under O_EXCL the kernel never follows a final symlink). O_NOFOLLOW says so a second time.
+    # ⭐ EEXIST TAKES THE NEXT ID, BOUNDED. The benign case is a file left by a crashed process that had
+    # our pid; it is skipped without being opened, never truncated. Any other error is final.
     var pid = syscall(39);                 # getpid — per-proc uniqueness seed
-    _setu_buf_counter = _setu_buf_counter + 1;
-    var id = pid * 100000 + _setu_buf_counter;
     var path[48];
-    setu_buf_path(id, &path);
-    var fd = sys_open(&path, 577, 384);    # O_WRONLY|O_CREAT|O_TRUNC (1|64|512), mode 0600
-    if (fd < 0) { return 0 - 1; }
-    syscall(77, fd, size);                 # ftruncate to size (pre-size)
-    sys_close(fd);
-    return id;
+    var tries = 0;
+    while (tries < SETU_BUF_CREATE_TRIES) {
+        _setu_buf_counter = _setu_buf_counter + 1;
+        var id = pid * 100000 + _setu_buf_counter;
+        setu_buf_path(id, &path);
+        var fd = sys_open(&path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 384);   # 0600
+        if (fd >= 0) {
+            syscall(77, fd, size);         # ftruncate to size (pre-size)
+            sys_close(fd);
+            return id;
+        }
+        if (fd != 0 - EEXIST) { return 0 - 1; }
+        tries = tries + 1;
+    }
+    return 0 - 1;                          # every name tried was taken
     #endif
 }
 
 # Client: copy `size` bytes from `src` INTO shared buffer `buf_id`. Returns 0 / -1.
+# On Linux -1 also when the name holds anything but a regular file; the open never waits.
 fn setu_buf_write(buf_id, src, size): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return sys_shm_write(buf_id, src, size);   # shm_write#72: user src -> kernel buffer
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
+    # ⚠ The name is the client's own (setu_buf_create made it O_EXCL), but it is reopened on every
+    # present for the life of the client. If it is removed and something is put there, a symlink must
+    # not be written through (O_NOFOLLOW: ELOOP), and a FIFO must not hold the client in open until a
+    # reader comes (O_NONBLOCK: ENXIO with no reader; with one, the regular-file check refuses it).
     var path[48];
     setu_buf_path(buf_id, &path);
-    var fd = sys_open(&path, 1, 0);        # O_WRONLY
+    var fd = sys_open(&path, O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC, 0);
     if (fd < 0) { return 0 - 1; }
+    if (setu__buf_fd_ok(fd, 0) == 0) { sys_close(fd); return 0 - 1; }
     var sent = 0;
     while (sent < size) {
         var w = sys_write(fd, src + sent, size - sent);
@@ -91,15 +139,29 @@ fn setu_buf_write(buf_id, src, size): i64 {
 }
 
 # Compositor: copy `size` bytes OUT of shared buffer `buf_id` into `dst`. Returns 0 / -1.
+# On Linux -1 also, at once and with `dst` untouched, when the name holds anything but a regular file
+# of at least `size` bytes; the open never waits (a FIFO, a leased file) and never follows a symlink.
 fn setu_buf_read(buf_id, dst, size): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return sys_shm_read(buf_id, dst, size);    # shm_read#73: kernel buffer -> user dst
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
+    # ⛔ THE CLIENT CHOSE THIS NAME, AND THE CALLER IS A COMPOSITOR'S FRAME LOOP (0.8.13). It was a
+    # plain O_RDONLY: a FIFO at the name held the open until a writer came, which could be never; a file
+    # whose owner held a write lease (F_SETLEASE) held it for lease-break-time, 45 s by default; and a
+    # symlink was followed to whatever it named.
+    #   O_NONBLOCK  the open cannot wait: a FIFO opens at once, a leased file fails EWOULDBLOCK at once.
+    #   O_NOFOLLOW  a symlink is refused (ELOOP).
+    #   fstat       on the descriptor opened: anything but a regular file is refused, and so is one
+    #               shorter than `size` — before a byte is copied, so `dst` is left as it was. (A short
+    #               file was refused before too, by EOF, but only after `dst` had been half-overwritten.)
+    # ⭐ O_NONBLOCK DOES NOT CHANGE A REGULAR FILE'S READ: the page cache answers it and it never waits
+    # for a writer, so the loop below copies exactly what it did. Only a regular file gets that far.
     var path[48];
     setu_buf_path(buf_id, &path);
-    var fd = sys_open(&path, 0, 0);        # O_RDONLY
+    var fd = sys_open(&path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC, 0);
     if (fd < 0) { return 0 - 1; }
+    if (setu__buf_fd_ok(fd, size) == 0) { sys_close(fd); return 0 - 1; }
     var got = 0;
     while (got < size) {
         var r = sys_read(fd, dst + got, size - got);
