@@ -91,31 +91,33 @@ jobs:
           fi
           cyrius distlib
 
-      - name: Verify dep sidecar covers the declared stdlib
+      - name: Verify the sidecar is enough to build the bundle
         # ⛔ Before cyrius 6.5.10, distlib's sidecar listed 8 of setu's 12 leaves. A consumer that
         # trusted it and declared only those 8 built "OK" on agnos with NO error, whereas a complete
         # sidecar makes `cyrius deps` HARD ERROR ("dep setu requires 'chrono'") in the consumer's
-        # own repo. 6.5.10 made the sidecar [deps].stdlib unioned with an include scan; this asserts
-        # that property here instead of trusting every future toolchain to keep it. A superset
-        # passes, because the include scan may add a leaf the declaration lacks.
+        # own repo. This step used to assert that every declared [deps].stdlib leaf was listed.
+        # Since cyrius 6.6.18 that is wrong on purpose: [deps].stdlib never reaches the sidecar, and
+        # dist/setu.deps names only what the bundle needs (6 of the 12). So this builds what a
+        # consumer gets: reach_test, which forces the whole transport reachable, against
+        # dist/setu.cyr, whose `# Requires` block is the sidecar, for both targets.
+        # ⛔ --no-deps IS THE GATE. Without it the manifest's 12 leaves are auto-prepended and hide a
+        # short sidecar: measured on 6.6.20, a bundle missing `chrono` still built OK. With it,
+        # dropping `io` fails both targets, dropping `chrono` fails Linux, and dropping the whole
+        # block fails both. Dropping `syscalls`, `alloc`, `string` or `fmt` alone passes, correctly:
+        # `io` and `chrono` include them. `args` is reach_test's own (argc()), not the bundle's.
         # Defect: docs/development/issues/archived/2026-08-07-distlib-deps-sidecar-under-reports.md
         run: |
-          declared=$(awk '
-            /^\[deps\]/ { d = 1; next }
-            /^\[/       { d = 0 }
-            d && /^[[:space:]]*stdlib[[:space:]]*=/ { s = 1 }
-            s { e = index($0, "]"); if (e) { print substr($0, 1, e - 1); exit } print }
-          ' cyrius.cyml | grep -o '"[^"]*"' | tr -d '"') || true
-          [ -n "$declared" ] || { echo "ERROR: parsed no [deps] stdlib leaves from cyrius.cyml"; exit 1; }
-          missing=""
-          for leaf in $declared; do
-            grep -qxF -e "$leaf" dist/setu.deps || missing="$missing $leaf"
-          done
-          if [ -n "$missing" ]; then
-            echo "ERROR: dist/setu.deps omits declared [deps] stdlib leaves:$missing"
+          mkdir -p build
+          {
+            echo 'include "lib/args.cyr"'
+            sed 's|^include "src/lib.cyr"|include "dist/setu.cyr"|' programs/reach_test.cyr
+          } > build/reach_dist.cyr
+          grep -q '^include "dist/setu.cyr"' build/reach_dist.cyr || {
+            echo "ERROR: reach_test.cyr no longer includes src/lib.cyr, so this gate tested nothing"
             exit 1
-          fi
-          echo "dist/setu.deps covers all $(echo "$declared" | wc -l | tr -d ' ') declared leaves ($(grep -vc '^#' dist/setu.deps) listed)"
+          }
+          cyrius build --no-deps build/reach_dist.cyr build/reach_dist
+          cyrius build --no-deps --agnos build/reach_dist.cyr build/reach_dist_agnos
 
       - name: No TCP on the agnos target
         # ⛔ setu 0.8.0's changelog states "the TCP arm is DELETED on agnos". It was deleted from

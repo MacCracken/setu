@@ -6,6 +6,51 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.14] - 2026-11-06
+
+### Changed — cyrius 6.6.6 → 6.6.20
+
+The pin moves 14 releases, and `lib/` is re-synced from the 6.6.20 snapshot. `src/` and `programs/` are
+unchanged, and the wire ABI with them. Every RUN suite passes, every program builds for Linux and agnos,
+and lint, fmt and vet are clean.
+
+- ⚠ **Binaries grew, with no setu source change.** Smoke (DCE on) went from 16,344 to 21,728 B, and the
+  agnos smoke from 118,568 to 165,400 B. Each RUN program grew by 29,960 to 34,064 B.
+- ⚠ **setu's pin now leads its consumers.** Until 0.8.13 it matched dhancha. aethersafha is on 6.6.11, and
+  dhancha, puka and crab are on 6.6.6. See "Toolchain" in `docs/development/overview.md`.
+
+### Changed — `dist/setu.deps` names 6 stdlib leaves, not 12
+
+cyrius 6.6.18 made the compile-verify the only authority for a sidecar: `[deps].stdlib` no longer reaches
+it, and neither does an include in `src/lib.cyr`. Regenerating is required, because `distlib --check` reads
+every older bundle as stale.
+
+- **`dist/setu.deps` lists `syscalls`, `alloc`, `string`, `fmt`, `io` and `chrono`.** `vec`, `str`, `assert`,
+  `result`, `net` and `args` are gone. The new list is a strict subset of the old one, so a consumer that
+  satisfied the old sidecar satisfies this one.
+- **`dist/setu.cyr` gains a `# Requires` block**, one `include "lib/<leaf>.cyr"` per sidecar leaf, so
+  including the bundle alone compiles. Apart from the version line, the rest of the bundle is unchanged.
+- ⚠ **A consumer that used one of the six dropped leaves only because setu's sidecar put it in scope must
+  now declare it.** No consumer's main build needs to. aethersafha (6.6.11) and dhancha, puka and crab
+  (6.6.6) each pass `cyrius deps` and build their manifest entry for Linux and agnos on their own pins
+  against this bundle, through `path = "../setu"`, in scratch copies. Their other programs and their tests
+  were not built. aethersafha, dhancha and puka come out the same size as against 0.8.13. crab is 8,416 B smaller because it no longer
+  compiles `net`, which it never declared and does not call.
+- `cyrius distlib` now warns that 8 names stay undefined on x86_64-windows. setu has no Windows arm, and
+  the warning does not change the exit status.
+
+### Changed — the CI sidecar gate now tests what a consumer needs
+
+"Verify dep sidecar covers the declared stdlib" asserted that every declared leaf was in the sidecar, which
+cannot hold since 6.6.18. Its replacement builds `reach_test` against `dist/setu.cyr` with `--no-deps`, for
+Linux and agnos. That is a stronger check: the old gate compared two lists, and this one proves the bundle
+links on exactly what it names, with the whole transport reachable. `--no-deps` is what makes it a gate.
+Measured on 6.6.20, without that flag a bundle missing `chrono` still builds, because the manifest's leaves
+are auto-prepended. With it, removing `io` fails both targets, removing `chrono` fails Linux, and removing the
+whole block fails both.
+
+---
+
 ## [0.8.13] - 2026-10-10
 
 ### Fixed — on Linux a compositor opened whatever name a client's buffer id gave it, and could be held there

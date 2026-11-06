@@ -137,24 +137,40 @@ function over a real connection, and requires 0 bytes.
 
 Commit `dist/` exactly as `cyrius distlib` writes it. CI fails if either
 file differs from a fresh regeneration (`cyrius distlib --check`), if the
-bundle does not compile, or if `dist/setu.deps` omits a declared
-`[deps].stdlib` leaf.
+bundle does not compile, or if `programs/reach_test.cyr` cannot be built
+against the bundle with `--no-deps`, for Linux and for agnos. That last check
+is what proves `dist/setu.deps` is enough: without `--no-deps` the manifest's
+leaves are auto-prepended and hide a short sidecar.
 
 ### Toolchain
 
 The pin is `[package].cyrius` in `cyrius.cyml`; CI and the release workflow
-install exactly that version. It is kept matched to dhancha, setu's primary
-consumer, so the contract lib and its consumer build on the identical
-compiler. `lib/` is vendored from the pinned toolchain's stdlib by
-`cyrius deps` (or `cyrius lib sync --full` locally) and is not committed.
+install exactly that version. `lib/` is vendored from the pinned toolchain's
+stdlib by `cyrius deps` (or `cyrius lib sync --full` locally) and is not
+committed.
+
+⚠ Until 0.8.13 the pin was kept matched to dhancha, setu's primary consumer.
+Since 0.8.14 it leads its consumers: setu is on 6.6.20, aethersafha on 6.6.11,
+and dhancha, puka and crab on 6.6.6. Each compiles `dist/setu.cyr` from source
+on its own pin, so nothing forces them to move, but setu's CI no longer proves
+the bundle on those compilers. At 0.8.14 all four were built by hand on their
+own pins, for Linux and agnos, through `cyrius deps` with `path = "../setu"`.
 
 ### Dependencies
 
 Cyrius stdlib only, no external libs. The declared set is `[deps].stdlib`
-in `cyrius.cyml`. `cyrius distlib` writes it into `dist/setu.deps`, together
-with any stdlib leaf `src/lib.cyr` includes, so consumers of
-`dist/setu.cyr` are told what to have in scope. The wire codec needs none of
-it: little-endian marshalling uses the `load8` / `store8` builtins.
+in `cyrius.cyml`: the 12 leaves setu's own builds and tests have in scope.
+What consumers are told is narrower. Since cyrius 6.6.18, `cyrius distlib`
+derives `dist/setu.deps` by compiling the bundle on six targets, and writes the
+same leaves into `dist/setu.cyr` as a `# Requires` block: `syscalls`, `alloc`,
+`string`, `fmt`, `io` and `chrono`. Neither `[deps].stdlib` nor the includes in
+`src/lib.cyr` reach it. The wire codec needs none of it: little-endian
+marshalling uses the `load8` / `store8` builtins.
+
+`cyrius distlib` warns that 8 names stay undefined on x86_64-windows
+(`O_CLOEXEC`, `O_NONBLOCK`, `EEXIST`, `EAGAIN`, `EINTR`, `sys_fstat`,
+`sys_unlinkat`, `sys_accept4`). That is expected: setu has no Windows arm. The
+warning does not change distlib's exit status.
 
 | Module | What setu uses it for |
 |---|---|
@@ -165,7 +181,7 @@ it: little-endian marshalling uses the `load8` / `store8` builtins.
 | `syscalls` | AF_UNIX `sys_socket` / `sys_connect` / `sys_bind` / `sys_listen` / `sys_accept4` / `sys_recvfrom` / `sys_unlinkat` and `EAGAIN` / `EINTR` (Linux); `sys_open` / `sys_fstat` with the per-arch `O_*` flags (`O_NOFOLLOW` differs between x86_64 and arm64, and is named in the stdlib since cyrius 6.6.4), `STAT_MODE` / `STAT_SIZE` and `EEXIST` for the `/dev/shm` buffers (Linux, 0.8.13); the `sys_chan_*` channel band, `sys_shm_*` buffers and the read-deadline clocks `sys_uptime_us` / `sys_uptime_ms` (agnos); `SYS_WRITE` / `SYS_EXIT`. poll(2) has no wrapper, so the Linux read spells it `syscall(7, …)` as the stdlib does; the aarch64 backend rewrites that to ppoll. |
 | `chrono` | `clock_now_ns`: the monotonic clock behind the Linux read deadline (0.8.12), included from `src/lib.cyr`. `read_deadline_test` also times the reads with `clock_now_ms` and paces its peers with `sleep_ms`; `buf_safety_test` times its refusals with `clock_now_ns` and paces its watchdog with `sleep_ms`. It backed the agnos read-retry sleep until 0.8.2 and was unreferenced from then until 0.8.12. |
 | `args` | `argc()` / `args_init()` in `programs/reach_test.cyr`, `programs/unix_transport_test.cyr`, `programs/read_deadline_test.cyr`, `programs/buf_safety_test.cyr` and `programs/zero_alloc_test.cyr`. Before cyrius 6.6.6 it was also what put `_agnos_getenv` in scope for `io`'s `getenv` on agnos. |
-| `vec`, `str`, `assert`, `result`, `net` | ⚠ Not referenced by setu's own code, and every build is clean with them undeclared (measured at 0.8.10). `vec` and `result` are compiled in regardless, because `fmt` and `io` include them. `net` and `result` served the TCP transport removed in 0.8.4; `vec` / `str` / `assert` date from the scaffold. They stay declared (and so stay in `dist/setu.deps`) until a deliberate prune, because dropping one changes what consumers are told to declare. For `vec` / `str` / `assert` that also means removing their `src/lib.cyr` includes: distlib's include scan keeps an included leaf in the sidecar even when it is undeclared (measured on 6.6.6). |
+| `vec`, `str`, `assert`, `result`, `net` | ⚠ Not referenced by setu's own code, and every build is clean with them undeclared (measured at 0.8.10). `vec` and `result` are compiled in regardless, because `fmt` and `io` include them. `net` and `result` served the TCP transport removed in 0.8.4; `vec` / `str` / `assert` date from the scaffold. They stay declared until a deliberate prune. None is in `dist/setu.deps` since cyrius 6.6.18, so a prune no longer changes what consumers are told to declare; for `vec` / `str` / `assert` it still means removing their `src/lib.cyr` includes, or setu's own build keeps compiling them in. |
 
 ## Roadmap
 
