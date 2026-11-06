@@ -150,11 +150,18 @@ stdlib by `cyrius deps` (or `cyrius lib sync --full` locally) and is not
 committed.
 
 ⚠ Until 0.8.13 the pin was kept matched to dhancha, setu's primary consumer.
-Since 0.8.14 it leads its consumers: setu is on 6.6.20, aethersafha on 6.6.11,
+Since 0.8.14 it leads its consumers: setu is on 6.7.9, aethersafha on 6.6.11,
 and dhancha, puka and crab on 6.6.6. Each compiles `dist/setu.cyr` from source
 on its own pin, so nothing forces them to move, but setu's CI no longer proves
-the bundle on those compilers. At 0.8.14 all four were built by hand on their
+the bundle on those compilers. At 0.9.0 all four were built by hand on their
 own pins, for Linux and agnos, through `cyrius deps` with `path = "../setu"`.
+
+⛔ Until every consumer is on 6.7, `src/` stays in the language all of them
+compile. setu's CI builds on 6.7.9 only, so it cannot see a difference between
+compilers. Most 6.7 syntax fails loudly on an older pin (`true` and `const` were
+measured), but a lone `!` does not: below 6.7.3 the lexer drops it, so `if (!x)`
+compiles as `if (x)`. Measured: the same source exits 3 on 6.6.6 and 6.6.11, and
+7 on 6.7.9. Write `x == 0`.
 
 ### Dependencies
 

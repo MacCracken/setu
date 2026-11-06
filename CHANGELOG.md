@@ -6,6 +6,33 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.9.0] - 2026-11-06
+
+### Changed — cyrius 6.6.20 → 6.7.9, the language minor
+
+The pin moves onto the 6.7 line, and `lib/` is re-synced from the 6.7.9 snapshot. `src/`, `programs/` and
+the wire ABI are unchanged. `dist/setu.deps` lists the same 6 leaves, and the only change to `dist/setu.cyr`
+is its version line. Every RUN suite passes, every program builds for Linux and agnos, and lint, fmt and
+vet are clean.
+
+- **No 6.7 behaviour change reaches setu.** Several of them change what compiled code does instead of
+  failing the build, and setu's agnos arm is built but never run, so passing tests could not show this on
+  their own. The source was audited with comments and strings stripped. It has no lone `!`, no typed
+  pointers (6.7.8's narrow `*p`, 6.7.9's pointer-step and `&q` rules), no `~` and no unary `-` on a constant
+  (6.7.9's folding), no structs, traits or slices, and no reserved word used as a name.
+- ⚠ **`src/` cannot use 6.7 syntax yet, and CI would not say so.** Each consumer compiles `dist/setu.cyr` on
+  its own pin, and all four are below 6.7. Most new syntax fails loudly there, but `!` does not: below 6.7.3
+  the lexer drops it, so `if (!x)` compiles as `if (x)`. Measured, the same source exits 3 on 6.6.6 and
+  6.6.11, and 7 on 6.7.9. See "Toolchain" in `docs/development/overview.md`.
+- aethersafha (6.6.11) and dhancha, puka and crab (6.6.6) each pass `cyrius deps` and build their manifest
+  entry for Linux and agnos on their own pins against this bundle, at the same sizes as against 0.8.14,
+  through `path = "../setu"` in scratch copies. Their other programs and their tests were not built.
+- Binaries barely moved. `codec_test` and `reach_test` each gained about 380 B of code, most of which page
+  padding absorbs: files grew by 8 B on Linux and 16 B on agnos. `reach_test` on Linux grew by 4,104 B,
+  because its text crossed a page boundary and moved the data segment out by 4 KB.
+
+---
+
 ## [0.8.14] - 2026-11-06
 
 ### Changed — cyrius 6.6.6 → 6.6.20
