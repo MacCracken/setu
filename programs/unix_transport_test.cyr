@@ -336,7 +336,7 @@ fn main(): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     # agnos has no AF_UNIX and needs none — clients are PLACED on an endowed channel end. Nothing to
     # exercise here; the agnos transport is covered by the kernel's own ring-3 exerciser (chanx).
-    sys_write(1, "unix_transport_test: SKIP (agnos has no AF_UNIX; clients are placed)\n", 68);
+    sys_write(1, "unix_transport_test: SKIP (agnos has no AF_UNIX; clients are placed)\n", 69);
     return 0;
     #endif
     #ifndef CYRIUS_TARGET_AGNOS

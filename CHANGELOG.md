@@ -6,6 +6,43 @@ to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.9.1] - 2026-11-06
+
+### Fixed — `setu_connect`'s two agnos refusal lines lost their newline
+
+Both refusals wrote a 47-byte literal with a length of 46, so the `\n` never reached the console and the
+next output ran on after the message. These strings exist to be read on a console that three procs share,
+so the line ending is part of the job.
+
+- **"kernel has no usable chan band" and "AGNOS_CHAN absent or malformed" now write 47 bytes.** Nothing else
+  in those branches changes, and the return codes are the same.
+- `programs/unix_transport_test.cyr` had the same defect in its agnos SKIP line (68 of 69 bytes).
+- `cyrius lint` has flagged this since cyrius 6.7.11, and CI treats a lint warning as a failure, so this pin
+  could not pass without the fix. All three lines are on the agnos arm, which is built here and never run:
+  the evidence is the lint and a byte count, not a run.
+
+### Changed — cyrius 6.7.9 → 6.7.18
+
+The pin moves to the newest cyrius release, and `lib/` is re-synced from its snapshot. `dist/setu.deps` lists
+the same 6 leaves. Apart from the fix above, `src/`, `programs/` and the wire ABI are unchanged, and the only
+other change to `dist/setu.cyr` is its version line. Every RUN suite passes, every program builds for Linux
+and agnos with no compiler warning, and lint, fmt and vet are clean. A `--aarch64` build of every program,
+which CI does not run, is clean too.
+
+- **No 6.7.10 to 6.7.18 change was found to reach setu.** The migration notes for this range run to 1,554
+  entries, most of them fixes to structs, generics, vectors and closures, which setu does not use. Not every
+  entry was read: the ones naming what setu calls were, along with the agnos and tooling ones. The agnos
+  stdlib setu depends on was diffed directly: `alloc_agnos.cyr` is identical, `args_agnos.cyr` differs by one
+  comment, `syscalls_x86_64_agnos.cyr` only adds numbers, and `getenv` is unchanged.
+- **Binaries grew by about 8 KB.** `codec_test` and `reach_test` each gained about 8,050 B of code. Linux test
+  programs grew by 8,184 to 8,192 B, and agnos ones by 8,304 to 12,408 B. The DCE smoke build shrank by
+  4,096 B, to 17,640 B.
+- aethersafha (6.6.11) and dhancha, puka and crab (6.6.6) each pass `cyrius deps` and build their manifest
+  entry for Linux and agnos on their own pins against this bundle, at the same sizes as against 0.9.0,
+  through `path = "../setu"` in scratch copies. Their other programs and their tests were not built.
+
+---
+
 ## [0.9.0] - 2026-11-06
 
 ### Changed — cyrius 6.6.20 → 6.7.9, the language minor
